@@ -24,3 +24,7 @@ dev_key.pem
 
 # Claude Code session state (worktrees etc.) — never commit
 .claude/
+
+# souk-directory: compiled output + npm deps, regenerate via `npm run build`.
+souk-directory/node_modules/
+souk-directory/dist/
