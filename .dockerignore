@@ -1,0 +1,23 @@
+# Only pyproject/uv.lock/.python-version, souk_server/, and the submodule's
+# proto/ scripts/ souk/ are COPYed (see Dockerfile) — this trims the build
+# context rather than the image.
+.git
+.gitmodules
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+.env
+*.db
+*.db-wal
+*.db-shm
+*.pem
+*.key
+AgentSouk/.git
+AgentSouk/souk-server
+AgentSouk/souk-agent-sdk
+AgentSouk/souk-client-sdk
+AgentSouk/souk-directory
+AgentSouk/providers
+AgentSouk/agent-template
+AgentSouk/docs
