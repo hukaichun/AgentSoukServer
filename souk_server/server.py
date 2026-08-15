@@ -15,7 +15,7 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from souk_server import api_a2a, api_agui, api_health, api_llm_bridge, api_registry
+from souk_server import api_a2a, api_agui, api_health, api_llm_bridge, api_registry, ws_provider
 from souk.config import CoreSettings
 from souk_server.config import ServingSettings
 from souk.core import Souk
@@ -57,6 +57,10 @@ def create_app(souk: Souk, serving: ServingSettings | None = None) -> FastAPI:
     # module-level state and two apps can serve two different souks.
     app.state.souk = souk
     app.state.serving_settings = serving
+    # Per-app, not module-level, for the same reason the souk itself is on
+    # app.state: two apps in one process must not share a cancel-routing
+    # table (see ws_provider.WorkerSessions).
+    app.state.worker_sessions = ws_provider.WorkerSessions()
     app.add_middleware(
         CORSMiddleware,
         allow_origins=serving.cors_allow_origins,
@@ -69,6 +73,7 @@ def create_app(souk: Souk, serving: ServingSettings | None = None) -> FastAPI:
     app.include_router(api_agui.router)
     app.include_router(api_a2a.router)
     app.include_router(api_llm_bridge.router)
+    app.include_router(ws_provider.router)
     return app
 
 
