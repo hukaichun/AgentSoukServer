@@ -1,17 +1,28 @@
-# AgentSoukServer
+# Agent Souk Server 🕌🔌
 
-The reference [Agent Souk](https://github.com/hukaichun/AgentSouk) gateway:
-AG-UI + A2A over HTTP (FastAPI), and the gRPC relay that providers connect
-out to for NAT traversal. Extracted from AgentSouk's `souk-server`
-subproject; souk core (the network-free library) is consumed from the
-`AgentSouk` git submodule via a `uv` path dependency.
+> **The reference [Agent Souk](https://github.com/hukaichun/AgentSouk) gateway — every network decision, in one place.**  
+> One HTTP surface serving humans (**AG-UI** SSE), agents (**A2A v1.0** JSON-RPC), and the outbound relay that lets providers behind NAT serve agents **without public IPs, open ports, or tunnels.**
 
-This package owns every I/O decision — which framework, which port, which
-TLS story. Core knows a database and nothing else; see
-[`AgentSouk/docs/library-architecture.md`](AgentSouk/docs/library-architecture.md)
-for the design and the core/serving boundary this split protects.
+---
 
-## Setup
+## 🧭 Two Repositories, One Boundary
+
+This repo is the *serving* half of Agent Souk. The split is a hard line, recorded in [AgentSouk#27](https://github.com/hukaichun/AgentSouk/issues/27):
+
+| | **[AgentSouk](https://github.com/hukaichun/AgentSouk)** (upstream) | **AgentSoukServer** (this repo) |
+|---|---|---|
+| **Owns** | The domain: agents, threads, runs, identity, persistence, protocol *translation* | The network: ports, transports, TLS, CORS, endpoints, wire framing, admin surface |
+| **Ships** | `souk` (network-free core) + provider/caller SDKs | The gateway process assembled from core |
+| **May it bind a socket?** | ❌ Never — enforced by packaging and test | ✅ That is its entire job |
+
+Two consequences worth knowing before touching anything:
+
+- **The wire contract is authored here.** [`docs/server-mode.md`](docs/server-mode.md) is the spec of record — single HTTP port, WebSocket relays for providers and KYOK bridges, gRPC removed. Upstream's SDKs implement that spec; they don't define it.
+- **souk core arrives via the git submodule** (`AgentSouk/souk`, a `uv` path dependency), pinned by commit. This repo contains no domain logic — it lifts headers, frames responses, binds sockets, and hands everything else to core.
+
+---
+
+## ⚡ Quick Start
 
 The submodule is required — without it there is no `souk` to resolve:
 
@@ -21,62 +32,85 @@ cd AgentSoukServer
 # (already cloned without it? git submodule update --init)
 ```
 
-Quickstart:
+Then, in four commands:
 
 ```bash
 uv sync --group dev
-uv run bash AgentSouk/scripts/gen_proto.sh souk_server/grpc_gen   # gRPC stubs
-uv run pytest
-SOUK_TOKEN_SIGNING_SECRET=dev uv run souk-server                  # :8000 HTTP, :50051 gRPC
+uv run bash AgentSouk/scripts/gen_proto.sh souk_server/grpc_gen   # gRPC stubs (always pass the explicit path)
+uv run alembic -c AgentSouk/souk/alembic.ini upgrade head          # one-time DDL step
+SOUK_TOKEN_SIGNING_SECRET=dev uv run souk-server                   # :8000 HTTP · :50051 gRPC
 ```
 
-Always pass the explicit output path to `gen_proto.sh` — its no-arg default
-targets the AgentSouk repo's own layout.
-
-## Configuration
-
-All via `SOUK_*` environment variables — see [.env.example](.env.example)
-(documentation only; nothing auto-loads it). Unset `SOUK_DATABASE_URL`
-means zero-config SQLite at `./souk.db`; real deployments use Postgres
-(`postgresql+psycopg://…`) and must set `SOUK_TOKEN_SIGNING_SECRET`.
-
-## Docker
+Verify it's alive:
 
 ```bash
-docker compose up --build   # paradedb + one-shot alembic migrate + the gateway
+curl http://localhost:8000/healthz && curl http://localhost:8000/readyz
 ```
 
-Schema migration is a separate one-shot service (`souk-migrate`), not a
-server-startup step — deployments run DDL with different credentials than
-the DML-only role the server needs.
+> ⚠️ `gen_proto.sh` with **no arguments** targets the AgentSouk repo's own layout — always pass `souk_server/grpc_gen` from here.
 
-## TLS is required off localhost
+---
 
-TLS is a serving-layer concern — souk core never touches a socket, so
-none of this is a core setting (the `*_tls_*` fields live in
-`ServingSettings`, not `CoreSettings`). But for any gateway reachable
-beyond `localhost` it is not optional, for a specific reason: registration
-and KYOK requests are replay-protected only by a 60-second freshness
-window (`SIGNATURE_FRESHNESS_WINDOW_SECONDS`), and session tokens are
-bearer credentials. On a plaintext path, anyone in the middle can read a
-token outright or replay a captured signed request inside that window —
-TLS is what turns "bounded to 60s" into "not visible at all". The server
-logs a warning at startup when it binds HTTP without TLS.
+## 🏛️ What This Process Is
 
-Two supported ways to get it — pick one, but off-localhost you need one:
+```mermaid
+graph TD
+    User([Human / Web Directory]) -->|"POST /agui/{agent} (SSE)"| HTTP["FastAPI HTTP surface<br/>:8000"]
+    CallerAgent([External Agent]) -->|"POST /a2a/{agent}/rpc"| HTTP
+    Bridge([Caller's KYOK bridge]) -->|"/kyok/poll · /kyok/respond"| HTTP
 
-- **Terminate at the gateway:** point `SOUK_HTTP_TLS_CERT_PATH` /
-  `SOUK_HTTP_TLS_KEY_PATH` at a real CA-issued cert (dev pair:
-  `uv run python AgentSouk/scripts/gen_dev_tls_cert.py`).
-- **Terminate at a reverse proxy** (nginx / caddy / cloud LB) and run the
-  gateway plaintext on an internal network. `wss` is a plain HTTP/1.1
-  upgrade, so any proxy handles the WebSocket relay — no HTTP/2 support
-  required.
+    subgraph Process ["souk-server (single process)"]
+        HTTP --> Core["souk core (from the submodule)<br/>broker · handlers · protocol adapters"]
+        GRPC["gRPC relay :50051<br/>(→ WebSocket on :8000, per server-mode)"] <--> Core
+    end
 
-## Tests
+    Process --> DB[(SQLite / Postgres)]
+    GRPC <== "outbound persistent streams" ==> Providers["Providers behind NAT<br/>(souk-agent-sdk)"]
+```
 
-SQLite by default; the same suite runs against Postgres by exporting a DSN
-(dialect bugs only appear on one side — run both):
+`create_app(souk, serving)` returns a plain ASGI app that binds nothing — mount it inside a larger app, wrap it in your own middleware (pure ASGI, not `BaseHTTPMiddleware`: that class buffers streams and never sees WebSocket scopes), or let the `souk-server` console script serve it. Every I/O decision — which framework, which port, which TLS story — is made here so that core never has to.
+
+**Where this is heading** ([`docs/server-mode.md`](docs/server-mode.md)): the gRPC listener disappears; providers and KYOK bridges each get a WebSocket on the one HTTP port (`/ws/provider`, `/ws/kyok`, JSON frames, dual-track auth). One port, one TLS certificate, any reverse proxy, and a browser can be a provider. An MCP adapter lands on the same listener later.
+
+---
+
+## ⚙️ Configuration
+
+Everything is `SOUK_*` environment variables — [.env.example](.env.example) documents them (nothing auto-loads it; it's for `export` / compose). The split mirrors the repo boundary:
+
+| Layer | Variables | Examples |
+|---|---|---|
+| **Core** (`CoreSettings`, upstream) | database, domain timing, signing key | `SOUK_DATABASE_URL` (unset = zero-config SQLite `./souk.db`), `SOUK_TOKEN_SIGNING_SECRET` (**required in any real deployment**), `SOUK_DB_SCHEMA` |
+| **Serving** (`ServingSettings`, here) | everything that only means something once there's a socket | `SOUK_HTTP_PORT`, `SOUK_GRPC_PORT`, `SOUK_PUBLIC_HTTP_URL`, `SOUK_CORS_ALLOW_ORIGINS`, `SOUK_*_TLS_CERT_PATH`/`_KEY_PATH` |
+
+---
+
+## 🔐 TLS Is Required Off Localhost
+
+Not hardening advice — a specific threat: registration and KYOK requests are replay-protected only by a **60-second freshness window**, and session tokens are **bearer credentials**. On a plaintext path, anyone in the middle reads a token outright or replays a captured signed request inside that window. TLS turns "bounded to 60s" into "not visible at all". The server logs a warning when it binds HTTP without it.
+
+Two supported terminations — pick one, but off-localhost you need one:
+
+- **At the gateway**: `SOUK_HTTP_TLS_CERT_PATH` / `SOUK_HTTP_TLS_KEY_PATH` with a real CA-issued cert (dev pair: `uv run python AgentSouk/scripts/gen_dev_tls_cert.py`).
+- **At a reverse proxy** (nginx / caddy / cloud LB), gateway plaintext on an internal network. `wss` is a plain HTTP/1.1 upgrade — no HTTP/2 support required of the proxy.
+
+---
+
+## 🐳 Docker
+
+```bash
+docker compose up --build
+```
+
+brings up the trio: **paradedb** (Postgres), **souk-migrate** (one-shot `alembic upgrade head`, then exits), and **souk** (the gateway, after migration completes). The migration is deliberately its own service — DDL runs with different credentials than the DML-only role the server needs; the gateway never creates tables at startup.
+
+Building the image requires the submodule checked out (`git clone --recurse-submodules`) — `proto/`, `scripts/`, and `souk/` are COPYed from it.
+
+---
+
+## 🧪 Tests
+
+SQLite by default; the same suite runs against Postgres, and both must pass — dialect bugs only ever appear on one side:
 
 ```bash
 uv run pytest
@@ -84,9 +118,21 @@ docker compose up paradedb -d
 SOUK_DATABASE_URL=postgresql+psycopg://souk:souk@localhost:5433/souk uv run pytest
 ```
 
-A green suite does not import `souk_server/server.py`; after broad edits
-also verify the app builds:
+A green suite does **not** import `souk_server/server.py` — after broad edits, also prove the app assembles:
 
 ```bash
 uv run python -c "from souk.config import CoreSettings; from souk.core import Souk; from souk_server.server import create_app; create_app(Souk(CoreSettings(token_signing_secret='x'))); print('app builds')"
 ```
+
+---
+
+## 🗺️ Roadmap
+
+In build order, from [`docs/server-mode.md`](docs/server-mode.md):
+
+1. 🔌 **`WS /ws/provider`** — the worker relay (claim / event / finish / cancel) over one socket, probed end-to-end including reconnect-mid-run and cancel.
+2. 🔑 **`WS /ws/kyok`** — replaces the poll/respond pair, and removes the unauthenticated respond endpoint (a security fix, not just a transport swap — see the design note).
+3. ✂️ **Strip gRPC** — listener, stubs, deps, `:50051`, and this README's mentions of them.
+4. 🧩 **Examples** — a browser provider (frame-protocol conformance, no SDK), an end-to-end `demo` compose profile, and a managed-gateway embedding sample (edge auth + admin router over the `Souk` facade).
+
+**License**: [Apache 2.0](AgentSouk/LICENSE) (inherited from upstream; this repo has no separate license file yet)
