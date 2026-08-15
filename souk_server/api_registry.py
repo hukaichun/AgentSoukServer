@@ -28,7 +28,7 @@ async def register_agents(
     )
 
     return RegisterBatchResponse(
-        agents=[AgentRosterEntry(**a) for a in await souk.list_agents()],
+        agents=[AgentRosterEntry(**a.model_dump()) for a in await souk.list_agents()],
         session_token=registration.session_token,
         agent_ids=registration.agent_ids,
     )
@@ -36,4 +36,4 @@ async def register_agents(
 
 @router.get("/agents")
 async def list_agents(souk: Souk = Depends(get_souk)) -> RosterResponse:
-    return RosterResponse(agents=[AgentRosterEntry(**a) for a in await souk.list_agents()])
+    return RosterResponse(agents=[AgentRosterEntry(**a.model_dump()) for a in await souk.list_agents()])

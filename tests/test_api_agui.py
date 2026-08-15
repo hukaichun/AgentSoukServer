@@ -158,8 +158,8 @@ async def test_agui_run_with_valid_actor_chain_stores_verified_chain(client, ses
     run_id = _run_started_run_id(resp.text)
 
     run = await repo.get_run(session, run_id)
-    assert run["metadata"]["verifiedActorChain"]["subject"] == subject
-    assert run["metadata"]["verifiedActorChain"]["actors"] == [
+    assert run.metadata["verifiedActorChain"]["subject"] == subject
+    assert run.metadata["verifiedActorChain"]["actors"] == [
         {"publicKey": caller.public_key, "agentName": None}
     ]
 
@@ -184,7 +184,7 @@ async def test_agui_run_without_actor_chain_is_unaffected(client, session, new_i
     run_id = _run_started_run_id(resp.text)
 
     run = await repo.get_run(session, run_id)
-    assert "verifiedActorChain" not in run["metadata"]
+    assert "verifiedActorChain" not in run.metadata
 
 
 def test_build_forwarded_props_includes_caller_when_chain_verified():

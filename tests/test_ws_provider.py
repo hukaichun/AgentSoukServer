@@ -197,13 +197,13 @@ async def test_a_cancel_reaches_the_socket_the_identity_has_open(souk):
             # A request, not an order: the run is 'cancelling' until its
             # stream actually ends, and the outcome is read off what arrived.
             async with asyncio.timeout(2):
-                while (await souk.get_run(handle.run_id))["status"] != "cancelling":
+                while (await souk.get_run(handle.run_id)).status != "cancelling":
                     await asyncio.sleep(0.01)
             await socket.send({"type": "finish", "runId": handle.run_id})
             async with asyncio.timeout(2):
                 while souk.broker.get(handle.run_id) is not None:
                     await asyncio.sleep(0.01)
-    assert (await souk.get_run(handle.run_id))["status"] == "cancelled"
+    assert (await souk.get_run(handle.run_id)).status == "cancelled"
 
 
 @pytest.mark.parametrize("resume_with", ["events", "finish_only"])
@@ -233,7 +233,7 @@ async def test_a_dropped_socket_ends_nothing(souk, resume_with):
         # the socket drops mid-run
 
         assert souk.broker.get(handle.run_id) is not None
-        assert (await souk.get_run(handle.run_id))["status"] == "running"
+        assert (await souk.get_run(handle.run_id)).status == "running"
 
         async with _connect(client) as ws:
             socket = await _handshake(ws, registration.session_token, [agent_id])
@@ -259,7 +259,7 @@ async def test_a_dropped_socket_ends_nothing(souk, resume_with):
     # RUN_FINISHED then stream-end is a completion; a bare stream-end is a
     # stop souk never asked for — a failure. Both read off what arrived.
     expected = "completed" if resume_with == "events" else "failed"
-    assert (await souk.get_run(handle.run_id))["status"] == expected
+    assert (await souk.get_run(handle.run_id)).status == expected
 
 
 async def test_max_claim_budget_and_finish_as_the_credit(souk):
