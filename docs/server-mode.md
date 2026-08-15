@@ -1,9 +1,9 @@
 # Server mode: one port, WebSocket relay
 
 Status: **implemented** (`souk_server/ws_provider.py`,
-`souk_server/ws_kyok.py`); gRPC removal in progress. Defines what this
-gateway serves and over which transports. Supersedes the inherited
-HTTP+gRPC split.
+`souk_server/ws_kyok.py`), gRPC removed. Defines what this gateway
+serves and over which transports. Supersedes the inherited HTTP+gRPC
+split.
 
 Nothing here is constrained by compatibility: souk is unreleased, this
 gateway has no deployments, and the gRPC SDK has no users. This is the

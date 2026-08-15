@@ -1,10 +1,11 @@
 """The WS /ws/provider relay (souk_server.ws_provider) — the properties the
 gRPC transport was probed for, carried over, plus what the socket adds.
 
-Same catalogue as tests/test_event_path_grpc.py by design: no per-run state
-in the transport, a cancel reaching whichever socket the identity has open,
-and — the property server-mode.md names as a test to carry over, not a hope
-— a dropped socket ending nothing, with a reconnect reporting the rest.
+Same catalogue as the retired gRPC suite (tests/test_event_path_grpc.py,
+deleted with the transport) by design: no per-run state in the transport,
+a cancel reaching whichever socket the identity has open, and — the
+property server-mode.md names as a test to carry over, not a hope — a
+dropped socket ending nothing, with a reconnect reporting the rest.
 New here: the hello handshake's dual-track auth, and the maxClaim budget
 now enforced by the server-side claim loop (finish is the credit).
 

@@ -1,5 +1,5 @@
 # Only pyproject/uv.lock/.python-version, souk_server/, and the submodule's
-# proto/ scripts/ souk/ are COPYed (see Dockerfile) — this trims the build
+# scripts/ souk/ are COPYed (see Dockerfile) — this trims the build
 # context rather than the image.
 .git
 .gitmodules
