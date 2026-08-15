@@ -259,9 +259,14 @@ The surface, sketched (design properly at build time):
   clients wield tools far more readily than resources:
   `search_agents(query)`, `describe_agent(name)` — each answer ending
   in "and here is its A2A endpoint". A lookup, never an invocation.
-- **Notifications.** Optional: roster changes as resource-updated
-  notifications. Polling is acceptable for a directory; this is not
-  load-bearing.
+- **Notifications.** Optional, and if built, necessarily two-track:
+  `souk.on_change` fires for registrations and de-listings, but an agent
+  going stale fires *nothing* — `online` is derived from `last_seen_at`
+  against a window at query time, so there is no instant to fire on
+  (souk/changes.py records this deliberately). A directory that
+  advertises live updates off `on_change` alone would miss exactly the
+  transition its users care most about; pair the hook with a slow poll,
+  or just poll. Not load-bearing either way.
 - **Not exposed:** invocation (A2A's job), registration/identity
   (provider business), KYOK (bridge business), threads/runs (run
   observation is a different feature with a different audience — add
