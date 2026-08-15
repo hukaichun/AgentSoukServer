@@ -247,7 +247,7 @@ Split by what an example teaches, not by where it happens to run:
 
 | example | teaches | lives | why |
 |---|---|---|---|
-| `agent-template`, python providers | writing a provider against **souk-agent-sdk** | upstream (AgentSouk) | they are the SDK's teaching material and a provider is gateway-agnostic — it connects to any souk |
+| `agent-template`, python providers | writing a provider against **souk-agent-sdk** | upstream (AgentSouk), for now | written when the SDK lived there; with the SDKs relocated here, whether they follow or stay as path-dep consumers is settled in upstream's half of the move |
 | end-to-end demo (gateway + agent, one `docker compose` command) | what the whole system looks like running | **this repo**, a `demo` compose profile | after souk-server leaves upstream, only this repo has a gateway to demo against; build contexts point into the submodule (`AgentSouk/agent-template/…`) so the example code keeps one home |
 | browser provider (single HTML file speaking `/ws/provider`) | the frame protocol in this document, directly — no SDK | **this repo**, `examples/` | the frames are authored here, so their conformance demo belongs here; it is also the living proof of the claim that justified ws — a browser can be a provider |
 | managed-gateway embedding (`create_app` wrapped in edge auth + an admin router over the `Souk` facade) | how a deployment adds management without this repo shipping policy | **this repo**, `examples/` | the embedding surface (`create_app`, `app.state.souk`) is this repo's contract |
@@ -268,9 +268,12 @@ role moves here wholesale.
 - adds: `websockets` (or uvicorn's built-in ws support — FastAPI's
   `WebSocket` route type needs no new top-level dependency)
 
-Upstream (`souk-agent-sdk`, `souk-client-sdk`) needs ws transports to
-match — freely rewritable for the same no-users reason. Out of scope
-here; belongs with the Phase 2 upstream cleanup.
+The SDKs (`souk-agent-sdk/`, `souk-client-sdk/`) implement the matching
+ws transports and live **in this repo** — relocated from upstream when
+they were rewritten, because a wire client is network code and upstream
+keeps none: this repo owns both ends of every wire it defines. Their
+removal from AgentSouk (with `agent-template`/`providers/*` re-pointed at
+the new home) is upstream's half of the move.
 
 ## Build order
 
@@ -281,5 +284,7 @@ here; belongs with the Phase 2 upstream cleanup.
    `poll`/`respond`.
 3. Strip gRPC (the removal list above); `ServingSettings` loses its
    `grpc_*` fields.
-4. Upstream: SDK ws transports, alongside the already-planned removal
-   of `souk-server/` from AgentSouk.
+4. SDK ws transports — done, and the SDKs moved into this repo with
+   them (upstream keeps no network code; see "What this removes").
+   Remaining upstream: delete the old SDK directories and re-point
+   their consumers.
