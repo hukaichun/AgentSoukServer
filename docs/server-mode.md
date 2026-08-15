@@ -203,32 +203,42 @@ it. Written as two layers (pure mapping over souk's types + SDK
 binding) so the mapping can be promoted to core if a second consumer
 ever appears.
 
+**Scope: discovery, not invocation.** Talking to an agent is A2A's
+job — souk already serves cards and JSON-RPC for exactly that, and
+wrapping `start_run` in an MCP tool would build a second, lossier
+invocation path beside a standard one (an earlier draft of this section
+did exactly that, and it was scoped out on review). What MCP adds is
+the thing A2A assumes you already did: *knowing what is in this souk.*
+MCP hands out the map; A2A does the walking.
+
 The surface, sketched (design properly at build time):
 
-- **Tools — the point of the adapter.** One tool per listed agent,
-  generated from the roster: name from the agent's name, description
-  and schema from its card. Calling the tool is `start_run`; the event
-  stream becomes progress notifications; the final assistant text is
-  the tool result. `input-required` maps to elicitation, answered with
-  `resume_run` on the same run. Roster changes emit
-  `tools/list_changed` — the souk becomes a *dynamic toolbox*: an MCP
-  client connects and sees whoever is in the market today. Plus one
-  meta tool: `cancel_run`.
-- **Resources.** `souk://agents`, `souk://agent/{id}`,
-  `souk://thread/{id}` (+ `/tree` for delegation lineage),
-  `souk://run/{id}`; `resources/subscribe` for a live run
-  (`get_run_events(since_seq)` already supports incremental reads).
-- **Prompts.** Optional, low priority — a per-agent conversation
-  template.
-- **Not exposed:** registration/identity (provider business), KYOK
-  (bridge business), admin (deployment policy — the managed-gateway
-  example's job).
+- **Resources.** `souk://agents` — the roster: each agent's name,
+  description, skills, online state, and which provider identity
+  (public key) serves it. `souk://agent/{id}` — the full card,
+  including the A2A endpoint to actually call it at. Possibly
+  `souk://providers` — the roster grouped the way souk itself groups
+  it, by provider key: which identity is here, serving what.
+- **Tools — read-only directory lookups only,** because most MCP
+  clients wield tools far more readily than resources:
+  `search_agents(query)`, `describe_agent(name)` — each answer ending
+  in "and here is its A2A endpoint". A lookup, never an invocation.
+- **Notifications.** Optional: roster changes as resource-updated
+  notifications. Polling is acceptable for a directory; this is not
+  load-bearing.
+- **Not exposed:** invocation (A2A's job), registration/identity
+  (provider business), KYOK (bridge business), threads/runs (run
+  observation is a different feature with a different audience — add
+  it later if wanted, deliberately absent now), admin (deployment
+  policy — the managed-gateway example's job).
 
-Depends on a core state surface tracked upstream as
-[AgentSouk#31](https://github.com/hukaichun/AgentSouk/issues/31):
-enumeration queries (`list_threads`/`list_runs`), typed query models
-(promised by `library-architecture.md`, currently dicts), and an
-in-process change hook so `tools/list_changed` is not a poll.
+Core already serves most of this (`list_agents` carries description/
+skills/online/provider key). What remains wanted upstream, tracked as
+[AgentSouk#31](https://github.com/hukaichun/AgentSouk/issues/31) after
+rescoping: typed query models (promised by `library-architecture.md`,
+currently dicts); a roster change hook is nice-to-have, and the
+enumeration queries originally asked for there are withdrawn — a
+discovery-only adapter does not need them.
 
 ## Where examples live
 
