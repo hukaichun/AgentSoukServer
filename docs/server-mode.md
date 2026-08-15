@@ -123,6 +123,58 @@ different identity (provider key vs. caller session), different
 lifetime (long-lived vs. per-session), different frames. Merging them
 buys one route at the cost of role-dispatch on every frame.
 
+### Why the socket is a security fix, not only a transport swap
+
+The HTTP KYOK surface leaks a check the socket closes structurally, so
+the migration is worth doing for that reason alone — not just port
+consolidation.
+
+**`POST /kyok/respond/{request_id}` has no authentication of its own.**
+It reads the request body and streams whatever arrives into the pending
+completion's queue (`KyokAdapter.respond` → `pending.response_queue`),
+guarded by nothing but the `request_id` being unguessable — a
+96-bit random `kyokreq_…` string (`souk.ids.new_id`). That is a
+capability-string model: hold the string, drive the completion. It is
+cryptographically hard to guess, but the string is not treated as a
+secret everywhere it travels — `respond` logs it (`kyok respond %s:
+dropping malformed line`), and, decisively, **nothing binds the
+responder to the session that was handed the request.** Whoever presents
+a valid `request_id` can supply the "LLM" answer for it, and that answer
+is content the provider's agent then acts on — if that agent holds a
+tool with side effects, injected completion output is injected tool
+input.
+
+The WebSocket removes the naked endpoint. After migration:
+
+- `chunk` / `done` / `error` frames arrive **only on a socket that
+  passed `hello`**, so answering a completion requires being the
+  authenticated bridge for that session — the binding the capability
+  string never carried. `request_id` reverts to what it should have been
+  all along: a multiplexing key *within* an authenticated channel, not a
+  bearer capability on an open one.
+- There is no `request_id` in a URL or a log line to leak, and no
+  unauthenticated route to replay it against.
+
+This does not change what a *legitimate* bridge is trusted to do — souk
+still does not validate the LLM output a bridge returns (see "Scope /
+limitations" in `keep-your-own-key.md`; a caller manipulating its own
+run's completions mostly harms itself, and a provider must treat KYOK
+output as untrusted input regardless). It closes the gap where someone
+who is *not* the bridge could answer at all.
+
+**Out of scope here, tracked upstream:** two KYOK hazards live in core
+(`souk/kyok.py`) and are unaffected by which transport this repo serves,
+so they are fixed in AgentSouk, not here:
+
+- unauthenticated `/kyok/poll` growing `KyokBridge`'s registries without
+  bound (`defaultdict` read-inserts) — [AgentSouk#25](https://github.com/hukaichun/AgentSouk/issues/25).
+- no per-run spend ceiling: a live run can drive unlimited completions of
+  any size and model against the caller's key. The structural defense is
+  that the bridge is the caller's own code and every request passes
+  through it before money moves — so the fix is a default ceiling in
+  `souk-client-sdk`'s bridge (per-run request/token caps, model
+  allow-list), not a souk-side rule souk can't price. Tracked upstream.
+
 ## MCP (recorded decision, separate work)
 
 MCP lands on the same HTTP listener later, as an adapter **in this
