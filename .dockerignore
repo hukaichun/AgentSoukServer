@@ -14,7 +14,6 @@ __pycache__
 *.pem
 *.key
 AgentSouk/.git
-AgentSouk/souk-server
 AgentSouk/souk-agent-sdk
 AgentSouk/souk-client-sdk
 AgentSouk/souk-directory
