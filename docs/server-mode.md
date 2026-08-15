@@ -51,18 +51,36 @@ justify ws in the first place. The semantics mirror `proto/souk.proto`'s
 PollForWork/AgentSession, minus what a single duplex socket makes
 redundant.
 
-**Auth is the first frame, not a header.** The browser WebSocket API
-cannot set headers, and tokens in query strings leak into access logs.
-The server waits (briefly) for:
+**Auth is dual-track: an `Authorization` header when the client can set
+one, the first frame when it can't.** Applies to both sockets (`/ws/
+provider` and `/ws/kyok`). Tokens never go in query strings — those leak
+into access logs.
+
+- **Header track.** A non-browser client sends `Authorization: Bearer
+  <token>` on the handshake request. This exists for managed
+  deployments: an edge middleware (or reverse proxy) can then gate the
+  connection *before* it is accepted, which frame-level auth can never
+  offer — at handshake time a hello-only design carries no credential
+  for the edge to check. Note for embedders: Starlette's
+  `BaseHTTPMiddleware` never sees WebSocket scopes; edge gating must be
+  pure ASGI middleware.
+- **Hello track.** The browser WebSocket API cannot set headers, so a
+  handshake without the header is accepted pending, and the server
+  waits (briefly) for the credential as the first frame:
 
 ```json
 {"type": "hello", "token": "<session JWT>", "agentIds": ["..."], "maxClaim": 2}
 ```
 
-verified exactly as PollForWork verified it — the token is the identity
-(its `public_key`), `agentIds` must be ones that key registered. Reply is
-`{"type": "welcome"}` or a close with a policy code. Anything else before
-`hello`, or an invalid token, closes the socket.
+If the header was present and valid, `hello` still arrives first (it
+carries `agentIds`/`maxClaim`, which are not auth) but may omit `token`.
+A `hello` token alongside a header token must match, else close.
+
+Either way the token is verified exactly as PollForWork verified it —
+the token is the identity (its `public_key`), `agentIds` must be ones
+that key registered. Reply is `{"type": "welcome"}` or a close with a
+policy code. Anything else before `hello`, an invalid token, or no
+credential on either track, closes the socket.
 
 After `hello`, the server drives the claim loop on the worker's behalf —
 the same inversion the gRPC servicer performed: it calls
@@ -186,6 +204,22 @@ binding) so the mapping can be promoted to core if a second consumer
 ever appears. Mapping sketch to design properly at build time: agent →
 tool, run events → progress notifications, `input-required` →
 elicitation.
+
+## Where examples live
+
+Split by what an example teaches, not by where it happens to run:
+
+| example | teaches | lives | why |
+|---|---|---|---|
+| `agent-template`, python providers | writing a provider against **souk-agent-sdk** | upstream (AgentSouk) | they are the SDK's teaching material and a provider is gateway-agnostic — it connects to any souk |
+| end-to-end demo (gateway + agent, one `docker compose` command) | what the whole system looks like running | **this repo**, a `demo` compose profile | after souk-server leaves upstream, only this repo has a gateway to demo against; build contexts point into the submodule (`AgentSouk/agent-template/…`) so the example code keeps one home |
+| browser provider (single HTML file speaking `/ws/provider`) | the frame protocol in this document, directly — no SDK | **this repo**, `examples/` | the frames are authored here, so their conformance demo belongs here; it is also the living proof of the claim that justified ws — a browser can be a provider |
+| managed-gateway embedding (`create_app` wrapped in edge auth + an admin router over the `Souk` facade) | how a deployment adds management without this repo shipping policy | **this repo**, `examples/` | the embedding surface (`create_app`, `app.state.souk`) is this repo's contract |
+
+This settles the one judgment call flagged in the extraction plan's
+Phase 2 checklist: upstream's compose drops its `agent-demo`-style
+services and slims to library development (database + tests); the demo
+role moves here wholesale.
 
 ## What this removes from this repo
 
