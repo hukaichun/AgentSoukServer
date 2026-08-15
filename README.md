@@ -50,6 +50,29 @@ Schema migration is a separate one-shot service (`souk-migrate`), not a
 server-startup step — deployments run DDL with different credentials than
 the DML-only role the server needs.
 
+## TLS is required off localhost
+
+TLS is a serving-layer concern — souk core never touches a socket, so
+none of this is a core setting (the `*_tls_*` fields live in
+`ServingSettings`, not `CoreSettings`). But for any gateway reachable
+beyond `localhost` it is not optional, for a specific reason: registration
+and KYOK requests are replay-protected only by a 60-second freshness
+window (`SIGNATURE_FRESHNESS_WINDOW_SECONDS`), and session tokens are
+bearer credentials. On a plaintext path, anyone in the middle can read a
+token outright or replay a captured signed request inside that window —
+TLS is what turns "bounded to 60s" into "not visible at all". The server
+logs a warning at startup when it binds HTTP without TLS.
+
+Two supported ways to get it — pick one, but off-localhost you need one:
+
+- **Terminate at the gateway:** point `SOUK_HTTP_TLS_CERT_PATH` /
+  `SOUK_HTTP_TLS_KEY_PATH` at a real CA-issued cert (dev pair:
+  `uv run python AgentSouk/scripts/gen_dev_tls_cert.py`).
+- **Terminate at a reverse proxy** (nginx / caddy / cloud LB) and run the
+  gateway plaintext on an internal network. `wss` is a plain HTTP/1.1
+  upgrade, so any proxy handles the WebSocket relay — no HTTP/2 support
+  required.
+
 ## Tests
 
 SQLite by default; the same suite runs against Postgres by exporting a DSN
