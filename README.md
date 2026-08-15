@@ -11,13 +11,13 @@ This repo is the *serving* half of Agent Souk. The split is a hard line, recorde
 
 | | **[AgentSouk](https://github.com/hukaichun/AgentSouk)** (upstream) | **AgentSoukServer** (this repo) |
 |---|---|---|
-| **Owns** | The domain: agents, threads, runs, identity, persistence, protocol *translation* | The network: ports, transports, TLS, CORS, endpoints, wire framing, admin surface |
-| **Ships** | `souk` (network-free core) + provider/caller SDKs | The gateway process assembled from core |
+| **Owns** | The domain: agents, threads, runs, identity, persistence, protocol *translation* | The network: ports, transports, TLS, CORS, endpoints, wire framing, admin surface — **both ends of every wire** |
+| **Ships** | `souk` (network-free core) | The gateway process assembled from core, plus the client SDKs that speak its wire ([`souk-agent-sdk/`](souk-agent-sdk), [`souk-client-sdk/`](souk-client-sdk)) |
 | **May it bind a socket?** | ❌ Never — enforced by packaging and test | ✅ That is its entire job |
 
 Two consequences worth knowing before touching anything:
 
-- **The wire contract is authored here.** [`docs/server-mode.md`](docs/server-mode.md) is the spec of record — single HTTP port, WebSocket relays for providers and KYOK bridges, gRPC removed. Upstream's SDKs implement that spec; they don't define it.
+- **The wire contract is authored here, and so are both sides of it.** [`docs/server-mode.md`](docs/server-mode.md) is the spec of record — single HTTP port, WebSocket relays for providers and KYOK bridges, gRPC removed. The SDKs that implement that spec live in this repo too ([`souk-agent-sdk/`](souk-agent-sdk) for providers, [`souk-client-sdk/`](souk-client-sdk) for callers and their KYOK bridges): upstream keeps no network code at all, client side included.
 - **souk core arrives via the git submodule** (`AgentSouk/souk`, a `uv` path dependency), pinned by commit. This repo contains no domain logic — it lifts headers, frames responses, binds sockets, and hands everything else to core.
 
 ---
