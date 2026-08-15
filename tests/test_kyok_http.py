@@ -1,23 +1,19 @@
-"""Covers KYOK (Keep Your Own Key) — souk/kyok.py's token issue/verify,
-and the souk/api_llm_bridge.py HTTP surface (`/kyok/poll`,
-`/kyok/v1/chat/completions`, `/kyok/respond/{request_id}`) plus its pure
-`_collapse_stream` helper. See docs/keep-your-own-key.md for the full
-design; this was previously entirely untested (see that doc's own
-"Status: experimental" header before this file existed).
+"""KYOK's one remaining HTTP route: `POST /kyok/v1/chat/completions`
+(souk_server.api_llm_bridge) — the provider-facing, OpenAI-compatible
+side, and every way its two-part authorization refuses a call. The
+bridge's side of the relay is `WS /ws/kyok`; its round trips (including
+what used to be probed over poll/respond) live in tests/test_ws_kyok.py.
+See docs/keep-your-own-key.md for the full design.
 """
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import time
 
-import pytest
-
 from souk import repo
-from souk.protocols.kyok import collapse_stream
-from souk.kyok import issue_kyok_token, verify_kyok_token
+from souk.kyok import issue_kyok_token
 
 
 def _kyok_headers(bearer: str, private_key, body: bytes) -> dict:
@@ -189,120 +185,6 @@ async def test_chat_completions_bad_signature_401s(client, session, souk, new_id
         souk.broker.forget(run_id)
 
 
-# --- Full success round trip ---------------------------------------------
-
-
-def _chunk(content: str = "", role: str | None = None, finish_reason: str | None = None) -> dict:
-    delta: dict = {}
-    if role:
-        delta["role"] = role
-    if content:
-        delta["content"] = content
-    return {
-        "id": "chatcmpl-1",
-        "object": "chat.completion.chunk",
-        "created": 1,
-        "model": "kyok",
-        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
-    }
-
-
-async def test_full_round_trip_non_streaming(client, session, souk, new_identity):
-    identity, agent_id = await _register_agent(session, new_identity)
-    run_id = "run_success_nonstream"
-    session_id = "sess_success_nonstream"
-    souk.broker.enqueue_run(run_id, agent_id, "thread_1", {}, "ag-ui")
-    try:
-        token = issue_kyok_token(run_id, session_id, agent_id, "test-signing-secret")
-        body = json.dumps({"messages": [{"role": "user", "content": "hi"}]}).encode()
-        headers = {**_kyok_headers(token, identity._key, body), "content-type": "application/json"}
-
-        async def provider_call():
-            resp = await client.post("/kyok/v1/chat/completions", content=body, headers=headers)
-            assert resp.status_code == 200, resp.text
-            return resp.json()
-
-        async def bridge_relay():
-            poll_resp = await client.get("/kyok/poll", params={"sessionId": session_id, "waitSeconds": 5})
-            assert poll_resp.status_code == 200
-            requests = poll_resp.json()["requests"]
-            assert len(requests) == 1
-            request_id = requests[0]["requestId"]
-            ndjson = (
-                json.dumps(_chunk(content="hello", role="assistant")) + "\n"
-                + json.dumps(_chunk(content=" world", finish_reason="stop")) + "\n"
-            )
-            respond_resp = await client.post(f"/kyok/respond/{request_id}", content=ndjson)
-            assert respond_resp.status_code == 200
-
-        result, _ = await asyncio.gather(provider_call(), bridge_relay())
-        assert result["choices"][0]["message"]["content"] == "hello world"
-        assert result["choices"][0]["message"]["role"] == "assistant"
-        assert result["choices"][0]["finish_reason"] == "stop"
-    finally:
-        souk.broker.forget(run_id)
-
-
-async def test_full_round_trip_streaming(client, session, souk, new_identity):
-    identity, agent_id = await _register_agent(session, new_identity)
-    run_id = "run_success_stream"
-    session_id = "sess_success_stream"
-    souk.broker.enqueue_run(run_id, agent_id, "thread_1", {}, "ag-ui")
-    try:
-        token = issue_kyok_token(run_id, session_id, agent_id, "test-signing-secret")
-        body = json.dumps({"messages": [{"role": "user", "content": "hi"}], "stream": True}).encode()
-        headers = {**_kyok_headers(token, identity._key, body), "content-type": "application/json"}
-
-        async def provider_call():
-            async with client.stream(
-                "POST", "/kyok/v1/chat/completions", content=body, headers=headers
-            ) as resp:
-                assert resp.status_code == 200
-                return [line async for line in resp.aiter_lines() if line]
-
-        async def bridge_relay():
-            poll_resp = await client.get("/kyok/poll", params={"sessionId": session_id, "waitSeconds": 5})
-            requests = poll_resp.json()["requests"]
-            request_id = requests[0]["requestId"]
-            ndjson = json.dumps(_chunk(content="hi", role="assistant", finish_reason="stop")) + "\n"
-            await client.post(f"/kyok/respond/{request_id}", content=ndjson)
-
-        lines, _ = await asyncio.gather(provider_call(), bridge_relay())
-        assert lines[-1] == "data: [DONE]"
-        assert any("hi" in line for line in lines[:-1])
-    finally:
-        souk.broker.forget(run_id)
-
-
-async def test_respond_error_line_surfaces_as_error_and_stream_ends(client, session, souk, new_identity):
-    identity, agent_id = await _register_agent(session, new_identity)
-    run_id = "run_error_line"
-    session_id = "sess_error_line"
-    souk.broker.enqueue_run(run_id, agent_id, "thread_1", {}, "ag-ui")
-    try:
-        token = issue_kyok_token(run_id, session_id, agent_id, "test-signing-secret")
-        body = json.dumps({"messages": [], "stream": True}).encode()
-        headers = {**_kyok_headers(token, identity._key, body), "content-type": "application/json"}
-
-        async def provider_call():
-            async with client.stream(
-                "POST", "/kyok/v1/chat/completions", content=body, headers=headers
-            ) as resp:
-                return [line async for line in resp.aiter_lines() if line]
-
-        async def bridge_relay():
-            poll_resp = await client.get("/kyok/poll", params={"sessionId": session_id, "waitSeconds": 5})
-            request_id = poll_resp.json()["requests"][0]["requestId"]
-            ndjson = json.dumps({"error": "upstream LLM call failed"}) + "\n"
-            await client.post(f"/kyok/respond/{request_id}", content=ndjson)
-
-        lines, _ = await asyncio.gather(provider_call(), bridge_relay())
-        assert len(lines) == 1
-        assert json.loads(lines[0].removeprefix("data: ")) == {"error": "upstream LLM call failed"}
-    finally:
-        souk.broker.forget(run_id)
-
-
 async def test_claim_timeout_returns_502(client, session, souk, new_identity, monkeypatch):
     import souk.protocols.kyok as kyok_protocol
 
@@ -318,11 +200,3 @@ async def test_claim_timeout_returns_502(client, session, souk, new_identity, mo
         assert resp.status_code == 502
     finally:
         souk.broker.forget(run_id)
-
-
-async def test_respond_unknown_request_id_404s(client):
-    resp = await client.post("/kyok/respond/does-not-exist", content=b"")
-    assert resp.status_code == 404
-
-
-# --- _collapse_stream (pure function) ------------------------------------

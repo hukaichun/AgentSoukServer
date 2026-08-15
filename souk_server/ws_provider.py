@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import logging
 from collections import defaultdict
 from functools import partial
@@ -35,6 +34,14 @@ from fastapi import APIRouter, WebSocket
 
 from souk.errors import InvalidRegistration
 from souk.identity import verify_session_token
+from souk_server.ws_common import (
+    INTERNAL_ERROR,
+    POLICY_VIOLATION,
+    close_frame,
+    parse_frame,
+    receive_hello,
+    write_loop,
+)
 
 if TYPE_CHECKING:
     from souk.core import Souk
@@ -43,25 +50,10 @@ logger = logging.getLogger("souk.ws_provider")
 
 router = APIRouter()
 
-# How long a fresh connection may sit silent before `hello` arrives. The
-# hello track exists for browser clients that cannot set headers; a socket
-# that connects and says nothing is not one of those, it is a leak.
-HELLO_TIMEOUT_SECONDS = 5.0
-
 # One cycle of the server-side claim loop: how long each claim_work call
 # long-polls before coming back empty. Also the liveness heartbeat — every
 # cycle marks this worker's agents seen, exactly as PollForWork did.
 CLAIM_WAIT_SECONDS = 25.0
-
-# Close codes. 1008 (policy violation) for anything about credentials,
-# 1011 for a server-side failure the client didn't cause.
-POLICY_VIOLATION = 1008
-INTERNAL_ERROR = 1011
-
-# Internal frame type routing a close through the single writer task —
-# never sent on the wire. Serialized like every other outbound frame so a
-# close can't interleave with a half-written message.
-_CLOSE = "_close"
 
 
 class WorkerSessions:
@@ -105,35 +97,6 @@ def _bearer(websocket: WebSocket) -> str:
     return header[len("Bearer ") :] if header.startswith("Bearer ") else header
 
 
-async def _receive_json(websocket: WebSocket) -> dict[str, Any] | None:
-    """One inbound frame as a dict, or None once the socket is gone.
-    Anything unparseable comes back as an empty dict — the caller answers
-    with an `error` frame rather than tearing the connection down."""
-    message = await websocket.receive()
-    if message["type"] == "websocket.disconnect":
-        return None
-    text = message.get("text")
-    if text is None:
-        return {}
-    try:
-        frame = json.loads(text)
-    except json.JSONDecodeError:
-        return {}
-    return frame if isinstance(frame, dict) else {}
-
-
-async def _write_loop(websocket: WebSocket, outbound: asyncio.Queue) -> None:
-    # Single writer serializing every outbound frame — run pushes, cancel
-    # pushes, error replies, and the close itself — because concurrent
-    # sends on one ASGI websocket are not safe to interleave.
-    while True:
-        frame = await outbound.get()
-        if frame.get("type") == _CLOSE:
-            await websocket.close(code=frame["code"], reason=frame["reason"])
-            return
-        await websocket.send_text(json.dumps(frame))
-
-
 async def _claim_loop(
     souk: "Souk",
     sessions: WorkerSessions,
@@ -173,11 +136,11 @@ async def _claim_loop(
             # The session token aged out under a long-lived socket. Close
             # with policy — the SDK's reconnect re-registers, which is how
             # tokens were always refreshed.
-            outbound.put_nowait({"type": _CLOSE, "code": POLICY_VIOLATION, "reason": str(e)})
+            outbound.put_nowait(close_frame(POLICY_VIOLATION, str(e)))
             return
         except Exception:
             logger.exception("claim loop for %s failed", public_key)
-            outbound.put_nowait({"type": _CLOSE, "code": INTERNAL_ERROR, "reason": "claim loop failed"})
+            outbound.put_nowait(close_frame(INTERNAL_ERROR, "claim loop failed"))
             return
         for run in runs:
             in_flight.add(run.run_id)
@@ -204,15 +167,8 @@ async def provider_socket(websocket: WebSocket) -> None:
     # pure ASGI middleware in front (BaseHTTPMiddleware never sees
     # websocket scopes).
     await websocket.accept()
-    try:
-        hello = await asyncio.wait_for(_receive_json(websocket), timeout=HELLO_TIMEOUT_SECONDS)
-    except asyncio.TimeoutError:
-        await websocket.close(code=POLICY_VIOLATION, reason="no hello frame")
-        return
+    hello = await receive_hello(websocket)
     if hello is None:
-        return
-    if hello.get("type") != "hello":
-        await websocket.close(code=POLICY_VIOLATION, reason="first frame must be hello")
         return
 
     header_token = _bearer(websocket)
@@ -241,7 +197,7 @@ async def provider_socket(websocket: WebSocket) -> None:
     sessions.add(public_key, outbound)
     outbound.put_nowait({"type": "welcome"})
 
-    writer = asyncio.create_task(_write_loop(websocket, outbound))
+    writer = asyncio.create_task(write_loop(websocket, outbound))
     claimer = asyncio.create_task(
         _claim_loop(
             souk, sessions, token, public_key, agent_ids, max_claim, in_flight, credit, outbound
@@ -293,14 +249,8 @@ async def provider_socket(websocket: WebSocket) -> None:
 async def _parse_worker_frame(message: dict[str, Any]) -> tuple[str, str | None, Any] | None:
     """(type, runId, event) off one raw ASGI message, or None if it isn't
     JSON text. Split out so the reader loop above stays about semantics."""
-    text = message.get("text")
-    if text is None:
-        return None
-    try:
-        frame = json.loads(text)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(frame, dict):
+    frame = parse_frame(message)
+    if frame is None:
         return None
     ftype = frame.get("type")
     if not isinstance(ftype, str):
