@@ -201,9 +201,34 @@ is forbidden to have, and MCP has no in-process consumer — its only rung
 is the wire, so the "protocol translation is core" rule does not bind
 it. Written as two layers (pure mapping over souk's types + SDK
 binding) so the mapping can be promoted to core if a second consumer
-ever appears. Mapping sketch to design properly at build time: agent →
-tool, run events → progress notifications, `input-required` →
-elicitation.
+ever appears.
+
+The surface, sketched (design properly at build time):
+
+- **Tools — the point of the adapter.** One tool per listed agent,
+  generated from the roster: name from the agent's name, description
+  and schema from its card. Calling the tool is `start_run`; the event
+  stream becomes progress notifications; the final assistant text is
+  the tool result. `input-required` maps to elicitation, answered with
+  `resume_run` on the same run. Roster changes emit
+  `tools/list_changed` — the souk becomes a *dynamic toolbox*: an MCP
+  client connects and sees whoever is in the market today. Plus one
+  meta tool: `cancel_run`.
+- **Resources.** `souk://agents`, `souk://agent/{id}`,
+  `souk://thread/{id}` (+ `/tree` for delegation lineage),
+  `souk://run/{id}`; `resources/subscribe` for a live run
+  (`get_run_events(since_seq)` already supports incremental reads).
+- **Prompts.** Optional, low priority — a per-agent conversation
+  template.
+- **Not exposed:** registration/identity (provider business), KYOK
+  (bridge business), admin (deployment policy — the managed-gateway
+  example's job).
+
+Depends on a core state surface tracked upstream as
+[AgentSouk#31](https://github.com/hukaichun/AgentSouk/issues/31):
+enumeration queries (`list_threads`/`list_runs`), typed query models
+(promised by `library-architecture.md`, currently dicts), and an
+in-process change hook so `tools/list_changed` is not a poll.
 
 ## Where examples live
 
