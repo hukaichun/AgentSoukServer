@@ -1,7 +1,9 @@
 # Server mode: one port, WebSocket relay
 
-Status: **design, not yet implemented.** Defines what this gateway serves
-and over which transports. Supersedes the inherited HTTP+gRPC split.
+Status: **implemented** (`souk_server/ws_provider.py`,
+`souk_server/ws_kyok.py`), gRPC removed. Defines what this gateway
+serves and over which transports. Supersedes the inherited HTTP+gRPC
+split.
 
 Nothing here is constrained by compatibility: souk is unreleased, this
 gateway has no deployments, and the gRPC SDK has no users. This is the
@@ -80,7 +82,13 @@ Either way the token is verified exactly as PollForWork verified it —
 the token is the identity (its `public_key`), `agentIds` must be ones
 that key registered. Reply is `{"type": "welcome"}` or a close with a
 policy code. Anything else before `hello`, an invalid token, or no
-credential on either track, closes the socket.
+credential on either track, closes the socket. Concretely: `hello` must
+arrive within 5 seconds of the handshake; every handshake refusal closes
+with 1008 (policy violation) and a reason string; 1011 is reserved for
+server-side failure the client didn't cause — including the session
+token expiring under a long-lived socket, which closes with 1008 so the
+client's ordinary reconnect (which re-registers, refreshing the token)
+is the recovery path.
 
 After `hello`, the server drives the claim loop on the worker's behalf —
 the same inversion the gRPC servicer performed: it calls
@@ -89,7 +97,7 @@ this socket, and pushes what it claims:
 
 | direction | frame | carries |
 |---|---|---|
-| ↓ | `{"type": "run", "runId", "threadId", "input"}` | a claimed run **with its RunAgentInput** — claiming is the hand-over, unchanged |
+| ↓ | `{"type": "run", "runId", "threadId", "agentId", "input"}` | a claimed run **with its RunAgentInput** — claiming is the hand-over, unchanged. `agentId` rides along because the worker routes by it and RunAgentInput does not name it |
 | ↑ | `{"type": "event", "runId", "event"}` | one AG-UI event; authorized against `Run.claimed_by`, unchanged |
 | ↑ | `{"type": "finish", "runId"}` | that run's stream ended (was `end_of_stream`) |
 | ↓ | `{"type": "cancel", "runId"}` | a request, not an order — outcome decided when the stream ends, unchanged |
@@ -121,10 +129,16 @@ Replaces the `GET /kyok/poll` + `POST /kyok/respond/{id}` pair. The
 provider-facing `POST /kyok/v1/chat/completions` endpoint is untouched —
 an OpenAI-compatible URL is the whole point of that side.
 
-One socket per caller session, hello-authenticated like the provider
-socket (`{"type": "hello", "token": "<kyok token>"}` — the same bearer
-`respond` verifies today, carrying the KYOK HMAC material the adapter
-already checks):
+The socket opens with `{"type": "hello", "sessionId": "<session id>"}`.
+`sessionId` is a **routing key, not a credential** — the same
+caller-minted, souk-opaque string `poll` took (souk neither mints nor
+verifies it; see souk/kyok.py). souk has no caller identity to bind a
+bridge credential to, deliberately: *who* may present a session is the
+deployment's business, enforced at the edge (pure ASGI middleware, before
+accept — the header track exists for exactly this). What the socket
+still buys over the query string: `sessionId` no longer appears in any
+URL, so it stops leaking into access logs — the mistake the old
+`/kyok/poll?sessionId=…` was making against this document's own rule.
 
 | direction | frame | carries |
 |---|---|---|
@@ -132,9 +146,27 @@ already checks):
 | ↑ | `{"type": "chunk", "requestId", "data"}` | one chunk of the bridge's LLM response (was a line of the `respond` NDJSON stream) |
 | ↑ | `{"type": "done", "requestId"}` | end of that response (was the `_DONE` sentinel / EOF) |
 | ↑ | `{"type": "error", "requestId", "message"}` | bridge-side failure, so the waiting completion can fail fast instead of timing out |
+| ↓ | `{"type": "error", "requestId"?, "message"}` | server-side rejection of a frame (unknown type, or a `requestId` not in flight on this connection) — answered, not a teardown, same as the provider socket |
 
 `requestId` multiplexing means one bridge socket serves concurrent
 completions — strictly better than `poll_one`'s one-per-cycle handover.
+
+Connection semantics, decided with the implementation:
+
+- **Sockets sharing a `sessionId` coexist**, each completion request
+  going to whichever polls first — the race the HTTP poll already had.
+  Pretending to enforce one-bridge-per-session would be ritual, not
+  security: without a real bridge credential, "the bridge" *is* whoever
+  presents the sessionId. Tightening this waits on a caller-identity
+  primitive, which souk deliberately doesn't own.
+- **An answer is accepted only on the connection its request was
+  delivered to** (see the security note below).
+- **A socket dropping mid-answer fails its in-flight completions
+  immediately** (`{"error": …}` to the waiting provider) — a truncated
+  answer must never pass as a complete one, and failing now beats the
+  claim timeout. Requests delivered but unanswered when a socket dies
+  are not re-queued; they fail the same way a crashed poll-era bridge
+  failed them.
 
 Provider and KYOK stay **two endpoints**, not one multiplexed socket:
 different identity (provider key vs. caller session), different
@@ -164,12 +196,16 @@ input.
 
 The WebSocket removes the naked endpoint. After migration:
 
-- `chunk` / `done` / `error` frames arrive **only on a socket that
-  passed `hello`**, so answering a completion requires being the
-  authenticated bridge for that session — the binding the capability
-  string never carried. `request_id` reverts to what it should have been
-  all along: a multiplexing key *within* an authenticated channel, not a
-  bearer capability on an open one.
+- `chunk` / `done` / `error` frames are accepted **only for requests
+  delivered on that same connection** — the server knows exactly which
+  `requestId`s it pushed down each socket, and membership in that set,
+  not anything a frame carries, is what authorizes an answer. This is
+  the binding the capability string never had, and it is deliberately
+  connection-scoped state living in the serving layer: core has no
+  concept of a connection, and has nothing of its own to verify on the
+  bridge side (see the hello note above). `request_id` reverts to what
+  it should have been all along: a multiplexing key *within* the
+  connection that received it, not a bearer capability on an open route.
 - There is no `request_id` in a URL or a log line to leak, and no
   unauthenticated route to replay it against.
 

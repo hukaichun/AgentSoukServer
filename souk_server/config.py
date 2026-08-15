@@ -24,8 +24,6 @@ class ServingSettings(BaseSettings):
 
     http_host: str = "0.0.0.0"
     http_port: int = 8000
-    grpc_host: str = "0.0.0.0"
-    grpc_port: int = 50051
 
     # Origins allowed to call souk's HTTP surface cross-origin (e.g. a
     # souk-directory instance served from a different origin). "*" is fine
@@ -41,18 +39,16 @@ class ServingSettings(BaseSettings):
     # whoever serves souk passes this to the protocol layer.
     public_http_url: str = "http://localhost:8000"
 
-    # TLS for the gRPC server (PollForWork/AgentSession) and the HTTP
-    # server (/agents/register, /agui/*, /a2a/*). Both left unset means
-    # plaintext — fine for same-host development, never for a souk
-    # reachable over a real network: without TLS, session tokens and
-    # signed requests are visible to anyone on the path, and a captured
-    # registration signature is only bounded by
-    # souk.identity.SIGNATURE_FRESHNESS_WINDOW_SECONDS (60s), not
-    # prevented outright. See scripts/gen_dev_tls_cert.py for a
+    # TLS for the one listener — every surface (/agents/register, /agui/*,
+    # /a2a/*, /kyok/*, /ws/provider, /ws/kyok) rides it, wss included (a
+    # plain HTTP/1.1 upgrade). Both left unset means plaintext — fine for
+    # same-host development, never for a souk reachable over a real
+    # network: without TLS, session tokens and signed requests are visible
+    # to anyone on the path, and a captured registration signature is only
+    # bounded by souk.identity.SIGNATURE_FRESHNESS_WINDOW_SECONDS (60s),
+    # not prevented outright. See scripts/gen_dev_tls_cert.py for a
     # self-signed pair to test with; use a real CA-issued cert (or
     # terminate TLS at a reverse proxy in front of souk) for anything
     # else.
-    grpc_tls_cert_path: str | None = None
-    grpc_tls_key_path: str | None = None
     http_tls_cert_path: str | None = None
     http_tls_key_path: str | None = None

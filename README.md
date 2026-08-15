@@ -32,13 +32,12 @@ cd AgentSoukServer
 # (already cloned without it? git submodule update --init)
 ```
 
-Then, in four commands:
+Then, in three commands:
 
 ```bash
 uv sync --group dev
-uv run bash AgentSouk/scripts/gen_proto.sh souk_server/grpc_gen   # gRPC stubs (always pass the explicit path)
-uv run alembic -c AgentSouk/souk/alembic.ini upgrade head          # one-time DDL step
-SOUK_TOKEN_SIGNING_SECRET=dev uv run souk-server                   # :8000 HTTP · :50051 gRPC
+uv run alembic -c AgentSouk/souk/alembic.ini upgrade head   # one-time DDL step
+SOUK_TOKEN_SIGNING_SECRET=dev uv run souk-server            # everything on :8000
 ```
 
 Verify it's alive:
@@ -47,30 +46,27 @@ Verify it's alive:
 curl http://localhost:8000/healthz && curl http://localhost:8000/readyz
 ```
 
-> ⚠️ `gen_proto.sh` with **no arguments** targets the AgentSouk repo's own layout — always pass `souk_server/grpc_gen` from here.
-
 ---
 
 ## 🏛️ What This Process Is
 
 ```mermaid
 graph TD
-    User([Human / Web Directory]) -->|"POST /agui/{agent} (SSE)"| HTTP["FastAPI HTTP surface<br/>:8000"]
+    User([Human / Web Directory]) -->|"POST /agui/{agent} (SSE)"| HTTP["FastAPI surface — one listener<br/>:8000"]
     CallerAgent([External Agent]) -->|"POST /a2a/{agent}/rpc"| HTTP
-    Bridge([Caller's KYOK bridge]) -->|"/kyok/poll · /kyok/respond"| HTTP
+    Bridge([Caller's KYOK bridge]) ==>|"WS /ws/kyok"| HTTP
 
     subgraph Process ["souk-server (single process)"]
         HTTP --> Core["souk core (from the submodule)<br/>broker · handlers · protocol adapters"]
-        GRPC["gRPC relay :50051<br/>(→ WebSocket on :8000, per server-mode)"] <--> Core
     end
 
     Process --> DB[(SQLite / Postgres)]
-    GRPC <== "outbound persistent streams" ==> Providers["Providers behind NAT<br/>(souk-agent-sdk)"]
+    HTTP <== "WS /ws/provider (outbound)" ==> Providers["Providers behind NAT<br/>(souk-agent-sdk)"]
 ```
 
 `create_app(souk, serving)` returns a plain ASGI app that binds nothing — mount it inside a larger app, wrap it in your own middleware (pure ASGI, not `BaseHTTPMiddleware`: that class buffers streams and never sees WebSocket scopes), or let the `souk-server` console script serve it. Every I/O decision — which framework, which port, which TLS story — is made here so that core never has to.
 
-**Where this is heading** ([`docs/server-mode.md`](docs/server-mode.md)): the gRPC listener disappears; providers and KYOK bridges each get a WebSocket on the one HTTP port (`/ws/provider`, `/ws/kyok`, JSON frames, dual-track auth). One port, one TLS certificate, any reverse proxy, and a browser can be a provider. An MCP adapter lands on the same listener later.
+**Server mode is live** ([`docs/server-mode.md`](docs/server-mode.md)): providers and KYOK bridges each hold a WebSocket on the one HTTP port (`/ws/provider`, `/ws/kyok` — JSON frames, dual-track auth). One port, one TLS certificate, any reverse proxy (`wss` is a plain HTTP/1.1 upgrade), and a browser can be a provider. An MCP adapter lands on the same listener later.
 
 ---
 
@@ -104,7 +100,7 @@ docker compose up --build
 
 brings up the trio: **paradedb** (Postgres), **souk-migrate** (one-shot `alembic upgrade head`, then exits), and **souk** (the gateway, after migration completes). The migration is deliberately its own service — DDL runs with different credentials than the DML-only role the server needs; the gateway never creates tables at startup.
 
-Building the image requires the submodule checked out (`git clone --recurse-submodules`) — `proto/`, `scripts/`, and `souk/` are COPYed from it.
+Building the image requires the submodule checked out (`git clone --recurse-submodules`) — `scripts/` and `souk/` are COPYed from it.
 
 ---
 
@@ -128,11 +124,11 @@ uv run python -c "from souk.config import CoreSettings; from souk.core import So
 
 ## 🗺️ Roadmap
 
-In build order, from [`docs/server-mode.md`](docs/server-mode.md):
+From [`docs/server-mode.md`](docs/server-mode.md); the transport work is done:
 
-1. 🔌 **`WS /ws/provider`** — the worker relay (claim / event / finish / cancel) over one socket, probed end-to-end including reconnect-mid-run and cancel.
-2. 🔑 **`WS /ws/kyok`** — replaces the poll/respond pair, and removes the unauthenticated respond endpoint (a security fix, not just a transport swap — see the design note).
-3. ✂️ **Strip gRPC** — listener, stubs, deps, `:50051`, and this README's mentions of them.
+1. ✅ **`WS /ws/provider`** — the worker relay (claim / event / finish / cancel) over one socket, probed end-to-end including reconnect-mid-run and cancel ([tests/test_ws_provider.py](tests/test_ws_provider.py)).
+2. ✅ **`WS /ws/kyok`** — replaced the poll/respond pair; answers are only accepted on the connection each request was delivered to (a security fix, not just a transport swap — see the design note).
+3. ✅ **gRPC stripped** — listener, stubs, deps, `:50051` all gone; the wire semantics live on in the ws frames, `proto/souk.proto` remains upstream as their record.
 4. 🧩 **Examples** — a browser provider (frame-protocol conformance, no SDK), an end-to-end `demo` compose profile, and a managed-gateway embedding sample (edge auth + admin router over the `Souk` facade).
 
 **License**: [Apache 2.0](AgentSouk/LICENSE) (inherited from upstream; this repo has no separate license file yet)

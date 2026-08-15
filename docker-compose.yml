@@ -53,7 +53,6 @@ services:
       dockerfile: Dockerfile
     ports:
       - "8000:8000"
-      - "50051:50051"
     depends_on:
       souk-migrate:
         condition: service_completed_successfully

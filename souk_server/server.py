@@ -1,10 +1,11 @@
-"""The reference gateway: assembles a Souk into an HTTP + gRPC server.
+"""The reference gateway: assembles a Souk into one HTTP server.
 
 This is the serving layer. It is the only place that binds a port, applies
 CORS, or terminates TLS — every such decision belongs to whoever hosts souk,
 not to souk itself, which is why `create_app` hands back a plain ASGI app and
-`main` is a thin wrapper that happens to serve it. This module moves to the
-souk-server subproject in a later step; see docs/library-architecture.md.
+`main` is a thin wrapper that happens to serve it. One listener carries
+everything (docs/server-mode.md): callers over HTTP+SSE, providers over
+WS /ws/provider, KYOK bridges over WS /ws/kyok.
 """
 
 import asyncio
@@ -15,12 +16,11 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from souk_server import api_a2a, api_agui, api_health, api_llm_bridge, api_registry
+from souk_server import api_a2a, api_agui, api_health, api_llm_bridge, api_registry, ws_kyok, ws_provider
 from souk.config import CoreSettings
 from souk_server.config import ServingSettings
 from souk.core import Souk
 from souk_server.deps import install_error_handlers
-from souk_server.grpc_server import create_grpc_server
 
 logger = logging.getLogger("souk_server")
 logging.basicConfig(level=logging.INFO)
@@ -57,6 +57,10 @@ def create_app(souk: Souk, serving: ServingSettings | None = None) -> FastAPI:
     # module-level state and two apps can serve two different souks.
     app.state.souk = souk
     app.state.serving_settings = serving
+    # Per-app, not module-level, for the same reason the souk itself is on
+    # app.state: two apps in one process must not share a cancel-routing
+    # table (see ws_provider.WorkerSessions).
+    app.state.worker_sessions = ws_provider.WorkerSessions()
     app.add_middleware(
         CORSMiddleware,
         allow_origins=serving.cors_allow_origins,
@@ -69,6 +73,8 @@ def create_app(souk: Souk, serving: ServingSettings | None = None) -> FastAPI:
     app.include_router(api_agui.router)
     app.include_router(api_a2a.router)
     app.include_router(api_llm_bridge.router)
+    app.include_router(ws_provider.router)
+    app.include_router(ws_kyok.router)
     return app
 
 
@@ -76,16 +82,6 @@ async def _serve() -> None:
     souk = Souk(CoreSettings())
     serving = ServingSettings()
     app = create_app(souk, serving)
-
-    # Ahead of the gRPC server: it must not accept PollForWork/AgentSession
-    # traffic before reconciliation has run. uvicorn's Server.serve() below
-    # triggers the app's ASGI lifespan, which calls this again — and that is
-    # simply a no-op now, rather than a second reconciliation pass justified
-    # by the window between the two usually being empty.
-    await souk.start()
-
-    grpc_server = create_grpc_server(souk, serving)
-    await grpc_server.start()
 
     if not (serving.http_tls_cert_path and serving.http_tls_key_path):
         logger.warning(
@@ -105,9 +101,12 @@ async def _serve() -> None:
     http_server = uvicorn.Server(config)
 
     try:
-        await asyncio.gather(http_server.serve(), grpc_server.wait_for_termination())
+        # uvicorn's serve() runs the app's ASGI lifespan, which brings souk
+        # up (reconciliation, health sweeps) before the listener accepts
+        # anything — no work can arrive on any surface before it has run,
+        # now that every surface lives on this one listener.
+        await http_server.serve()
     finally:
-        await grpc_server.stop(grace=5)
         await souk.aclose()
 
 
