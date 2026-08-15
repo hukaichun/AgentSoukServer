@@ -27,3 +27,6 @@ souk_server/grpc_gen/*_pb2.pyi
 souk_server/grpc_gen/*_pb2_grpc.py
 
 .pytest_cache/
+
+# Claude Code session state (worktrees etc.) — never commit
+.claude/
