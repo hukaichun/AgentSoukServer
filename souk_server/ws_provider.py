@@ -55,6 +55,15 @@ router = APIRouter()
 # cycle marks this worker's agents seen, exactly as PollForWork did.
 CLAIM_WAIT_SECONDS = 25.0
 
+# How often an idle socket re-checks that souk still lists the agents it
+# is claiming for. Deliberately slower than a claim cycle: the condition
+# it catches (a registration that vanished under a live socket — a
+# restored database, a de-listing, a souk redeployed against a fresh one)
+# is rare and permanent, so the cost of noticing it a minute late is
+# nothing, while checking every cycle would scan the roster per socket
+# per 25s for a question that is almost always the same.
+OWNERSHIP_RECHECK_SECONDS = 120.0
+
 
 class WorkerSessions:
     """Which connected providers souk can currently reach, by public key.
@@ -97,6 +106,20 @@ def _bearer(websocket: WebSocket) -> str:
     return header[len("Bearer ") :] if header.startswith("Bearer ") else header
 
 
+async def _still_owns_any(souk: "Souk", public_key: str, agent_ids: list[str]) -> bool:
+    """Does souk still list any of these agents under this key?
+
+    Asked through `list_agents` rather than a narrower lookup because the
+    roster is what "listed" means — the same view the registry, the
+    directory and the docent answer from — and because `get_agent` does
+    not carry the owning key, so it cannot answer the ownership half at
+    all. A market's worth of stalls is a cheap scan once every couple of
+    minutes per socket.
+    """
+    listed = {a.agent_id for a in await souk.list_agents() if a.public_key == public_key}
+    return bool(listed & set(agent_ids))
+
+
 async def _claim_loop(
     souk: "Souk",
     sessions: WorkerSessions,
@@ -114,6 +137,8 @@ async def _claim_loop(
     is under it. No credit frames; `finish` is the credit (the reader sets
     `credit` when one arrives).
     """
+    loop = asyncio.get_running_loop()
+    last_ownership_check = loop.time()
     while True:
         remaining = None
         if max_claim is not None:
@@ -142,6 +167,39 @@ async def _claim_loop(
             logger.exception("claim loop for %s failed", public_key)
             outbound.put_nowait(close_frame(INTERNAL_ERROR, "claim loop failed"))
             return
+
+        # An idle cycle is the cheap moment to ask whether this socket is
+        # still claiming for agents souk knows about. `claim_work` filters
+        # unowned ids out and carries on — correct in itself, and the
+        # reason a worker can loop here forever against agents that no
+        # longer exist: it claims nothing, is touched by nothing, ages out
+        # of the roster, and reports no error, while its container sits
+        # there healthy. Observed, not imagined: a database restored
+        # under a running provider left it invisible for half an hour,
+        # logging one server-side warning per cycle and nothing at all on
+        # its own side.
+        #
+        # Closing is the repair, not the punishment: registering is what
+        # mints agent_ids, the SDK re-registers on every reconnect, so a
+        # worker that says goodbye here comes back owning its agents
+        # again. Same shape as the expired-token close below it.
+        if not runs and loop.time() - last_ownership_check >= OWNERSHIP_RECHECK_SECONDS:
+            last_ownership_check = loop.time()
+            if not await _still_owns_any(souk, public_key, agent_ids):
+                logger.warning(
+                    "worker %s claims for agent id(s) souk no longer lists (%s) — "
+                    "closing so its reconnect re-registers",
+                    public_key,
+                    agent_ids,
+                )
+                outbound.put_nowait(
+                    close_frame(
+                        POLICY_VIOLATION,
+                        "none of these agentIds are listed for this key; re-register",
+                    )
+                )
+                return
+
         for run in runs:
             in_flight.add(run.run_id)
             outbound.put_nowait(
