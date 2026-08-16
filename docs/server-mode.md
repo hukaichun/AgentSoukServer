@@ -21,9 +21,9 @@ a persistent WebSocket each, replacing gRPC entirely.
 | Who | Surface | Transport | Status |
 |---|---|---|---|
 | Callers | AG-UI (`/agui/*`, `/threads/*`), A2A (`/a2a/*`), registry (`/agents*`), health | HTTP + SSE | exists, unchanged |
-| Callers | MCP | streamable HTTP, same listener | later; see "MCP" below |
-| Providers | work relay | `WS /ws/provider` | to build |
-| KYOK bridge | completion relay | `WS /ws/kyok` | to build |
+| Callers | MCP (the docent) | streamable HTTP at `/mcp`, same listener | built; see "MCP: the docent" below |
+| Providers | work relay | `WS /ws/provider` | built |
+| KYOK bridge | completion relay | `WS /ws/kyok` | built |
 | Provider's model client | `POST /kyok/v1/chat/completions` | HTTP (OpenAI-compatible by definition) | exists, unchanged |
 
 gRPC is **removed**, not demoted to an option: `grpc_server.py`,
@@ -229,9 +229,9 @@ so they are fixed in AgentSouk, not here:
   `souk-client-sdk`'s bridge (per-run request/token caps, model
   allow-list), not a souk-side rule souk can't price. Tracked upstream.
 
-## MCP (recorded decision, separate work)
+## MCP: the docent
 
-MCP lands on the same HTTP listener later, as an adapter **in this
+MCP is served on the same HTTP listener, as an adapter **in this
 repo**, not in core: the official SDK drags transport dependencies core
 is forbidden to have, and MCP has no in-process consumer — its only rung
 is the wire, so the "protocol translation is core" rule does not bind
@@ -247,19 +247,36 @@ did exactly that, and it was scoped out on review). What MCP adds is
 the thing A2A assumes you already did: *knowing what is in this souk.*
 MCP hands out the map; A2A does the walking.
 
-The surface, sketched (design properly at build time):
+**Built** as `souk_server/mcp_docent.py`, mounted at `/mcp` on the same
+listener (`tests/test_mcp_docent.py`; probed end to end with a real MCP
+client over a real socket). The audience is a **docent** — the guide who
+walks a visitor through the market — not an operator, which is what
+fixes the surface below at "who is here, what do they do, where do I go".
 
-- **Resources.** `souk://agents` — the roster: each agent's name,
-  description, skills, online state, and which provider identity
-  (public key) serves it. `souk://agent/{id}` — the full card,
-  including the A2A endpoint to actually call it at. Possibly
-  `souk://providers` — the roster grouped the way souk itself groups
-  it, by provider key: which identity is here, serving what.
-- **Tools — read-only directory lookups only,** because most MCP
-  clients wield tools far more readily than resources:
-  `search_agents(query)`, `describe_agent(name)` — each answer ending
-  in "and here is its A2A endpoint". A lookup, never an invocation.
-- **Notifications.** Optional, and if built, necessarily two-track:
+- **Tools** (read-only, `read_only_hint` declared): `browse_souk` (the
+  market grouped by stall), `search_agents(query)` (over name,
+  description, skills and tags), `describe_agent(name_or_id)`,
+  `describe_stall(provider_key)`. Tools rather than resources alone
+  because most MCP clients wield tools far more readily.
+- **Resources.** `souk://providers` (stall-shaped) and `souk://agents`
+  (flat, each record still carrying its provider), plus the
+  `souk://agent/{agent_id}` template.
+- **Every answer carries directions and a provider key.** The
+  `a2a_endpoint` uses the `/a2a/id/{agent_id}` route, never the name
+  route: display names are not unique across providers, and a direction
+  that sometimes 409s is not a direction. The provider's `public_key`
+  rides on every agent record because that is what makes an answer
+  *placeable* — souk-directory groups by stall, and the AI-town layout
+  derives a stall's map coordinate by hashing that key, so an agent named
+  without its provider cannot be pointed at.
+- **Ambiguity is handed back, not guessed.** A duplicate display name
+  returns the candidates with their ids rather than picking one — the
+  same refusal souk's own name route makes.
+- **`online` never travels alone.** Each record pairs it with
+  `last_seen` in words ("40s ago", "3d ago"), because the boolean cannot
+  separate "stepped away" from "gone for a week" and that is the
+  difference a visitor deciding whether to wait is asking about.
+- **Notifications.** Not built. If built, necessarily two-track:
   `souk.on_change` fires for registrations and de-listings, but an agent
   going stale fires *nothing* — `online` is derived from `last_seen_at`
   against a window at query time, so there is no instant to fire on
@@ -273,13 +290,24 @@ The surface, sketched (design properly at build time):
   it later if wanted, deliberately absent now), admin (deployment
   policy — the managed-gateway example's job).
 
-Core already serves most of this (`list_agents` carries description/
-skills/online/provider key). What remains wanted upstream, tracked as
-[AgentSouk#31](https://github.com/hukaichun/AgentSouk/issues/31) after
-rescoping: typed query models (promised by `library-architecture.md`,
-currently dicts); a roster change hook is nice-to-have, and the
-enumeration queries originally asked for there are withdrawn — a
-discovery-only adapter does not need them.
+Core serves all of it from `list_agents` alone
+([AgentSouk#31](https://github.com/hukaichun/AgentSouk/issues/31), now
+closed: typed query models landed, enumeration was withdrawn as
+unneeded). Search filters that roster in Python rather than querying —
+a market's worth of stalls is not a log, and if a deployment ever
+outgrows it, that is when a core query earns its place.
+
+**The one question the docent cannot answer: "are they busy right
+now?"** Capacity is per-stall in souk's model (`maxClaim` is a
+provider's budget across everything it hosts), and the roster carries
+nothing about it — so "you'll have to wait, they're serving someone",
+one of the few genuinely market-shaped answers a guide could give, is
+unavailable. Note where the data actually is before reaching upstream
+for it: this gateway knows each connected worker's `maxClaim` (it
+arrives in the hello frame) and how many runs it has in flight (it
+drives the claim loop), so the honest version is per-process serving
+state, not a core projection — and it would read as authoritative while
+being blind to workers connected to another replica.
 
 ## Where examples live
 

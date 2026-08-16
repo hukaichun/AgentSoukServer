@@ -21,6 +21,7 @@ dependencies = [
     # — the ws relays need no dependency of their own.
     "uvicorn[standard]>=0.32",
     "sse-starlette>=2.1",
+    "mcp>=2.0",
 ]
 
 [project.optional-dependencies]

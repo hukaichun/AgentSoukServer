@@ -21,6 +21,7 @@ from souk.config import CoreSettings
 from souk_server.config import ServingSettings
 from souk.core import Souk
 from souk_server.deps import install_error_handlers
+from souk_server.mcp_docent import create_docent
 
 logger = logging.getLogger("souk_server")
 logging.basicConfig(level=logging.INFO)
@@ -32,6 +33,13 @@ def create_app(souk: Souk, serving: ServingSettings | None = None) -> FastAPI:
     their own middleware or mount it inside a larger app.
     """
     serving = serving or ServingSettings()
+
+    # The docent: MCP discovery over the same listener (docs/server-mode.md).
+    # Stateless because it holds nothing per visitor — every answer is a
+    # fresh query against the roster, so there is no session worth pinning to
+    # one process, and a second replica can answer just as well.
+    docent = create_docent(souk, serving.public_http_url)
+    docent_app = docent.streamable_http_app(streamable_http_path="/", stateless_http=True)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -45,7 +53,11 @@ def create_app(souk: Souk, serving: ServingSettings | None = None) -> FastAPI:
         # separate from starting the server, which only ever runs DML against
         # a possibly DML-only role.
         await souk.start()
-        yield
+        # The MCP session manager owns a task group; without this its
+        # requests fail rather than degrade, which is why it is entered here
+        # rather than lazily on first call.
+        async with docent.session_manager.run():
+            yield
         # Deliberately no aclose: this app was handed a Souk it does not own
         # (see create_app's docstring — it may be mounted inside a larger
         # app), and closing someone else's would take their background work
@@ -75,6 +87,9 @@ def create_app(souk: Souk, serving: ServingSettings | None = None) -> FastAPI:
     app.include_router(api_llm_bridge.router)
     app.include_router(ws_provider.router)
     app.include_router(ws_kyok.router)
+    # Mounted rather than routed: the MCP transport is its own ASGI app, and
+    # this is the one surface souk does not frame itself.
+    app.mount("/mcp", docent_app)
     return app
 
 

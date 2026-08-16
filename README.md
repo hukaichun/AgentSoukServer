@@ -66,7 +66,7 @@ graph TD
 
 `create_app(souk, serving)` returns a plain ASGI app that binds nothing — mount it inside a larger app, wrap it in your own middleware (pure ASGI, not `BaseHTTPMiddleware`: that class buffers streams and never sees WebSocket scopes), or let the `souk-server` console script serve it. Every I/O decision — which framework, which port, which TLS story — is made here so that core never has to.
 
-**Server mode is live** ([`docs/server-mode.md`](docs/server-mode.md)): providers and KYOK bridges each hold a WebSocket on the one HTTP port (`/ws/provider`, `/ws/kyok` — JSON frames, dual-track auth). One port, one TLS certificate, any reverse proxy (`wss` is a plain HTTP/1.1 upgrade), and a browser can be a provider. An MCP adapter lands on the same listener later.
+**Server mode is live** ([`docs/server-mode.md`](docs/server-mode.md)): providers and KYOK bridges each hold a WebSocket on the one HTTP port (`/ws/provider`, `/ws/kyok` — JSON frames, dual-track auth). One port, one TLS certificate, any reverse proxy (`wss` is a plain HTTP/1.1 upgrade), and a browser can be a provider. The MCP docent rides the same listener at `/mcp`.
 
 ---
 
@@ -129,6 +129,7 @@ From [`docs/server-mode.md`](docs/server-mode.md); the transport work is done:
 1. ✅ **`WS /ws/provider`** — the worker relay (claim / event / finish / cancel) over one socket, probed end-to-end including reconnect-mid-run and cancel ([tests/test_ws_provider.py](tests/test_ws_provider.py)).
 2. ✅ **`WS /ws/kyok`** — replaced the poll/respond pair; answers are only accepted on the connection each request was delivered to (a security fix, not just a transport swap — see the design note).
 3. ✅ **gRPC stripped** — listener, stubs, deps, `:50051` all gone; the wire semantics live on in the ws frames, `proto/souk.proto` remains upstream as their record.
-4. 🧩 **Examples** — a browser provider (frame-protocol conformance, no SDK), an end-to-end `demo` compose profile, and a managed-gateway embedding sample (edge auth + admin router over the `Souk` facade).
+4. ✅ **MCP docent** (`/mcp`) — discovery, not invocation: who is in the souk, what each stall offers, and the A2A endpoint to go talk to them ([souk_server/mcp_docent.py](souk_server/mcp_docent.py)). Read-only; calling an agent stays A2A's job.
+5. 🧩 **Examples** — a browser provider (frame-protocol conformance, no SDK), an end-to-end `demo` compose profile, and a managed-gateway embedding sample (edge auth + admin router over the `Souk` facade).
 
 **License**: [Apache 2.0](AgentSouk/LICENSE) (inherited from upstream; this repo has no separate license file yet)
