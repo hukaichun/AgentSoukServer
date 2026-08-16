@@ -145,21 +145,31 @@ built that assumes otherwise: a stall standing in the town is never
 evidence that its agent is there to claim a run. The run is what decides,
 and the map is a picture of a moment that has already passed.
 
-**Two addresses, and only one of them is durable.** A stall's coordinate
-comes from `public_key`, which is the identity and never changes. The
-`agent_id` inside every `a2a_endpoint` does not share that property: it is
-minted at registration, so an agent that re-registers comes back with a new
-one — and re-registering is now a *routine* event, because the gateway
-deliberately closes an idle socket whose agents souk no longer lists in
-order to provoke exactly that repair (`server-mode.md`). Observed here: the
-docent's `agent_id` today is not the one it held an hour ago, while its key
-is unchanged.
+**Two addresses, and they fail differently.** A stall's coordinate comes
+from `public_key` — the identity, which never changes. The `agent_id`
+inside every `a2a_endpoint` is *nearly* as stable, and the gap is worth
+stating precisely, because an earlier draft of this section got it wrong in
+the alarming direction.
 
-So directions expire. The town must re-read endpoints on every roster poll
-and cache none across syncs; anything durable — a coordinate, a stall's
-identity, a remembered visit — keys off `public_key`. A direction the
-docent handed out is good for the conversation it was given in, and no
-longer.
+`register_agents` looks up an existing `(public_key, name)` row with **no
+`delisted_at` filter**, so a re-registration reuses the original id and
+clears the de-listing. Measured three ways here: `scribe` kept a
+byte-identical id across a provider restart someone else ran, across a
+stop/start run here, and its stall came back with both of its ids
+unchanged. It has to work this way — the SDK re-registers on *every*
+reconnect, and ids that churned per reconnect would churn all day.
+
+An `agent_id` changes only when the row is genuinely gone: a wiped or
+restored database. That is an operator event, not a routine one, and it is
+exactly the event behind the invisible-docent incident — the docent came
+back under a new id because its row had vanished beneath its open socket.
+
+So directions are durable in practice without being guaranteed. The town
+should still re-read endpoints on each roster poll rather than cache them
+across syncs, but the reason is correctness under a rare event, not churn
+— and the cost of doing so is nothing, since it is already polling.
+Anything genuinely durable — a coordinate, a stall's identity, a remembered
+visit — keys off `public_key`, which never moves.
 
 Two gaps in the current surfaces:
 
@@ -350,9 +360,17 @@ waits outside. Backpressure becomes something you can see rather than a
 number in a log.
 
 Presence has the same granularity: `claim_work` refreshes `last_seen_at` for
-**every agent the worker hosts** (read). All of a provider's agents go
-online and offline together — there is no half-staffed stall. A stall opens
-or shuts as a unit.
+**every agent the worker hosts**. All of a provider's agents go online and
+offline together — there is no half-staffed stall. Measured: stopping
+Yusuf's Workshop flipped `scribe` and `translator` to offline *in the same
+poll*, about a minute after the heartbeat stopped, with no intermediate
+state where one had gone and the other had not. Both stayed listed
+throughout, keeping their skills and their provider key, and starting the
+stall again brought both back.
+
+A stall therefore opens or shuts as a unit, and a shut stall **stays on the
+map**. That is the right rendering: the sign is still up, the goods are
+still described, nobody is behind the counter.
 
 ## The self-delegation deadlock draws itself
 
@@ -375,9 +393,40 @@ around.
 
 Delegation to a *different* stall is the opposite — the person leaves their
 counter and walks across the market. A delegation chain renders as a
-journey. This is the one thing a market shows that a roster list cannot —
-and the roster list is now a specific program, `souk-directory`, which
-renders the same stalls and has nowhere to put a walk between two of them.
+journey.
+
+An earlier draft of this document claimed that journey was "the one thing a
+market shows that a roster list cannot". **That was wrong, and the list
+that disproves it is the one in this repo.** `souk-directory` already
+renders a delegation: `renderCallChain` reads `GET /threads/{id}/tree`,
+`flattenRoute` walks it depth-first into an ordered list of stops, and the
+result is drawn as a strip of dots joined by links, labelled *call chain
+for this reply* — journey vocabulary, arrived at independently. Measured
+here end to end: asking Zahra's `haggler` for wording "in writing" produced
+a real cross-stall delegation to Yusuf's `scribe` — two different provider
+keys — and the tree came back with the child under the root.
+
+So the honest claim is narrower, and better for being narrower. **A list
+shows a delegation's sequence. A map shows its shape and its cost.** Four
+things the strip cannot hold, three of which its own source concedes:
+
+- **Fan-out.** One call spawning three siblings flattens into one
+  depth-first line. The code says so and says why — a tree widget would be
+  overkill for a case that is usually linear. On a map, branching costs
+  nothing to draw: three people leave at once.
+- **Place.** `A → B → C` is an order, not a geography. It cannot say that B
+  was next door and C was across the market, which is the difference
+  between a cheap delegation and an expensive one.
+- **Time.** The strip is drawn *for this reply* — after it lands. The walk
+  happens while the run is in flight, and that is when a person watching
+  wants to see it.
+- **Waiting.** A walk to a stall already serving someone else stands there.
+  That is `max_claim` rendered as a queue, and it is the same picture as
+  the deadlock above.
+
+The bar this sets is therefore higher than the earlier draft admitted. The
+list does not merely group stalls; it already draws the chain. What a
+market adds is not the chain's existence but its dimensions.
 
 ## Why not the other two directions
 
@@ -460,7 +509,13 @@ person" is what the market is meant to show, that first link is missing.
 | the provider transport is `WS /ws/provider`; gRPC is removed | read (`server-mode.md`) |
 | `register_agents` drops every key but `name`/`description`/`agent_card_extra`, so top-level `skills` never lands | read (upstream `repo.register_agents`) |
 | the docent surface: 4 read-only tools, 3 resources, provider key on every record | read (`souk_server/mcp_docent.py`, `fdcd1ed`) |
-| cross-stall delegation rendering, external-run activity path | not implemented |
+| cross-stall delegation is real: Zahra's `haggler` → Yusuf's `scribe`, two provider keys, parent/child in `/threads/{id}/tree` | measured (probe against the demo stack) |
+| `souk-directory` already renders that chain as a route strip; a list is not blind to delegation | read (`src/agent.ts`, `renderCallChain`/`flattenRoute`) |
+| the route strip's name labels come from an `agent_id` → name join built once at page load, so they degrade to raw ids only if a row is recreated under an open page — rare, not routine | read |
+| fan-out, place, time and waiting in a delegation — the four things the strip cannot hold | not implemented |
+| external-run activity path (`player.activity`) | not implemented |
 | the docent *agent* — a provider consuming `/mcp`, so every frontend gets a guide | implemented (`providers/pydantic-ai-agent/config.docent.yaml`, `3f6e0dc`) |
-| `agent_id` changes across a re-registration while `public_key` does not | measured (the live docent's id today is not the one it held an hour ago) |
+| `agent_id` **survives** re-registration, restart and de-listing — `register_agents` matches `(public_key, name)` with no `delisted_at` filter | measured (identical ids across two restarts and a stop/start) |
+| it changes only when the row itself is gone (wiped/restored database) — the invisible-docent case | measured (that incident) |
+| a whole stall goes offline together, stays listed, and comes back together | measured (stopped Yusuf's Workshop; both agents flipped in one poll) |
 | the docent's stall rendered in the town | not implemented |
