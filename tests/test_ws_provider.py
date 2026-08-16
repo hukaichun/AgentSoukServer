@@ -27,6 +27,7 @@ from httpx_ws import WebSocketDisconnect, aconnect_ws
 from httpx_ws.transport import ASGIWebSocketTransport
 
 from souk.identity import registration_signing_payload
+from souk_server import ws_provider
 from souk_server.server import create_app
 
 RECEIVE_TIMEOUT = 2.0
@@ -323,3 +324,58 @@ async def test_a_frame_for_a_run_this_identity_does_not_hold_gets_an_error_frame
             frame = await socket.recv()
             assert frame["type"] == "error"
             assert frame["runId"] == "run_nobody"
+
+
+async def test_a_worker_whose_agents_vanish_is_closed_so_it_re_registers(souk, monkeypatch):
+    """The failure this repairs was observed, not imagined: a database
+    restored under a running provider left it claiming for an agent_id
+    souk no longer had. `claim_work` filters unowned ids and carries on —
+    right in itself — so the worker looped forever, claimed nothing, was
+    touched by nothing, aged out of the roster, and reported no error at
+    all while its container sat there healthy. Half an hour of a market
+    with an invisible stall in it.
+
+    Closing is the repair rather than the punishment: registering is what
+    mints agent_ids, and the SDK re-registers on every reconnect.
+    """
+    # Both constants: the check runs on an idle cycle, and a cycle is a
+    # 25s long poll by default.
+    monkeypatch.setattr(ws_provider, "OWNERSHIP_RECHECK_SECONDS", 0.0)
+    monkeypatch.setattr(ws_provider, "CLAIM_WAIT_SECONDS", 0.05)
+    registration, _ = await _register(souk, "greeter")
+    agent_ids = list(registration.agent_ids.values())
+
+    async with _provider_client(souk) as client:
+        async with _connect(
+            client, headers={"Authorization": f"Bearer {registration.session_token}"}
+        ) as ws:
+            await _handshake(ws, None, agent_ids)
+
+            # The agent goes away under the live socket, exactly as a
+            # restore or a de-listing does.
+            async def empty_roster():
+                return []
+
+            monkeypatch.setattr(souk, "list_agents", empty_roster)
+
+            with pytest.raises(WebSocketDisconnect) as excinfo:
+                for _ in range(5):
+                    await ws.receive_text(timeout=RECEIVE_TIMEOUT)
+    assert excinfo.value.code == 1008
+
+
+async def test_a_worker_whose_agents_are_still_listed_is_left_alone(souk, monkeypatch):
+    """The other half: an idle socket for a live registration must not be
+    closed just because it has claimed nothing — idleness is the normal
+    state of a market stall."""
+    monkeypatch.setattr(ws_provider, "OWNERSHIP_RECHECK_SECONDS", 0.0)
+    monkeypatch.setattr(ws_provider, "CLAIM_WAIT_SECONDS", 0.05)
+    registration, _ = await _register(souk, "greeter")
+
+    async with _provider_client(souk) as client:
+        async with _connect(
+            client, headers={"Authorization": f"Bearer {registration.session_token}"}
+        ) as ws:
+            await _handshake(ws, None, list(registration.agent_ids.values()))
+            with pytest.raises(TimeoutError):
+                await ws.receive_text(timeout=1.0)
