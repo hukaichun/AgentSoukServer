@@ -375,9 +375,40 @@ around.
 
 Delegation to a *different* stall is the opposite — the person leaves their
 counter and walks across the market. A delegation chain renders as a
-journey. This is the one thing a market shows that a roster list cannot —
-and the roster list is now a specific program, `souk-directory`, which
-renders the same stalls and has nowhere to put a walk between two of them.
+journey.
+
+An earlier draft of this document claimed that journey was "the one thing a
+market shows that a roster list cannot". **That was wrong, and the list
+that disproves it is the one in this repo.** `souk-directory` already
+renders a delegation: `renderCallChain` reads `GET /threads/{id}/tree`,
+`flattenRoute` walks it depth-first into an ordered list of stops, and the
+result is drawn as a strip of dots joined by links, labelled *call chain
+for this reply* — journey vocabulary, arrived at independently. Measured
+here end to end: asking Zahra's `haggler` for wording "in writing" produced
+a real cross-stall delegation to Yusuf's `scribe` — two different provider
+keys — and the tree came back with the child under the root.
+
+So the honest claim is narrower, and better for being narrower. **A list
+shows a delegation's sequence. A map shows its shape and its cost.** Four
+things the strip cannot hold, three of which its own source concedes:
+
+- **Fan-out.** One call spawning three siblings flattens into one
+  depth-first line. The code says so and says why — a tree widget would be
+  overkill for a case that is usually linear. On a map, branching costs
+  nothing to draw: three people leave at once.
+- **Place.** `A → B → C` is an order, not a geography. It cannot say that B
+  was next door and C was across the market, which is the difference
+  between a cheap delegation and an expensive one.
+- **Time.** The strip is drawn *for this reply* — after it lands. The walk
+  happens while the run is in flight, and that is when a person watching
+  wants to see it.
+- **Waiting.** A walk to a stall already serving someone else stands there.
+  That is `max_claim` rendered as a queue, and it is the same picture as
+  the deadlock above.
+
+The bar this sets is therefore higher than the earlier draft admitted. The
+list does not merely group stalls; it already draws the chain. What a
+market adds is not the chain's existence but its dimensions.
 
 ## Why not the other two directions
 
@@ -460,7 +491,11 @@ person" is what the market is meant to show, that first link is missing.
 | the provider transport is `WS /ws/provider`; gRPC is removed | read (`server-mode.md`) |
 | `register_agents` drops every key but `name`/`description`/`agent_card_extra`, so top-level `skills` never lands | read (upstream `repo.register_agents`) |
 | the docent surface: 4 read-only tools, 3 resources, provider key on every record | read (`souk_server/mcp_docent.py`, `fdcd1ed`) |
-| cross-stall delegation rendering, external-run activity path | not implemented |
+| cross-stall delegation is real: Zahra's `haggler` → Yusuf's `scribe`, two provider keys, parent/child in `/threads/{id}/tree` | measured (probe against the demo stack) |
+| `souk-directory` already renders that chain as a route strip; a list is not blind to delegation | read (`src/agent.ts`, `renderCallChain`/`flattenRoute`) |
+| the route strip's name labels come from an `agent_id` → name join built once at page load, so a re-registration under an open page degrades them to raw ids | read |
+| fan-out, place, time and waiting in a delegation — the four things the strip cannot hold | not implemented |
+| external-run activity path (`player.activity`) | not implemented |
 | the docent *agent* — a provider consuming `/mcp`, so every frontend gets a guide | implemented (`providers/pydantic-ai-agent/config.docent.yaml`, `3f6e0dc`) |
 | `agent_id` changes across a re-registration while `public_key` does not | measured (the live docent's id today is not the one it held an hour ago) |
 | the docent's stall rendered in the town | not implemented |
