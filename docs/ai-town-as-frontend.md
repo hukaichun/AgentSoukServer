@@ -145,6 +145,22 @@ built that assumes otherwise: a stall standing in the town is never
 evidence that its agent is there to claim a run. The run is what decides,
 and the map is a picture of a moment that has already passed.
 
+**Two addresses, and only one of them is durable.** A stall's coordinate
+comes from `public_key`, which is the identity and never changes. The
+`agent_id` inside every `a2a_endpoint` does not share that property: it is
+minted at registration, so an agent that re-registers comes back with a new
+one — and re-registering is now a *routine* event, because the gateway
+deliberately closes an idle socket whose agents souk no longer lists in
+order to provoke exactly that repair (`server-mode.md`). Observed here: the
+docent's `agent_id` today is not the one it held an hour ago, while its key
+is unchanged.
+
+So directions expire. The town must re-read endpoints on every roster poll
+and cache none across syncs; anything durable — a coordinate, a stall's
+identity, a remembered visit — keys off `public_key`. A direction the
+docent handed out is good for the conversation it was given in, and no
+longer.
+
 Two gaps in the current surfaces:
 
 - **Appearance.** `Player.join` requires a `character` (a sprite from
@@ -446,4 +462,5 @@ person" is what the market is meant to show, that first link is missing.
 | the docent surface: 4 read-only tools, 3 resources, provider key on every record | read (`souk_server/mcp_docent.py`, `fdcd1ed`) |
 | cross-stall delegation rendering, external-run activity path | not implemented |
 | the docent *agent* — a provider consuming `/mcp`, so every frontend gets a guide | implemented (`providers/pydantic-ai-agent/config.docent.yaml`, `3f6e0dc`) |
+| `agent_id` changes across a re-registration while `public_key` does not | measured (the live docent's id today is not the one it held an hour ago) |
 | the docent's stall rendered in the town | not implemented |
