@@ -2,9 +2,15 @@ import DOMPurify from "dompurify";
 import { marked } from "marked";
 import { AgentRosterEntry, escapeHtml, fetchAgents, linkWithSouk, renderSoukBar, streamSse } from "./app.js";
 
+// A thread names the agent it belongs to by the pair, same as everything
+// else now. `agent_name` arriving on the node is what lets the call-chain
+// strip label itself without a lookup — but the stall still needs one,
+// because two stalls may each keep an agent of the same name and a route
+// that says "translator → scribe" would not say *which* translator.
 interface ThreadTreeNode {
   thread_id: string;
-  agent_id: string;
+  provider_key: string;
+  agent_name: string;
   children: ThreadTreeNode[];
 }
 
@@ -21,16 +27,20 @@ function renderMarkdown(el: HTMLElement, raw: string): void {
   el.classList.add("markdown");
 }
 
+// The pair is the address: ?provider=<fingerprint>&name=<name>.
 const params = new URLSearchParams(window.location.search);
-const agentId = params.get("id");
+const providerRef = params.get("provider");
+const agentName = params.get("name");
 let threadId: string | null = null;
 let selfName = "assistant";
 let currentAssistantEl: HTMLElement | null = null;
 let currentAssistantRaw = "";
 let typingEl: HTMLElement | null = null;
-// agent_id -> display name, from the roster fetched once at page load —
-// used to label the call-chain route with names instead of raw agent_ids.
-const agentNameById = new Map<string, string>();
+// provider_key -> storefront label, from the roster fetched once at page
+// load. The call-chain strip gets agent names from the tree itself now,
+// but not stall names — and without the stall a route through a duplicated
+// agent name is unreadable.
+const stallNameByKey = new Map<string, string>();
 // Keyed by the sub-agent's A2A task id — one accumulating bubble per
 // delegated call, so a streamed multi-hop response reads like the main
 // assistant's own streaming text instead of one raw JSON blob per event.
@@ -78,9 +88,14 @@ async function loadAgentInfo(soukUrl: string): Promise<AgentRosterEntry | null> 
 
   const agents = await fetchAgents(soukUrl);
   for (const a of agents) {
-    agentNameById.set(a.agent_id, a.name);
+    if (a.provider_name) stallNameByKey.set(a.provider_key, a.provider_name);
   }
-  const agent = agents.find((a) => a.agent_id === agentId);
+  // `provider` in the URL is the fingerprint, but accept the full key too:
+  // it costs one comparison and means a hand-written link works either way,
+  // exactly as the gateway's own {provider} path segment accepts both.
+  const agent = agents.find(
+    (a) => a.name === agentName && (a.fingerprint === providerRef || a.provider_key === providerRef)
+  );
   if (!agent) {
     document.getElementById("agent-title")!.textContent = "Agent not found";
     document.getElementById("agent-desc")!.textContent =
@@ -95,7 +110,9 @@ async function loadAgentInfo(soukUrl: string): Promise<AgentRosterEntry | null> 
       <span class="dot"></span>${agent.online ? "online" : "offline"}
     </span>
   `;
-  document.getElementById("agent-id")!.textContent = agent.agent_id;
+  // The address, shown the way it is written: stall then name.
+  document.getElementById("agent-id")!.textContent =
+    `${agent.provider_name || "unnamed provider"} · ${agent.fingerprint}/${agent.name}`;
   document.getElementById("agent-desc")!.textContent = agent.description || "";
   if (!agent.online) {
     document.getElementById("offline-banner")!.innerHTML =
@@ -241,8 +258,8 @@ function handleAguiEvent(event: any): void {
 // than branching visually — every delegation chain seen in practice so
 // far is linear, and a strip is the right shape for that; a true tree
 // widget would be overkill for the common case it'd rarely serve.
-function flattenRoute(node: ThreadTreeNode): string[] {
-  const stops = [node.agent_id];
+function flattenRoute(node: ThreadTreeNode): ThreadTreeNode[] {
+  const stops = [node];
   for (const child of node.children) {
     stops.push(...flattenRoute(child));
   }
@@ -265,10 +282,17 @@ async function renderCallChain(soukUrl: string, forThreadId: string): Promise<vo
     }
     const stops = flattenRoute(root);
     const stopHtml = stops
-      .map((id, i) => {
-        const name = escapeHtml(agentNameById.get(id) || id);
+      .map((node, i) => {
+        const name = escapeHtml(node.agent_name);
+        // Name the stall whenever it is known — a hop reading "translator"
+        // is ambiguous in any souk where two providers keep one, and this
+        // strip exists precisely to show a walk between two stalls.
+        const stall = stallNameByKey.get(node.provider_key);
+        const at = stall ? `<span class="stop-stall">${escapeHtml(stall)}</span>` : "";
         const link = i > 0 ? `<span class="link"></span>` : "";
-        return `${link}<span class="stop ${i === 0 ? "root" : ""}"><span class="dot"></span>${name}</span>`;
+        return `${link}<span class="stop ${i === 0 ? "root" : ""}" title="${escapeHtml(
+          node.provider_key
+        )}"><span class="dot"></span>${name}${at}</span>`;
       })
       .join("");
     container.classList.add("has-chain");
@@ -304,7 +328,7 @@ async function sendMessage(soukUrl: string, text: string): Promise<void> {
   // satisfies the schema without meaning anything beyond that.
   try {
     if (!threadId) {
-      const created = await fetch(`${soukUrl}/threads/id/${encodeURIComponent(agentId!)}`, {
+      const created = await fetch(`${soukUrl}/threads/${encodeURIComponent(providerRef!)}/${encodeURIComponent(agentName!)}`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({}),
@@ -322,7 +346,7 @@ async function sendMessage(soukUrl: string, text: string): Promise<void> {
       forwardedProps: null,
     };
 
-    const resp = await fetch(`${soukUrl}/agui/id/${encodeURIComponent(agentId!)}`, {
+    const resp = await fetch(`${soukUrl}/agui/${encodeURIComponent(providerRef!)}/${encodeURIComponent(agentName!)}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
@@ -354,8 +378,9 @@ async function sendMessage(soukUrl: string, text: string): Promise<void> {
 }
 
 async function init(soukUrl: string): Promise<void> {
-  if (!agentId) {
-    document.getElementById("agent-title")!.textContent = "No agent id given";
+  if (!providerRef || !agentName) {
+    document.getElementById("agent-title")!.textContent =
+      "Need both ?provider= and ?name= — an agent is the pair";
     return;
   }
   await loadAgentInfo(soukUrl);
