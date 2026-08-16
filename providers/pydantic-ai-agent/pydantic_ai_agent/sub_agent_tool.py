@@ -16,6 +16,7 @@ from pydantic_ai import RunContext, Tool
 from souk_agent_sdk.a2a_client import call_agent_streaming
 
 from pydantic_ai_agent.config import SubAgentConfig
+from pydantic_ai_agent.resolve import ResolvedURL, SubAgentUnresolvable
 
 
 @dataclass
@@ -49,12 +50,23 @@ class AgentDeps:
     sub_agent_context_ids: dict[str, str] = field(default_factory=dict)
 
 
-def build_sub_agent_tools(sub_agents: list[SubAgentConfig]) -> list[Tool]:
-    return [_make_tool(sub) for sub in sub_agents]
+def build_sub_agent_tools(sub_agents: list[SubAgentConfig], souk_http_url: str) -> list[Tool]:
+    return [_make_tool(sub, ResolvedURL(sub, souk_http_url)) for sub in sub_agents]
 
 
-def _make_tool(sub: SubAgentConfig) -> Tool:
+def _make_tool(sub: SubAgentConfig, address: ResolvedURL) -> Tool:
     async def call_sub_agent(ctx: RunContext[AgentDeps], message: str) -> str:
+        # Resolved here rather than at startup: a sub-agent is usually a
+        # sibling container that has not registered yet at boot, and a
+        # delegation edge should not become a boot order. See resolve.py.
+        try:
+            a2a_url = await address.get()
+        except SubAgentUnresolvable as e:
+            # Back to the model as an answer, not up as a crash: it is the
+            # one that can say something useful to whoever asked, and an
+            # unreachable sub-agent is not a reason to fail the whole run.
+            return f"({sub.name} could not be reached: {e})"
+
         # souk assigns every thread id itself (see souk.ids /
         # souk.repo.ensure_thread), the sub-agent tool never mints one.
         # `referenceTaskIds` (real A2A, see souk_agent_sdk.a2a_client)
@@ -83,7 +95,7 @@ def _make_tool(sub: SubAgentConfig) -> Tool:
         # RUN_FINISHED event a naive translation would otherwise send).
         pending = False
         async for update in call_agent_streaming(
-            sub.a2a_url,
+            a2a_url,
             message,
             context_id=context_id,
             reference_task_ids=reference_task_ids,

@@ -31,13 +31,13 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 import websockets
 from souk_provider_sdk import (
-    AgentHandle,
     DeliveredRun,
     HandleProvider,
     ProviderIdentity,
     ProviderRuntime,
 )
 
+from souk_agent_sdk.handle import AgentHandle
 from souk_agent_sdk.identity import load_or_create_identity
 
 logger = logging.getLogger("souk_agent_sdk")
