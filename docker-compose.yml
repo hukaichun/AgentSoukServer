@@ -101,6 +101,79 @@ services:
       LLM_API_KEY: "${LLM_API_KEY}"
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
 
+  # --- the demo market: `docker compose --profile demo up` -------------
+  #
+  # Off by default so the plain stack stays small (and cheap: each of
+  # these is an LLM-backed agent, though an idle one spends nothing — it
+  # only claims). Together with the docent they make a market with more
+  # than one thing in it, which is what a frontend cannot be built
+  # against otherwise. What each is here to exercise:
+  #
+  #   zahra    two agents in one stall, and a cross-stall A2A delegation
+  #            (its haggler calls Yusuf's scribe)
+  #   yusuf    two agents, one of them sharing the display name
+  #            "translator" with Zahra's — a genuinely ambiguous name,
+  #            which the docent refuses to guess at and a directory must
+  #            render as a choice rather than a winner
+  #   teahouse a single-agent stall, a different card from the other two
+  #
+  # Each is its own provider identity, which is what makes them separate
+  # stalls rather than one stall with five agents — hence a volume each
+  # for the key (see the docent's own comment on why that matters).
+  zahra:
+    profiles: ["demo"]
+    build:
+      context: .
+      dockerfile: providers/pydantic-ai-agent/Dockerfile
+    depends_on:
+      - souk
+    volumes:
+      - ./providers/pydantic-ai-agent/config.zahra.yaml:/app/config.yaml:ro
+      - zahra_identity:/data
+    environment:
+      SOUK_IDENTITY_KEY_PATH: /data/souk_identity.key
+      LLM_BASE_URL: "${LLM_BASE_URL}"
+      LLM_MODEL_NAME: "${LLM_MODEL_NAME}"
+      LLM_API_KEY: "${LLM_API_KEY}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+
+  yusuf:
+    profiles: ["demo"]
+    build:
+      context: .
+      dockerfile: providers/pydantic-ai-agent/Dockerfile
+    depends_on:
+      - souk
+    volumes:
+      - ./providers/pydantic-ai-agent/config.yusuf.yaml:/app/config.yaml:ro
+      - yusuf_identity:/data
+    environment:
+      SOUK_IDENTITY_KEY_PATH: /data/souk_identity.key
+      LLM_BASE_URL: "${LLM_BASE_URL}"
+      LLM_MODEL_NAME: "${LLM_MODEL_NAME}"
+      LLM_API_KEY: "${LLM_API_KEY}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+
+  teahouse:
+    profiles: ["demo"]
+    build:
+      context: .
+      dockerfile: providers/pydantic-ai-agent/Dockerfile
+    depends_on:
+      - souk
+    volumes:
+      - ./providers/pydantic-ai-agent/config.teahouse.yaml:/app/config.yaml:ro
+      - teahouse_identity:/data
+    environment:
+      SOUK_IDENTITY_KEY_PATH: /data/souk_identity.key
+      LLM_BASE_URL: "${LLM_BASE_URL}"
+      LLM_MODEL_NAME: "${LLM_MODEL_NAME}"
+      LLM_API_KEY: "${LLM_API_KEY}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+
 volumes:
   paradedb_data:
   docent_identity:
+  zahra_identity:
+  yusuf_identity:
+  teahouse_identity:
