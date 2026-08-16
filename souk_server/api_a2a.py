@@ -11,8 +11,10 @@ origin root — a deliberate deviation from A2A's single-agent-per-origin
 assumption, since one souk fronts many agents at one origin.
 
 Two ways to address an agent:
-- `/a2a/id/{agent_id}/...` — the canonical, always-unambiguous route keyed
-  by souk's own assigned id (see souk/schema.py's `agents.agent_id`).
+- `/a2a/{provider}/{name}/...` — the canonical, always-unambiguous route.
+  An agent *is* `(provider_key, name)`, so addressing it needs both and
+  needs nothing souk minted; `provider` may be the full public key or its
+  16-hex fingerprint, which core tells apart by length.
 - `/a2a/{name}/...` — the legacy, human-readable route, kept working for
   convenience: resolves transparently as long as exactly one currently-
   listed agent has that display name. `name` is not unique (multiple
@@ -24,19 +26,39 @@ Two ways to address an agent:
 from __future__ import annotations
 
 from a2a.utils.constants import AGENT_CARD_WELL_KNOWN_PATH
+
+from souk.identity import provider_fingerprint
 from fastapi import APIRouter, Depends, Request
 from sse_starlette.sse import EventSourceResponse
 
+from souk.models import AgentRef
 from souk_server.config import ServingSettings
 from souk.core import Souk
-from souk_server.deps import get_serving_settings, get_souk
-from souk.protocols.a2a import A2AAdapter, A2AStream
+from souk_server.deps import get_serving_settings, get_souk, resolve_ref
+from souk.protocols.a2a import A2AAdapter, A2AStream, ServedInterface
 
 router = APIRouter()
 
 
-def _adapter(souk: Souk, serving: ServingSettings) -> A2AAdapter:
-    return A2AAdapter(souk, public_base_url=serving.public_http_url)
+def _adapter(souk: Souk) -> A2AAdapter:
+    return A2AAdapter(souk)
+
+
+def _interfaces(agent: AgentRef, serving: ServingSettings) -> list[ServedInterface]:
+    """Where this gateway actually serves that agent.
+
+    Core stopped naming URLs, which is right: it had been interpolating a
+    route layout on behalf of every gateway that would ever serve it. The
+    layout below is this repo's — `/a2a/{fingerprint}/{name}/rpc` — and
+    saying so here is the whole of what changed.
+    """
+    base = serving.public_http_url.rstrip("/")
+    return [
+        ServedInterface(
+            url=f"{base}/a2a/{provider_fingerprint(agent.provider_key)}/{agent.name}/rpc",
+            binding="JSONRPC",
+        )
+    ]
 
 
 # The path comes from a2a.utils.constants rather than being typed here, for
@@ -53,27 +75,19 @@ def _adapter(souk: Souk, serving: ServingSettings) -> A2AAdapter:
 # to end (see souk/tests/test_a2a_spec_methods.py). Whether to serve the
 # legacy path at all, and if so whether to answer it with a legacy-shaped
 # body, is a gateway decision and belongs downstream.
-@router.get("/a2a/id/{agent_id}" + AGENT_CARD_WELL_KNOWN_PATH)
-async def agent_card_by_id(
-    agent_id: str,
-    souk: Souk = Depends(get_souk),
-    serving: ServingSettings = Depends(get_serving_settings),
-) -> dict:
-    return await _adapter(souk, serving).agent_card(agent_id)
-
-
-@router.get("/a2a/{name}" + AGENT_CARD_WELL_KNOWN_PATH)
-async def agent_card_by_name(
+@router.get("/a2a/{provider}/{name}" + AGENT_CARD_WELL_KNOWN_PATH)
+async def agent_card_by_pair(
+    provider: str,
     name: str,
     souk: Souk = Depends(get_souk),
     serving: ServingSettings = Depends(get_serving_settings),
 ) -> dict:
-    adapter = _adapter(souk, serving)
-    return await adapter.agent_card(await adapter.resolve_agent_id(name))
+    agent = await resolve_ref(souk, provider, name)
+    return await _adapter(souk).agent_card(agent, _interfaces(agent, serving))
 
 
-async def _rpc(adapter: A2AAdapter, agent_id: str, request: Request):
-    result = await adapter.handle_rpc(agent_id, await request.json())
+async def _rpc(adapter: A2AAdapter, agent: AgentRef, request: Request):
+    result = await adapter.handle_rpc(agent, await request.json())
     if not isinstance(result, A2AStream):
         return result
 
@@ -84,22 +98,13 @@ async def _rpc(adapter: A2AAdapter, agent_id: str, request: Request):
     return EventSourceResponse(stream())
 
 
-@router.post("/a2a/id/{agent_id}/rpc")
-async def rpc_by_id(
-    agent_id: str,
-    request: Request,
-    souk: Souk = Depends(get_souk),
-    serving: ServingSettings = Depends(get_serving_settings),
-):
-    return await _rpc(_adapter(souk, serving), agent_id, request)
-
-
-@router.post("/a2a/{name}/rpc")
-async def rpc_by_name(
+@router.post("/a2a/{provider}/{name}/rpc")
+async def rpc_by_pair(
+    provider: str,
     name: str,
     request: Request,
     souk: Souk = Depends(get_souk),
-    serving: ServingSettings = Depends(get_serving_settings),
 ):
-    adapter = _adapter(souk, serving)
-    return await _rpc(adapter, await adapter.resolve_agent_id(name), request)
+    return await _rpc(_adapter(souk), await resolve_ref(souk, provider, name), request)
+
+

@@ -31,6 +31,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 
 from souk.core import Souk
+from souk.identity import provider_fingerprint
 from souk.models import AgentSummary
 
 INSTRUCTIONS = """\
@@ -76,26 +77,31 @@ def _seen_ago(last_seen_at: datetime) -> str:
 def describe_agent(agent: AgentSummary, public_base_url: str) -> dict[str, Any]:
     """One stall, as the docent describes it — including where to go."""
     base = public_base_url.rstrip("/")
+    fingerprint = provider_fingerprint(agent.provider_key)
     return {
-        "agent_id": agent.agent_id,
+        # An agent *is* (provider_key, name): souk mints no id, so the pair
+        # is the address and there is nothing else to quote back.
+        "provider_key": agent.provider_key,
         "name": agent.name,
         "description": agent.description,
         "skills": agent.skills,
         "online": agent.online,
         "last_seen": _seen_ago(agent.last_seen_at),
         "listed_since": agent.joined_at.isoformat(),
-        # The stall keeper. The key is the identity souk actually verifies;
-        # provider_name is a self-chosen storefront label and may be absent,
-        # which is why both are here and only the key is ever authoritative.
+        # The stall keeper. The key is the identity souk verifies; the
+        # fingerprint is the same identity short enough for a URL, and
+        # `storefront_name` is a self-chosen label that may be absent or
+        # shared — only the key is ever authoritative.
         "provider": {
-            "public_key": agent.public_key,
+            "public_key": agent.provider_key,
+            "fingerprint": fingerprint,
             "storefront_name": agent.provider_name,
         },
-        # Directions, always. The id route rather than the name route: names
-        # are not unique across providers (see api_a2a's module docstring),
-        # so this is the address that cannot resolve to somebody else.
-        "a2a_endpoint": f"{base}/a2a/id/{agent.agent_id}/rpc",
-        "agent_card_url": f"{base}/a2a/id/{agent.agent_id}{AGENT_CARD_WELL_KNOWN_PATH}",
+        # Directions, always, and by the pair. There is no by-name route to
+        # be tempted by any more: a display name is not an address, since
+        # two providers may legitimately offer the same one.
+        "a2a_endpoint": f"{base}/a2a/{fingerprint}/{agent.name}/rpc",
+        "agent_card_url": f"{base}/a2a/{fingerprint}/{agent.name}{AGENT_CARD_WELL_KNOWN_PATH}",
     }
 
 
@@ -129,7 +135,7 @@ def describe_market(agents: list[AgentSummary], public_base_url: str) -> dict[st
     """
     stalls: dict[str, list[AgentSummary]] = {}
     for agent in agents:
-        stalls.setdefault(agent.public_key, []).append(agent)
+        stalls.setdefault(agent.provider_key, []).append(agent)
     return {
         "agent_count": len(agents),
         "online_count": sum(1 for a in agents if a.online),
@@ -265,22 +271,35 @@ def create_docent(souk: Souk, public_base_url: str) -> MCPServer:
         title="Describe one agent",
         description=(
             "Everything this souk knows about one agent, addressed by its "
-            "agent_id or its display name, and where to talk to it."
+            "its display name, and where to talk to it. Give provider "
+            "as well (the fingerprint from any earlier answer) when two "
+            "stalls share a name."
         ),
         annotations=READ_ONLY,
     )
-    async def describe_agent_tool(name_or_id: str) -> dict[str, Any]:
+    async def describe_agent_tool(name: str, provider: str = "") -> dict[str, Any]:
         agents = await souk.list_agents()
-        by_id = [a for a in agents if a.agent_id == name_or_id]
-        if by_id:
-            return describe_agent(by_id[0], public_base_url)
+        if provider:
+            exact = [
+                a
+                for a in agents
+                if a.name == name
+                and provider in (a.provider_key, provider_fingerprint(a.provider_key))
+            ]
+            if exact:
+                return describe_agent(exact[0], public_base_url)
+            return {
+                "found": False,
+                "asked_for": {"name": name, "provider": provider},
+                "hint": "No stall with that key offers that name — browse_souk lists who is here.",
+            }
 
-        by_name = [a for a in agents if a.name == name_or_id]
+        by_name = [a for a in agents if a.name == name]
         if not by_name:
             return {
                 "found": False,
-                "asked_for": name_or_id,
-                "hint": "No listed agent by that id or name — browse_souk shows who is here.",
+                "asked_for": name,
+                "hint": "No listed agent by that name — browse_souk shows who is here.",
             }
         if len(by_name) > 1:
             # Names are not unique: several identities may register the same
@@ -289,9 +308,12 @@ def create_docent(souk: Souk, public_base_url: str) -> MCPServer:
             # stall — so hand back the candidates and let the asker choose.
             return {
                 "found": False,
-                "asked_for": name_or_id,
+                "asked_for": name,
                 "reason": "ambiguous_name",
-                "hint": "Several providers list this name. Ask again with one of these agent_ids.",
+                "hint": (
+                    "Several stalls offer this name. Ask again with the provider "
+                    "fingerprint of the one you meant."
+                ),
                 "candidates": [describe_agent(a, public_base_url) for a in by_name],
             }
         return describe_agent(by_name[0], public_base_url)
@@ -307,7 +329,7 @@ def create_docent(souk: Souk, public_base_url: str) -> MCPServer:
         annotations=READ_ONLY,
     )
     async def describe_stall_tool(provider_key: str) -> dict[str, Any]:
-        members = [a for a in await souk.list_agents() if a.public_key == provider_key]
+        members = [a for a in await souk.list_agents() if a.provider_key == provider_key]
         if not members:
             return {
                 "found": False,
@@ -340,15 +362,18 @@ def create_docent(souk: Souk, public_base_url: str) -> MCPServer:
         }
 
     @docent.resource(
-        "souk://agent/{agent_id}",
+        "souk://agent/{provider}/{name}",
         title="One agent",
-        description="One listed agent, and where to reach it.",
+        description="One listed agent, addressed by the pair, and where to reach it.",
         mime_type="application/json",
     )
-    async def agent_resource(agent_id: str) -> dict[str, Any]:
+    async def agent_resource(provider: str, name: str) -> dict[str, Any]:
         for agent in await souk.list_agents():
-            if agent.agent_id == agent_id:
+            if agent.name == name and provider in (
+                agent.provider_key,
+                provider_fingerprint(agent.provider_key),
+            ):
                 return describe_agent(agent, public_base_url)
-        return {"found": False, "agent_id": agent_id}
+        return {"found": False, "provider": provider, "name": name}
 
     return docent
