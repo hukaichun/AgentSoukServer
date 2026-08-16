@@ -76,8 +76,9 @@ class RosterResponse(BaseModel):
 
 
 class RegisterBatchResponse(RosterResponse):
-    # Bearer token required on every subsequent PollForWork/AgentSession
-    # gRPC call (see souk.identity) — valid for
+    # Bearer token the worker socket authenticates with — the `hello`
+    # frame's `token`, or the handshake's Authorization header (see
+    # souk_server.ws_provider and souk.identity) — valid for
     # souk.identity.SESSION_TOKEN_TTL_SECONDS, re-issued on every
     # /agents/register call (souk_agent_sdk re-registers on each
     # run_forever() (re)connect, so an expired token is naturally
