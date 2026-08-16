@@ -38,12 +38,53 @@ HTTP/2 requirement on proxies (wss is an HTTP/1.1 upgrade), and a
 browser can be a provider — which is the audience that makes WebSocket
 the right default rather than a fallback.
 
-Core is untouched throughout. The worker inversion reduced the
-provider wire to three calls (`claim_work` / `report_event` /
-`finish_run`) plus a cancel push; a transport is just a carrier for
-that port, and this is the third carrier after in-process and gRPC.
-The KYOK edge swaps the same way because `LLMBridge` is likewise a
-transport-free port; only this repo's serving layer changes.
+Core is untouched throughout. The provider port is core's to state, and
+it has since been inverted again — souk offers a run and the provider
+answers, rather than the provider asking for work — so what a transport
+carries today is `broker.ConnectedProvider`: who you are, how much you
+will take at once, how to hand you a run, how to ask you to stop one. A
+transport is just a carrier for that port, and this is the third carrier
+after in-process and gRPC. The KYOK edge swaps the same way because
+`LLMBridge` is likewise a transport-free port; only this repo's serving
+layer changes.
+
+## Addressing: an agent is `(provider, name)`
+
+Every surface in that table takes both halves, and none takes anything
+souk minted. There is no `agent_id` — core stopped minting one, because a
+provider holding identifiers only souk could issue lost its whole
+vocabulary whenever the database was replaced, with no way to rebuild it.
+
+```
+/a2a/{provider}/{name}/rpc      /a2a/{provider}/{name}/.well-known/agent-card.json
+/agui/{provider}/{name}         /threads/{provider}/{name}
+```
+
+`{provider}` is the provider's Ed25519 public key or its 16-hex
+fingerprint (`sha256(key)[:16]`); core tells them apart by length. This
+gateway puts the fingerprint in URLs and the roster carries both, with
+`provider_key` the one to compare — the fingerprint is derived from it and
+never authoritative.
+
+**The by-name routes are deleted, not deprecated.** A display name is not
+unique: two identities may both register `translator`, and that is
+allowed. A route taking a bare name therefore had to guess or refuse, and
+guessing is how a caller reaches an agent it never meant to reach.
+
+Resolving a name is still ordinary, and still supported — it is
+`GET /agents`, done once by whoever holds the name, after which the pair
+is what goes on the wire. Both SDKs do exactly this (`SoukClient.resolve`,
+and the demo providers' sub-agent resolver), and both surface ambiguity to
+their caller rather than picking. The difference from the old route is
+only *where* the choice is made: somewhere the asker can answer it.
+
+That is also why an address cannot be written into a config file. The
+provider half is the callee's own key fingerprint, which does not exist
+until that provider has started once and written its key — so a static
+`a2a_url` for a sibling agent is unwriteable in principle, not merely
+inconvenient. Providers resolve lazily, on first delegation, so a
+delegation edge does not become a boot order that `depends_on` cannot
+express.
 
 ## Provider relay: `WS /ws/provider`
 
@@ -53,75 +94,111 @@ justify ws in the first place. The semantics mirror `proto/souk.proto`'s
 PollForWork/AgentSession, minus what a single duplex socket makes
 redundant.
 
-**Auth is dual-track: an `Authorization` header when the client can set
-one, the first frame when it can't.** Applies to both sockets (`/ws/
-provider` and `/ws/kyok`). Tokens never go in query strings — those leak
-into access logs.
+**souk hands work over; it does not wait to be asked for it.** There is
+no claim loop on either side. souk's broker knows which provider serves
+which agent, offers each run to it, and the answer comes back as a frame.
+The socket carries the offer; `souk_provider_sdk.ProviderRuntime`, on the
+far side, decides.
 
-- **Header track.** A non-browser client sends `Authorization: Bearer
-  <token>` on the handshake request. This exists for managed
-  deployments: an edge middleware (or reverse proxy) can then gate the
-  connection *before* it is accepted, which frame-level auth can never
-  offer — at handshake time a hello-only design carries no credential
-  for the edge to check. Note for embedders: Starlette's
-  `BaseHTTPMiddleware` never sees WebSocket scopes; edge gating must be
-  pure ASGI middleware.
-- **Hello track.** The browser WebSocket API cannot set headers, so a
-  handshake without the header is accepted pending, and the server
-  waits (briefly) for the credential as the first frame:
+That inversion deleted two things rather than moving them, and both are
+worth stating because a reader who knows the old design will look for
+them.
+
+**There is no session token.** The socket is opened with a signature from
+the provider's own Ed25519 key, so nothing bearer-shaped exists to leak,
+and nothing expires underneath a long-lived connection. The dual-track
+header/hello design below survives only as a shape: the credential is
+still in the first frame, but it is a signature, not a token, and the
+`Authorization` header track is gone with the token it carried. An edge
+middleware wanting to gate before accept has to verify the same signature
+itself — which it can, since verification needs only the public key.
 
 ```json
-{"type": "hello", "token": "<session JWT>", "agentIds": ["..."], "maxClaim": 2}
+{
+  "type": "hello",
+  "publicKey": "<hex>",
+  "signature": "<hex>",
+  "timestamp": 1755300000,
+  "agentNames": ["translator", "summarizer"],
+  "maxConcurrentRuns": 2
+}
 ```
 
-If the header was present and valid, `hello` still arrives first (it
-carries `agentIds`/`maxClaim`, which are not auth) but may omit `token`.
-A `hello` token alongside a header token must match, else close.
+The signature covers
+`souk-provider-connect:<publicKey>:<comma-joined sorted agentNames>:<timestamp>`.
+The prefix is deliberately *not* the registration payload's, even though
+it covers the same facts: reusing it would make a captured registration
+signature replayable as a connection, and within the freshness window
+that is somebody else's runs delivered to you. The names being inside
+what was signed is what stops a hello claiming a set the signature did
+not cover.
 
-Either way the token is verified exactly as PollForWork verified it —
-the token is the identity (its `public_key`), `agentIds` must be ones
-that key registered. Reply is `{"type": "welcome"}` or a close with a
-policy code. Anything else before `hello`, an invalid token, or no
-credential on either track, closes the socket. Concretely: `hello` must
-arrive within 5 seconds of the handshake; every handshake refusal closes
-with 1008 (policy violation) and a reason string; 1011 is reserved for
-server-side failure the client didn't cause — including the session
-token expiring under a long-lived socket, which closes with 1008 so the
-client's ordinary reconnect (which re-registers, refreshing the token)
-is the recovery path.
+The payload format is this gateway's, not core's — signing a socket open
+is a serving act, and souk supplies only the primitives it is built from
+(`verify_signature`, `is_timestamp_fresh`). Every name must be one this
+key registered; core enforces that in `attach_provider`, so a name nobody
+registered is refused at the door rather than advertised and served by
+nobody.
 
-After `hello`, the server drives the claim loop on the worker's behalf —
-the same inversion the gRPC servicer performed: it calls
-`souk.claim_work(token, agentIds, max_claim=…)` with `on_cancel` wired to
-this socket, and pushes what it claims:
+Reply is `{"type": "welcome"}` or a close with 1008 (policy violation)
+and a reason string. **`welcome` is queued before attaching**, and that
+ordering is load-bearing: attaching is what makes the provider reachable,
+and the broker begins offering inside `attach_provider`'s own awaits — so
+queueing it after lets a provider with work already waiting receive a
+`run` frame as the first thing after its hello. A client reading exactly
+one frame there raises and reconnects into the same race forever. 1011
+stays reserved for server-side failure the client didn't cause.
 
 | direction | frame | carries |
 |---|---|---|
-| ↓ | `{"type": "run", "runId", "threadId", "agentId", "input"}` | a claimed run **with its RunAgentInput** — claiming is the hand-over, unchanged. `agentId` rides along because the worker routes by it and RunAgentInput does not name it |
-| ↑ | `{"type": "event", "runId", "event"}` | one AG-UI event; authorized against `Run.claimed_by`, unchanged |
-| ↑ | `{"type": "finish", "runId"}` | that run's stream ended (was `end_of_stream`) |
-| ↓ | `{"type": "cancel", "runId"}` | a request, not an order — outcome decided when the stream ends, unchanged |
-| ↓ | `{"type": "error", "message", "runId"?}` | server-side rejection of a frame (bad runId, not the claimer) |
+| ↓ | `{"type": "run", "runId", "threadId", "agentName", "input"}` | an **offer**, with its RunAgentInput. `agentName` rides along because the provider routes by it and RunAgentInput does not name it |
+| ↑ | `{"type": "ack", "runId", "accepted"}` | whether this provider took it. `accepted: false` is how a full one says so |
+| ↑ | `{"type": "event", "runId", "event"}` | one AG-UI event; authorized against `Run.claimed_by` |
+| ↑ | `{"type": "finish", "runId"}` | that run's stream ended |
+| ↓ | `{"type": "cancel", "runId"}` | a request, not an order — outcome decided when the stream ends |
+| ↓ | `{"type": "error", "message", "runId"?}` | server-side rejection of a frame (bad runId, not the holder) |
 
-Flow control is the `maxClaim` budget, enforced where it always was: the
-server claims further runs only while in-flight (claimed − finished) is
-under the budget. No credit frames; `finish` is the credit.
+A declined offer costs the run nothing: it stays queued and is offered
+again when something changes — a run arriving, a provider registering, one
+of this provider's runs ending. Not immediately, deliberately: asking
+again at once is asking a provider that just said no, with nothing about
+the answer having changed.
 
-Liveness: claiming marked a provider seen, and still does — the server's
-claim loop touches liveness exactly as PollForWork did. WebSocket
-ping/pong keeps intermediaries from reaping idle sockets but is not the
-liveness signal.
+Flow control is `maxConcurrentRuns`, declared once at hello. souk keeps a
+bucket that size and offers nothing while it is empty. No credit frames
+and no counting in the transport — the number is a fact about the
+provider, and souk sees for itself when a run ends.
+
+Two deadlines apply to an offer, and only one governs. souk wraps every
+offer in `RunBroker.deliver_timeout_seconds` (5s) because it has a single
+delivery loop and an offer that never returns stops dispatch for
+everybody. The gateway's own `ACK_TIMEOUT_SECONDS` is longer and is a
+backstop for a souk that offers without a deadline. Answering after
+either has run out is the same as declining: the ack arrives for a run
+nobody is waiting on, and is dropped.
+
+**Liveness is not a heartbeat.** `online` is `is_serving` — souk holds a
+live provider mapping for that agent or it does not — so attaching *is*
+being online, and a dropped socket takes its agents offline in the same
+instant. There is no window to age out of and no `last_seen_at` clock to
+read. Because a provider connects once for every agent it serves, its
+agents go online and offline together, by construction. `last_seen_at` is
+still recorded and still worth reading, but it now answers a different
+question: how long since anybody was here, which `online` no longer says
+anything about. WebSocket ping/pong keeps intermediaries from reaping
+idle sockets and is not the liveness signal.
 
 **A dropped socket ends nothing.** Events are addressed by `runId`, so a
-worker reconnects (a fresh `hello`) and reports the rest, including how
-runs ended. souk records nothing at disconnect; a worker that is truly
-gone is caught by the stall sweep. This property was probed and kept
-under gRPC and must be preserved: reconnect-and-finish is a test to
-carry over, not a hope.
+provider reconnects (a fresh `hello`) and reports the rest, including how
+runs ended. souk records nothing at disconnect; one that is truly gone is
+caught by the stall sweep. This property was probed and kept under gRPC
+and must be preserved: reconnect-and-finish is a test to carry over, not
+a hope.
 
-At-least-once delivery (an ack per event) remains expressible and
-remains unbuilt — same status as under gRPC. The `reserved 5` lesson
-travels as words here: a retired frame type's name is never reused.
+At-least-once delivery (an ack per *event*) remains expressible and
+remains unbuilt — the `ack` frame above answers an offer, not an event.
+The `reserved 5` lesson travels as words here: a retired frame type's
+name is never reused.
 
 ## KYOK relay: `WS /ws/kyok`
 
@@ -255,23 +332,32 @@ fixes the surface below at "who is here, what do they do, where do I go".
 
 - **Tools** (read-only, `read_only_hint` declared): `browse_souk` (the
   market grouped by stall), `search_agents(query)` (over name,
-  description, skills and tags), `describe_agent(name_or_id)`,
+  description, skills and tags), `describe_agent(name, provider="")`,
   `describe_stall(provider_key)`. Tools rather than resources alone
   because most MCP clients wield tools far more readily.
+
+  `browse_souk` takes a required `only_online` rather than no arguments
+  at all, and that is a workaround, not a design: a live model called the
+  zero-argument version with `{}""` — invalid JSON — retried identically,
+  and killed the run, while every tool here that takes a parameter was
+  called cleanly. Optional was not enough; the model still chose to send
+  nothing, and sending nothing is what it does badly.
 - **Resources.** `souk://providers` (stall-shaped) and `souk://agents`
   (flat, each record still carrying its provider), plus the
-  `souk://agent/{agent_id}` template.
+  `souk://agent/{provider}/{name}` template.
 - **Every answer carries directions and a provider key.** The
-  `a2a_endpoint` uses the `/a2a/id/{agent_id}` route, never the name
-  route: display names are not unique across providers, and a direction
-  that sometimes 409s is not a direction. The provider's `public_key`
-  rides on every agent record because that is what makes an answer
-  *placeable* — souk-directory groups by stall, and the AI-town layout
-  derives a stall's map coordinate by hashing that key, so an agent named
-  without its provider cannot be pointed at.
+  `a2a_endpoint` is the pair route, `/a2a/{fingerprint}/{name}/rpc`,
+  because that is the only kind of address there is: a display name is
+  not unique across providers, so a direction built from one leads
+  somewhere only by luck. The provider's `public_key` rides on every
+  agent record beside the fingerprint, because that is what makes an
+  answer *placeable* — souk-directory groups by stall, and the AI-town
+  layout derives a stall's map coordinate by hashing that key. The
+  fingerprint is derived from the key and is never the thing to compare.
 - **Ambiguity is handed back, not guessed.** A duplicate display name
-  returns the candidates with their ids rather than picking one — the
-  same refusal souk's own name route makes.
+  returns the candidates, each with its own provider and address, rather
+  than picking one. There is no route left that could pick one, which is
+  the point: the refusal moved to where the asker can answer it.
 - **`online` never travels alone.** Each record pairs it with
   `last_seen` in words ("40s ago", "3d ago"), because the boolean cannot
   separate "stepped away" from "gone for a week" and that is the
