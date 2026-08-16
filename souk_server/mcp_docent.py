@@ -184,12 +184,36 @@ def create_docent(souk: Souk, public_base_url: str) -> MCPServer:
         title="Browse the souk",
         description=(
             "Everyone in this souk right now, grouped by the provider who "
-            "keeps each stall. Start here when asked what is available."
+            "keeps each stall. Start here when asked what is available. "
+            "Pass only_online=true for just the stalls that can answer "
+            "immediately, or false for everyone listed."
         ),
         annotations=READ_ONLY,
     )
-    async def browse_souk() -> dict[str, Any]:
-        return describe_market(await souk.list_agents(), public_base_url)
+    async def browse_souk(only_online: bool) -> dict[str, Any]:
+        """`only_online` answers a real visitor question — "who can I
+        actually talk to right now?" — and is **required**, which is not
+        an aesthetic choice.
+
+        Measured against a live model rather than reasoned about: a call
+        this tool takes no arguments for came back as `{}""` — an empty
+        object with two stray quotes, invalid JSON, rejected by
+        pydantic-ai, retried, identical the second time, run dead. Every
+        tool here that the model passed a value to was called cleanly.
+        Making the parameter optional was not enough: the model still
+        chose to send nothing, and sending nothing is what it does badly.
+        A required parameter is the one shape it cannot get wrong.
+
+        So this is a workaround for a defect on the other side of the
+        wire, kept because the docent has to work with the models people
+        actually have. If a future reader finds it fussy: try making it
+        optional again and ask a real model "who is trading today" before
+        deciding.
+        """
+        agents = await souk.list_agents()
+        if only_online:
+            agents = [a for a in agents if a.online]
+        return describe_market(agents, public_base_url)
 
     @docent.tool(
         title="Search for an agent",

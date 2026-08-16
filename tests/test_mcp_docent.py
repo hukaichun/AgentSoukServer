@@ -159,7 +159,7 @@ async def test_every_tool_declares_itself_read_only(souk):
 
 async def test_browsing_an_empty_souk_says_so_rather_than_failing(souk):
     async with _docent(souk) as client:
-        market = (await client.call_tool("browse_souk", {})).structured_content
+        market = (await client.call_tool("browse_souk", {"only_online": False})).structured_content
         assert market["agent_count"] == 0
         assert market["providers"] == []
 
@@ -173,7 +173,7 @@ async def test_browse_groups_registered_agents_by_stall(souk):
             {"name": "summarizer", "description": "Shortens documents"},
         )
 
-        market = (await client.call_tool("browse_souk", {})).structured_content
+        market = (await client.call_tool("browse_souk", {"only_online": False})).structured_content
 
         assert market["provider_count"] == 1
         stall = market["providers"][0]
@@ -322,3 +322,24 @@ async def test_the_roster_is_readable_both_flat_and_by_stall(souk):
         assert '"agent_count"' in flat.contents[0].text
         stalls = await client.read_resource("souk://providers")
         assert '"provider_count"' in stalls.contents[0].text
+
+
+async def test_browsing_can_be_narrowed_to_who_can_answer_now(souk):
+    """The filter earns its place twice: a visitor asking "who can I talk
+    to right now" is a real question, and a tool with no parameters at all
+    has an empty argument schema — which a live model answered with
+    malformed JSON (`{}""`), failing the call twice and killing the run,
+    while every tool here that takes a parameter was called cleanly."""
+    await _register(souk, "Halima's", {"name": "translator"})
+
+    async with _docent(souk) as client:
+        everyone = (await client.call_tool("browse_souk", {"only_online": False})).structured_content
+        assert everyone["agent_count"] == 1
+
+        # Registration marks an agent seen, so it is online right now;
+        # the filter's shape is what this pins, not the clock.
+        available = (
+            await client.call_tool("browse_souk", {"only_online": True})
+        ).structured_content
+        assert available["agent_count"] == 1
+        assert available["online_count"] == 1
