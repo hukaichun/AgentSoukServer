@@ -1,13 +1,23 @@
-"""Test fixtures for souk-server's test suite.
+"""Test fixtures for the gateway's test suite.
 
 Deliberately a copy of souk/tests/conftest.py rather than an import of it:
 these are two independent distributions (see CONTRIBUTING.md's "no shared
-workspace"), and a test-only dependency from the server back into souk's
+workspace"), and a test-only dependency from the gateway back into souk's
 test package would be the first thread of exactly the coupling the split
 exists to remove. What is shared is a database and a schema, not fixtures.
 
-The one addition is the `client` fixture — an ASGI client over
-`create_app`, which is the whole reason these tests live here.
+Two things are the gateway's own. `client` is an ASGI client over
+`create_app`, which is the whole reason these tests live here. And
+`serve`/`register` hand back the `AgentRef` *and* the fingerprint, because
+an agent is `(provider_key, name)` now and this layer puts the short form
+of that pair in a URL — a test that talks to a route needs both halves.
+
+`Identity` subclasses `souk_provider_sdk.ProviderIdentity` rather than
+reimplementing the signing against `cryptography`, which the old copy did
+because souk did not depend on the SDK. This gateway does — `ws_provider`
+builds on `SoukConnection` — so reimplementing what a provider signs would
+mean the tests could agree with themselves while disagreeing with every
+real provider.
 
 Runs against SQLite by default — zero configuration, no database to stand
 up first. The same suite runs against Postgres by exporting SOUK_DATABASE_URL
@@ -30,14 +40,14 @@ between tests.
 
 from __future__ import annotations
 
-import hashlib
 import os
 import tempfile
 import time
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
-import jwt
 import pytest
 from alembic import command
 from alembic.config import Config
@@ -48,8 +58,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from souk.config import CoreSettings
 from souk.core import Souk
-from souk.identity import registration_signing_payload
+from souk.identity import provider_fingerprint
+from souk.models import AgentRef
+from souk_provider_sdk import InProcessProvider, ProviderIdentity, ProviderRuntime
 from souk_server.server import create_app
+from souk_server.ws_provider import connect_signing_payload
 
 ALEMBIC_INI = (
     Path(__file__).resolve().parent.parent / "AgentSouk" / "souk" / "alembic.ini"
@@ -64,7 +77,7 @@ DATABASE_URL = os.environ.get(
 
 # FK-safe teardown order (children before parents) for the SQLite path,
 # where there's no TRUNCATE ... CASCADE. Postgres uses TRUNCATE directly.
-_TABLES_CHILD_FIRST = ("run_events", "thread_history", "threads", "agents", "providers")
+_TABLES_CHILD_FIRST = ("run_events", "thread_messages", "runs", "threads", "agents", "providers")
 
 
 @pytest.fixture(scope="session")
@@ -94,12 +107,28 @@ def _schema(settings: CoreSettings) -> None:
 
 
 @pytest.fixture(autouse=True)
+async def _dispatching(souk: Souk) -> AsyncIterator[None]:
+    """The broker's dispatch loop, for every test.
+
+    `create_app`'s lifespan is what starts it in a real process, and
+    `ASGITransport` does not run lifespans — so without this a run reaches
+    the broker and simply sits there, which reads as a hang rather than as
+    a missing fixture.
+    """
+    souk.broker.start()
+    try:
+        yield
+    finally:
+        souk.broker.stop()
+
+
+@pytest.fixture(autouse=True)
 async def _clean_db(souk: Souk) -> AsyncIterator[None]:
     is_postgres = souk.engine.sync_engine.dialect.name == "postgresql"
     async with souk.engine.begin() as conn:
         if is_postgres:
             await conn.exec_driver_sql(
-                "TRUNCATE providers, agents, threads, thread_history, run_events "
+                "TRUNCATE providers, agents, threads, runs, thread_messages, run_events "
                 "RESTART IDENTITY CASCADE"
             )
         else:
@@ -121,48 +150,165 @@ async def client(souk: Souk) -> AsyncIterator[AsyncClient]:
         yield c
 
 
-class Identity:
-    """A throwaway Ed25519 keypair plus a helper to build a signed
-    /agents/register body — mirrors souk_agent_sdk.identity's
-    sign/public_key_hex/registration_signing_payload exactly (souk doesn't
-    depend on souk_agent_sdk, so this is reimplemented directly against
-    `cryptography` rather than pulled in as a cross-project test-only
-    dependency).
+class Identity(ProviderIdentity):
+    """A throwaway keypair that signs the way a real provider does.
+
+    Everything souk verifies is `ProviderIdentity`'s. `sign_connect` is the
+    exception and belongs here: opening a socket is a serving act, so the
+    payload is this gateway's (see ws_provider.connect_signing_payload) and
+    upstream neither defines it nor exposes a general `sign` to build it
+    with — the same gap souk-agent-sdk works around, and AgentSouk#43.
     """
 
     def __init__(self) -> None:
         self._key = Ed25519PrivateKey.generate()
-        self.public_key = self._key.public_key().public_bytes_raw().hex()
+        super().__init__(self._key)
+
+    @property
+    def fingerprint(self) -> str:
+        return provider_fingerprint(self.public_key)
 
     def sign_chain_hop(self, subject: dict, prev_token: str | None = None, exp_offset: int = 300) -> str:
-        """Mirrors souk_agent_sdk.identity._sign_hop exactly (see that
-        module's docstring) — reimplemented here for the same reason
-        register_body reimplements the registration signing helper: souk's
-        own test suite doesn't depend on souk_agent_sdk as a package.
-        `exp_offset` can be negative to build an already-expired hop, for
-        testing souk.identity.verify_actor_chain's per-hop exp handling.
-        """
-        now = int(time.time())
-        payload = {
-            "subject": subject,
-            "actorPublicKey": self.public_key,
-            "prevHash": hashlib.sha256(prev_token.encode()).hexdigest() if prev_token is not None else None,
-            "iat": now,
-            "exp": now + exp_offset,
-        }
-        return jwt.encode(payload, self._key, algorithm="EdDSA")
+        """One actor-chain hop. `exp_offset` can be negative to build an
+        already-expired one, for souk.identity.verify_actor_chain's per-hop
+        exp handling."""
+        return self.sign_hop(subject, prev_token, ttl=exp_offset)
 
-    def register_body(self, agents: list[dict]) -> dict:
-        timestamp = int(time.time())
-        payload = registration_signing_payload([a["name"] for a in agents], timestamp)
+    def register_body(self, agents: list[dict], **extra) -> dict:
+        signature, timestamp = self.sign_registration([a["name"] for a in agents])
         return {
             "public_key": self.public_key,
-            "signature": self._key.sign(payload).hex(),
+            "signature": signature,
             "timestamp": timestamp,
             "agents": agents,
+            **extra,
+        }
+
+    def hello(self, names: list[str], **extra) -> dict:
+        timestamp = int(time.time())
+        return {
+            "type": "hello",
+            "publicKey": self.public_key,
+            "signature": self._key.sign(
+                connect_signing_payload(self.public_key, names, timestamp)
+            ).hex(),
+            "timestamp": timestamp,
+            "agentNames": sorted(names),
+            **extra,
         }
 
 
 @pytest.fixture
 def new_identity() -> type[Identity]:
     return Identity
+
+
+@dataclass
+class Served:
+    """What `serve`/`register` hand back: everything a test needs to talk
+    about the provider it just stood up, including how to address it.
+
+    `ref` is what souk takes, `fingerprint` is what goes in a URL — the same
+    identity in two forms, and a test that has to derive one from the other
+    is a test that has taken a position on which is authoritative.
+    """
+
+    identity: Identity
+    provider: Any
+    runtime: ProviderRuntime | None
+    names: tuple[str, ...]
+
+    @property
+    def public_key(self) -> str:
+        return self.identity.public_key
+
+    @property
+    def fingerprint(self) -> str:
+        return self.identity.fingerprint
+
+    def ref(self, name: str | None = None) -> AgentRef:
+        return AgentRef(provider_key=self.public_key, name=name or self.names[0])
+
+    def path(self, name: str | None = None) -> str:
+        """The `{provider}/{name}` half of every route this gateway serves."""
+        return f"{self.fingerprint}/{name or self.names[0]}"
+
+
+@pytest.fixture
+async def attach(souk: Souk):
+    """Attach a provider the way a real one arrives: the SDK's runtime, with
+    an adapter in front of it that souk can hand a run to.
+
+    Every runtime is stopped when the test ends. The `souk` fixture is
+    session-scoped, so one left running stays registered with the broker and
+    takes the next test's runs.
+    """
+    started: list[ProviderRuntime] = []
+
+    async def _attach(identity: ProviderIdentity, provider, names, **kwargs) -> ProviderRuntime:
+        runtime = ProviderRuntime(identity, provider, **kwargs)
+        started.append(runtime)
+        runtime.start()
+        await souk.attach_provider(InProcessProvider(souk, runtime), list(names))
+        return runtime
+
+    yield _attach
+    for runtime in started:
+        await runtime.aclose(cancel_in_flight=True)
+
+
+class EchoAgent:
+    """A provider that answers with one short message and remembers who
+    called it."""
+
+    def __init__(self) -> None:
+        self.seen_caller: dict | None = None
+
+    async def run_stream(self, agent_name: str, run_input: dict):
+        self.seen_caller = (run_input.get("forwardedProps") or {}).get("caller")
+        ids = {"threadId": run_input["threadId"], "runId": run_input["runId"]}
+        yield {"type": "RUN_STARTED", **ids}
+        yield {"type": "TEXT_MESSAGE_START", "messageId": "m1", "role": "assistant"}
+        yield {"type": "TEXT_MESSAGE_CONTENT", "messageId": "m1", "delta": "done"}
+        yield {"type": "TEXT_MESSAGE_END", "messageId": "m1"}
+        yield {"type": "RUN_FINISHED", **ids}
+
+
+@pytest.fixture
+async def register(souk: Souk):
+    """Register agents without attaching anything — for the cases that are
+    about souk knowing a name, not about anybody serving it. Which is most
+    of this suite: an offline agent is a state the gateway has routes for.
+    """
+
+    async def _register(*names: str, **agent_extra) -> Served:
+        names = names or ("agent",)
+        identity = Identity()
+        signature, timestamp = identity.sign_registration(list(names))
+        await souk.register_agents(
+            identity.public_key,
+            signature,
+            timestamp,
+            [{"name": n, **agent_extra} for n in names],
+        )
+        return Served(identity, None, None, tuple(names))
+
+    return _register
+
+
+@pytest.fixture
+async def serve(souk: Souk, attach, register):
+    """Register a provider's agents and attach it, in one step.
+
+    Both halves, because they are always done together and neither is
+    optional: registration is what makes the names souk's to serve, and
+    attaching is what makes them reachable.
+    """
+
+    async def _serve(provider=None, *names: str, **kwargs) -> Served:
+        provider = EchoAgent() if provider is None else provider
+        served = await register(*names)
+        runtime = await attach(served.identity, provider, served.names, **kwargs)
+        return Served(served.identity, provider, runtime, served.names)
+
+    return _serve

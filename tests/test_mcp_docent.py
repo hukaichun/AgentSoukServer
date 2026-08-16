@@ -20,14 +20,11 @@ decorator cannot tell you.
 
 from __future__ import annotations
 
-import time
 from datetime import UTC, datetime, timedelta
 
-import pytest
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from mcp import Client
 
-from souk.identity import registration_signing_payload
+from souk.identity import provider_fingerprint
 from souk.models import AgentSummary
 from souk_server.mcp_docent import (
     _seen_ago,
@@ -40,7 +37,7 @@ from souk_server.mcp_docent import (
 BASE = "https://souk.example.com"
 
 
-async def _register(souk, provider_name: str, *agents: dict) -> str:
+async def _register(souk, new_identity, provider_name: str, *agents: dict) -> str:
     """Register a stall. Note the shape: skills belong under
     `agent_card_extra`, because that is the only part of a registration
     souk copies verbatim into the agent card (repo.register_agents builds
@@ -48,18 +45,21 @@ async def _register(souk, provider_name: str, *agents: dict) -> str:
     anything else). souk-agent-sdk's AgentHandle sends them the same way,
     so a test registering them at the top level would be searching data no
     real provider produces.
+
+    Not the `register` fixture: these stalls need names and descriptions
+    and skills, which that fixture deliberately does not take — its job is
+    to make a name souk knows, and this one's is to furnish a market.
     """
-    key = Ed25519PrivateKey.generate()
-    public_key = key.public_key().public_bytes_raw().hex()
-    timestamp = int(time.time())
+    identity = new_identity()
+    signature, timestamp = identity.sign_registration([a["name"] for a in agents])
     await souk.register_agents(
-        public_key,
-        key.sign(registration_signing_payload([a["name"] for a in agents], timestamp)).hex(),
+        identity.public_key,
+        signature,
         timestamp,
         list(agents),
         provider_name=provider_name,
     )
-    return public_key
+    return identity.public_key
 
 
 def _docent(souk) -> Client:
@@ -78,14 +78,13 @@ def _summary(**overrides) -> AgentSummary:
     now = datetime.now(UTC)
     return AgentSummary(
         **{
-            "agent_id": "agent_1",
+            "provider_key": "aa" * 32,
             "name": "translator",
             "description": "Translates",
             "skills": [],
             "joined_at": now,
             "last_seen_at": now,
             "online": True,
-            "public_key": "aa" * 32,
             "provider_name": "Halima's",
             **overrides,
         }
@@ -96,27 +95,32 @@ def _summary(**overrides) -> AgentSummary:
 
 
 def test_every_agent_carries_directions_and_its_provider_key():
-    described = describe_agent(_summary(agent_id="agent_x", public_key="bb" * 32), BASE)
+    key = "bb" * 32
+    described = describe_agent(_summary(provider_key=key, name="scribe"), BASE)
 
-    # The id route, not the name route: names are not unique across
-    # providers, so the name route can 409 — a direction that sometimes
-    # leads to an argument is not a direction.
-    assert described["a2a_endpoint"] == f"{BASE}/a2a/id/agent_x/rpc"
-    assert described["agent_card_url"].startswith(f"{BASE}/a2a/id/agent_x/.well-known/")
-    assert described["provider"]["public_key"] == "bb" * 32
+    # The pair route, which is the only one there is: a display name is not
+    # an address, since two providers may legitimately offer the same one.
+    short = provider_fingerprint(key)
+    assert described["a2a_endpoint"] == f"{BASE}/a2a/{short}/scribe/rpc"
+    assert described["agent_card_url"].startswith(f"{BASE}/a2a/{short}/scribe/.well-known/")
+    # Both forms of the identity ride along, and the key is the one to
+    # compare — the fingerprint is derived from it, never the other way.
+    assert described["provider"]["public_key"] == key
+    assert described["provider"]["fingerprint"] == short
 
 
 def test_a_trailing_slash_on_the_base_url_does_not_double_up():
-    described = describe_agent(_summary(agent_id="agent_x"), BASE + "/")
-    assert described["a2a_endpoint"] == f"{BASE}/a2a/id/agent_x/rpc"
+    described = describe_agent(_summary(name="scribe"), BASE + "/")
+    short = provider_fingerprint("aa" * 32)
+    assert described["a2a_endpoint"] == f"{BASE}/a2a/{short}/scribe/rpc"
 
 
 def test_the_market_is_grouped_by_stall_not_flattened():
     market = describe_market(
         [
-            _summary(agent_id="a1", name="translator", public_key="aa" * 32),
-            _summary(agent_id="a2", name="summarizer", public_key="aa" * 32),
-            _summary(agent_id="a3", name="translator", public_key="bb" * 32, online=False),
+            _summary(name="translator", provider_key="aa" * 32),
+            _summary(name="summarizer", provider_key="aa" * 32),
+            _summary(name="translator", provider_key="bb" * 32, online=False),
         ],
         BASE,
     )
@@ -145,7 +149,7 @@ def test_last_seen_is_reported_in_words_beside_the_derived_flag():
 # --- through a real MCP client ---------------------------------------
 
 
-async def test_the_docent_offers_no_way_to_run_anything(souk):
+async def test_the_docent_offers_no_way_to_run_anything(souk, new_identity):
     """The boundary, asserted rather than trusted: a docent gives
     directions. Talking to an agent is A2A's job (docs/server-mode.md)."""
     async with _docent(souk) as client:
@@ -156,24 +160,25 @@ async def test_the_docent_offers_no_way_to_run_anything(souk):
         assert not [n for n in names if any(word in n for word in forbidden)]
 
 
-async def test_every_tool_declares_itself_read_only(souk):
+async def test_every_tool_declares_itself_read_only(souk, new_identity):
     async with _docent(souk) as client:
         for tool in (await client.list_tools()).tools:
             assert tool.annotations is not None, tool.name
             assert tool.annotations.read_only_hint is True, tool.name
 
 
-async def test_browsing_an_empty_souk_says_so_rather_than_failing(souk):
+async def test_browsing_an_empty_souk_says_so_rather_than_failing(souk, new_identity):
     async with _docent(souk) as client:
         market = (await client.call_tool("browse_souk", {"only_online": False})).structured_content
         assert market["agent_count"] == 0
         assert market["providers"] == []
 
 
-async def test_browse_groups_registered_agents_by_stall(souk):
+async def test_browse_groups_registered_agents_by_stall(souk, new_identity):
     async with _docent(souk) as client:
         key = await _register(
             souk,
+            new_identity,
             "Halima's Translations",
             {"name": "translator", "description": "Translates between languages"},
             {"name": "summarizer", "description": "Shortens documents"},
@@ -189,11 +194,12 @@ async def test_browse_groups_registered_agents_by_stall(souk):
         assert all(a["provider"]["public_key"] == key for a in stall["agents"])
 
 
-async def test_search_finds_by_skill_and_answers_with_the_stall(souk):
+async def test_search_finds_by_skill_and_answers_with_the_stall(souk, new_identity):
     async with _docent(souk) as client:
-        await _register(souk, "Halima's", {"name": "translator", "description": "Any language pair"})
+        await _register(souk, new_identity, "Halima's", {"name": "translator", "description": "Any language pair"})
         poet_key = await _register(
             souk,
+            new_identity,
             "Yusuf's Workshop",
             {
                 "name": "translator",
@@ -209,13 +215,14 @@ async def test_search_finds_by_skill_and_answers_with_the_stall(souk):
         assert found["agents"][0]["provider"]["public_key"] == poet_key
 
 
-async def test_search_survives_a_visitors_sentence_not_just_a_keyword(souk):
+async def test_search_survives_a_visitors_sentence_not_just_a_keyword(souk, new_identity):
     """The caller is a model relaying a person, and a model handed a tool
     called "search" will pass the whole sentence. Whole-phrase-only
     matching found nothing for exactly the stall that was standing
     there — so any significant word counts."""
     await _register(
         souk,
+        new_identity,
         "Yusuf's",
         {
             "name": "translator",
@@ -236,71 +243,104 @@ async def _search(souk, query: str) -> dict:
         return (await client.call_tool("search_agents", {"query": query})).structured_content
 
 
-async def test_short_words_in_a_sentence_do_not_match_the_whole_market(souk):
+async def test_short_words_in_a_sentence_do_not_match_the_whole_market(souk, new_identity):
     """The other half of the same decision: "the"/"for"/"with" must not
     turn a search into a roster dump."""
-    await _register(souk, "Halima's", {"name": "translator", "description": "Any language pair"})
+    await _register(souk, new_identity, "Halima's", {"name": "translator", "description": "Any language pair"})
 
     found = await _search(souk, "is the one for me")
 
     assert found["match_count"] == 0
 
 
-async def test_search_with_no_match_is_an_empty_answer_not_an_error(souk):
+async def test_search_with_no_match_is_an_empty_answer_not_an_error(souk, new_identity):
     async with _docent(souk) as client:
-        await _register(souk, "Halima's", {"name": "translator"})
+        await _register(souk, new_identity, "Halima's", {"name": "translator"})
         found = (await client.call_tool("search_agents", {"query": "blacksmith"})).structured_content
         assert found["match_count"] == 0 and found["agents"] == []
 
 
-async def test_a_duplicate_name_hands_back_candidates_instead_of_guessing(souk):
-    """Two identities may register the same display name. souk's own name
-    route 409s rather than picking a winner; a docent that guessed would
-    send the visitor to the wrong stall."""
+async def test_a_duplicate_name_hands_back_candidates_instead_of_guessing(souk, new_identity):
+    """Two identities may register the same display name. There is no
+    route that resolves a bare name any more, precisely because there was
+    no right answer for it to give — and a docent that guessed would send
+    the visitor to the wrong stall."""
     async with _docent(souk) as client:
-        key_a = await _register(souk, "Halima's", {"name": "translator"})
-        key_b = await _register(souk, "Yusuf's", {"name": "translator"})
+        key_a = await _register(souk, new_identity, "Halima's", {"name": "translator"})
+        key_b = await _register(souk, new_identity, "Yusuf's", {"name": "translator"})
 
         answer = (
-            await client.call_tool("describe_agent", {"name_or_id": "translator"})
+            await client.call_tool("describe_agent", {"name": "translator"})
         ).structured_content
 
         assert answer["found"] is False
         assert answer["reason"] == "ambiguous_name"
         assert {c["provider"]["public_key"] for c in answer["candidates"]} == {key_a, key_b}
-        # The candidates are directly usable: each carries the id that resolves.
+        # The candidates are directly usable: each carries a real address.
         assert all(c["a2a_endpoint"].endswith("/rpc") for c in answer["candidates"])
 
 
-async def test_an_ambiguous_name_resolves_once_addressed_by_id(souk):
+async def test_an_ambiguous_name_resolves_once_the_stall_is_named(souk, new_identity):
+    """The second argument is what the visitor takes away from the
+    ambiguous answer, and it is the provider — which is the whole shape of
+    the change: a name plus who offers it, never a name alone."""
     async with _docent(souk) as client:
-        await _register(souk, "Halima's", {"name": "translator"})
-        await _register(souk, "Yusuf's", {"name": "translator"})
+        await _register(souk, new_identity, "Halima's", {"name": "translator"})
+        await _register(souk, new_identity, "Yusuf's", {"name": "translator"})
         candidates = (
-            await client.call_tool("describe_agent", {"name_or_id": "translator"})
+            await client.call_tool("describe_agent", {"name": "translator"})
         ).structured_content["candidates"]
+        wanted = candidates[0]
 
         answer = (
             await client.call_tool(
-                "describe_agent", {"name_or_id": candidates[0]["agent_id"]}
+                "describe_agent",
+                {"name": "translator", "provider": wanted["provider"]["fingerprint"]},
             )
         ).structured_content
 
-        assert answer["agent_id"] == candidates[0]["agent_id"]
+        assert answer["provider_key"] == wanted["provider_key"]
+        assert answer["a2a_endpoint"] == wanted["a2a_endpoint"]
 
 
-async def test_an_unknown_agent_is_a_plain_no(souk):
+async def test_the_full_key_names_a_stall_just_as_well_as_its_fingerprint(souk, new_identity):
+    """Whichever form the visitor is holding. The docent hands out both on
+    every record, so demanding one back would be asking them to convert
+    between two spellings of the same identity."""
+    async with _docent(souk) as client:
+        key = await _register(souk, new_identity, "Halima's", {"name": "translator"})
+        await _register(souk, new_identity, "Yusuf's", {"name": "translator"})
+
+        answer = (
+            await client.call_tool("describe_agent", {"name": "translator", "provider": key})
+        ).structured_content
+
+        assert answer["provider_key"] == key
+
+
+async def test_a_stall_that_does_not_offer_that_name_is_a_plain_no(souk, new_identity):
+    async with _docent(souk) as client:
+        key = await _register(souk, new_identity, "Halima's", {"name": "translator"})
+
+        answer = (
+            await client.call_tool("describe_agent", {"name": "blacksmith", "provider": key})
+        ).structured_content
+
+        assert answer["found"] is False
+
+
+async def test_an_unknown_agent_is_a_plain_no(souk, new_identity):
     async with _docent(souk) as client:
         answer = (
-            await client.call_tool("describe_agent", {"name_or_id": "blacksmith"})
+            await client.call_tool("describe_agent", {"name": "blacksmith"})
         ).structured_content
         assert answer["found"] is False
         assert "candidates" not in answer
 
 
-async def test_describe_stall_answers_by_provider_key(souk):
+async def test_describe_stall_answers_by_provider_key(souk, new_identity):
     async with _docent(souk) as client:
-        key = await _register(souk, "Yusuf's Workshop", {"name": "translator"}, {"name": "scribe"})
+        key = await _register(souk, new_identity, "Yusuf's Workshop", {"name": "translator"}, {"name": "scribe"})
 
         answer = (await client.call_tool("describe_stall", {"provider_key": key})).structured_content
 
@@ -309,7 +349,7 @@ async def test_describe_stall_answers_by_provider_key(souk):
         assert sorted(answer["offers"]) == ["scribe", "translator"]
 
 
-async def test_an_unknown_stall_is_a_plain_no(souk):
+async def test_an_unknown_stall_is_a_plain_no(souk, new_identity):
     async with _docent(souk) as client:
         answer = (
             await client.call_tool("describe_stall", {"provider_key": "ff" * 32})
@@ -317,9 +357,9 @@ async def test_an_unknown_stall_is_a_plain_no(souk):
         assert answer["found"] is False
 
 
-async def test_the_roster_is_readable_both_flat_and_by_stall(souk):
+async def test_the_roster_is_readable_both_flat_and_by_stall(souk, new_identity):
     async with _docent(souk) as client:
-        await _register(souk, "Halima's", {"name": "translator"}, {"name": "summarizer"})
+        await _register(souk, new_identity, "Halima's", {"name": "translator"}, {"name": "summarizer"})
 
         uris = {str(r.uri) for r in (await client.list_resources()).resources}
         assert {"souk://agents", "souk://providers"} <= uris
@@ -330,25 +370,31 @@ async def test_the_roster_is_readable_both_flat_and_by_stall(souk):
         assert '"provider_count"' in stalls.contents[0].text
 
 
-async def test_browsing_can_be_narrowed_to_who_can_answer_now(souk):
+async def test_browsing_can_be_narrowed_to_who_can_answer_now(souk, register, serve):
     """The filter earns its place twice: a visitor asking "who can I talk
     to right now" is a real question, and a tool with no parameters at all
     has an empty argument schema — which a live model answered with
     malformed JSON (`{}""`), failing the call twice and killing the run,
-    while every tool here that takes a parameter was called cleanly."""
-    await _register(souk, "Halima's", {"name": "translator"})
+    while every tool here that takes a parameter was called cleanly.
+
+    Two stalls, one of them actually attended. The old version of this
+    test registered a single agent and asserted it was online, because
+    registering marked it seen and seen-recently *was* online — so the
+    filter had nothing to exclude and would have passed unimplemented.
+    """
+    await register("translator")
+    await serve(None, "scribe")
 
     async with _docent(souk) as client:
         everyone = (await client.call_tool("browse_souk", {"only_online": False})).structured_content
-        assert everyone["agent_count"] == 1
+        assert everyone["agent_count"] == 2
 
-        # Registration marks an agent seen, so it is online right now;
-        # the filter's shape is what this pins, not the clock.
         available = (
             await client.call_tool("browse_souk", {"only_online": True})
         ).structured_content
         assert available["agent_count"] == 1
         assert available["online_count"] == 1
+        assert available["providers"][0]["offers"] == ["scribe"]
 
 
 def test_a_wildcard_host_policy_disables_the_check_rather_than_listing_a_host():

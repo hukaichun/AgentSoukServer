@@ -44,9 +44,11 @@ answer includes an `a2a_endpoint` — that is where the conversation \
 actually happens, over A2A JSON-RPC. Hand it to whoever asked, or use an \
 A2A client with it.
 
-`online` is a live judgement, not a stored flag: it means the agent has \
-checked in recently. An offline agent is still listed — its stall is here, \
-its keeper stepped away — so say so rather than pretending it is gone.\
+`online` means someone is serving that agent through this souk *right \
+now* — not that it was seen recently. An offline agent is still listed: \
+its stall is here, its keeper stepped away. Say so rather than pretending \
+it is gone, and read `last_seen` to tell "away for a minute" from "away \
+for a week".\
 """
 
 # Declared, not just true: a client that surfaces tool safety to a user (or
@@ -57,11 +59,12 @@ READ_ONLY = ToolAnnotations(read_only_hint=True, open_world_hint=False)
 def _seen_ago(last_seen_at: datetime) -> str:
     """How long since this agent checked in, in words a guide would use.
 
-    Reported alongside `online` rather than instead of it, because `online`
-    is derived from this same timestamp at query time (see AgentSummary):
-    handing back only the boolean loses the difference between "away for a
-    minute" and "has not been seen in a week", which is exactly what a
-    visitor deciding whether to wait wants to know.
+    Reported alongside `online`, and now the *only* thing that says how
+    long: `online` used to be derived from this timestamp, so the boolean
+    was a coarse reading of it. It no longer is — it means someone is
+    serving this agent at this moment — so a visitor deciding whether to
+    wait learns nothing from it about "away for a minute" versus "not seen
+    in a week". This is where that lives.
     """
     seen = last_seen_at if last_seen_at.tzinfo else last_seen_at.replace(tzinfo=UTC)
     seconds = max(0, int((datetime.now(UTC) - seen).total_seconds()))
@@ -271,7 +274,7 @@ def create_docent(souk: Souk, public_base_url: str) -> MCPServer:
         title="Describe one agent",
         description=(
             "Everything this souk knows about one agent, addressed by its "
-            "its display name, and where to talk to it. Give provider "
+            "display name, and where to talk to it. Give provider "
             "as well (the fingerprint from any earlier answer) when two "
             "stalls share a name."
         ),

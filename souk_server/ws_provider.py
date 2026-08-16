@@ -48,11 +48,14 @@ logger = logging.getLogger("souk.ws_provider")
 
 router = APIRouter()
 
-# How long the broker waits for a provider to answer an offer before
-# treating it as declined. A provider that cannot say yes or no this
-# quickly is not one souk should be holding a run for — the run stays
-# queued and someone else (or the same one, next offer) takes it.
-ACK_TIMEOUT_SECONDS = 10.0
+# A backstop, and deliberately longer than the deadline that actually
+# governs. souk wraps every offer in `RunBroker.deliver_timeout_seconds`
+# (5s) because it has one delivery loop and an offer that never returns
+# stops dispatch for everybody — so souk gives up first, and this never
+# fires in a souk that sets a deadline. Shortening it to "win" would put
+# the same policy in two places and let them drift; deleting it would
+# leave a wait with no bound at all if souk ever offers without one.
+ACK_TIMEOUT_SECONDS = 30.0
 
 
 def connect_signing_payload(public_key: str, agent_names: list[str], timestamp: int) -> bytes:
@@ -111,11 +114,9 @@ class SocketProvider(SoukConnection):
         again — which is exactly how the first provider to be handed a
         run died, on `input_json`.
 
-        The timeout is the honest reading of silence: souk asked whether
-        this provider is taking the run and got nothing back, so it did
-        not take it. Answering late is the same as declining — the ack
-        arrives for a run this side has already given up on, and
-        `ack` drops it.
+        Answering late is the same as declining, whichever deadline ran
+        out: the ack arrives for a run nobody is waiting on any more, and
+        `ack` drops it. souk keeps the run either way.
         """
         loop = asyncio.get_running_loop()
         waiter: asyncio.Future[bool] = loop.create_future()
@@ -204,6 +205,18 @@ async def provider_socket(websocket: WebSocket) -> None:
 
     outbound: asyncio.Queue = asyncio.Queue()
     provider = SocketProvider(public_key, outbound, hello.get("maxConcurrentRuns"))
+    # Queued *before* attaching, and that is not cosmetic. Attaching is what
+    # makes this provider reachable, and the broker starts offering the
+    # moment it is — inside `attach_provider`'s own awaits. Queue the welcome
+    # afterwards and a provider with queued work receives a `run` frame as
+    # the first thing after its hello, which is not the handshake either
+    # side's docs describe: souk-agent-sdk reads exactly one frame, sees a
+    # run where it expected a welcome, raises, and reconnects into the same
+    # race forever.
+    #
+    # Nothing is written yet — the writer task starts below — so a failed
+    # attach still closes without ever sending this.
+    outbound.put_nowait({"type": "welcome"})
     try:
         # Registration is the prerequisite, and core enforces it: a name
         # this key never registered is refused here rather than being
@@ -213,7 +226,6 @@ async def provider_socket(websocket: WebSocket) -> None:
         await websocket.close(code=POLICY_VIOLATION, reason=str(e))
         return
 
-    outbound.put_nowait({"type": "welcome"})
     writer = asyncio.create_task(write_loop(websocket, outbound))
     try:
         while True:

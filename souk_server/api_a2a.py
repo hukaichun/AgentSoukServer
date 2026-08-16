@@ -10,17 +10,18 @@ Agent Cards are served under a per-agent path prefix rather than at the
 origin root — a deliberate deviation from A2A's single-agent-per-origin
 assumption, since one souk fronts many agents at one origin.
 
-Two ways to address an agent:
-- `/a2a/{provider}/{name}/...` — the canonical, always-unambiguous route.
-  An agent *is* `(provider_key, name)`, so addressing it needs both and
-  needs nothing souk minted; `provider` may be the full public key or its
-  16-hex fingerprint, which core tells apart by length.
-- `/a2a/{name}/...` — the legacy, human-readable route, kept working for
-  convenience: resolves transparently as long as exactly one currently-
-  listed agent has that display name. `name` is not unique (multiple
-  identities may register the same one — see repo.register_agents), so a
-  collision 404s/409s instead of silently picking a winner; a caller that
-  needs to pin one specific agent should use the `id` route.
+One way to address an agent: `/a2a/{provider}/{name}/...`. An agent *is*
+`(provider_key, name)`, so addressing it takes both and takes nothing souk
+minted; `provider` may be the full public key or its 16-hex fingerprint,
+which core tells apart by length.
+
+There was a second, by-name route, kept because a bare name is what a human
+types. It is gone rather than deprecated. A name is not unique — two
+identities may both register `translator` (see repo.register_agents) — so
+that route had to either pick a winner or refuse, and picking a winner is
+how a caller reaches an agent it never meant to reach. Resolving a name is
+still easy and still supported; it is `list_agents`, done once by whoever
+holds the name, and then the pair is what goes on the wire.
 """
 
 from __future__ import annotations
@@ -106,5 +107,3 @@ async def rpc_by_pair(
     souk: Souk = Depends(get_souk),
 ):
     return await _rpc(_adapter(souk), await resolve_ref(souk, provider, name), request)
-
-
