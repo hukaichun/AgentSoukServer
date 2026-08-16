@@ -29,7 +29,13 @@ from mcp import Client
 
 from souk.identity import registration_signing_payload
 from souk.models import AgentSummary
-from souk_server.mcp_docent import _seen_ago, create_docent, describe_agent, describe_market
+from souk_server.mcp_docent import (
+    _seen_ago,
+    create_docent,
+    describe_agent,
+    describe_market,
+    transport_security_for,
+)
 
 BASE = "https://souk.example.com"
 
@@ -343,3 +349,18 @@ async def test_browsing_can_be_narrowed_to_who_can_answer_now(souk):
         ).structured_content
         assert available["agent_count"] == 1
         assert available["online_count"] == 1
+
+
+def test_a_wildcard_host_policy_disables_the_check_rather_than_listing_a_host():
+    """The SDK matches `allowed_hosts` exactly (plus a `host:*` port
+    pattern) and knows no wildcard, so passing a literal "*" allows one
+    host — one named `*` — and fails closed. Measured, not read: the
+    docent reaching souk by its compose service name got 421 from a
+    config that read as "allow everything"."""
+    wide = transport_security_for(["*"])
+    assert wide.enable_dns_rebinding_protection is False
+
+    pinned = transport_security_for(["souk:8000", "souk.example.com"])
+    assert pinned.enable_dns_rebinding_protection is True
+    assert "souk:8000" in pinned.allowed_hosts
+    assert "https://souk.example.com" in pinned.allowed_origins

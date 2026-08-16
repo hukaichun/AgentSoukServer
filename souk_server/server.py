@@ -21,7 +21,7 @@ from souk.config import CoreSettings
 from souk_server.config import ServingSettings
 from souk.core import Souk
 from souk_server.deps import install_error_handlers
-from souk_server.mcp_docent import create_docent
+from souk_server.mcp_docent import create_docent, transport_security_for
 
 logger = logging.getLogger("souk_server")
 logging.basicConfig(level=logging.INFO)
@@ -39,7 +39,15 @@ def create_app(souk: Souk, serving: ServingSettings | None = None) -> FastAPI:
     # fresh query against the roster, so there is no session worth pinning to
     # one process, and a second replica can answer just as well.
     docent = create_docent(souk, serving.public_http_url)
-    docent_app = docent.streamable_http_app(streamable_http_path="/", stateless_http=True)
+    docent_app = docent.streamable_http_app(
+        streamable_http_path="/",
+        stateless_http=True,
+        # Which Host headers this answers to — see ServingSettings.
+        # Without it the SDK's localhost-only default 421s every caller
+        # that reaches souk by any other name, which is every caller in
+        # a compose network or behind a proxy.
+        transport_security=transport_security_for(serving.mcp_allowed_hosts),
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):

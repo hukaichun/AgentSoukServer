@@ -1,0 +1,100 @@
+# Working on AgentSoukServer
+
+Notes that were expensive to learn. Everything here comes from a mistake
+actually made in this repo, not from general principle.
+
+## How things run here
+
+Three rules, and they are not stylistic:
+
+- **The gateway and every provider run in `docker compose`.** `souk`,
+  `souk-migrate`, `paradedb` and `docent` are all services in
+  `docker-compose.yml`. Bring the stack up with `docker compose up
+  --build`; that is the thing being developed, so it is the thing to run.
+  Hand-starting a uvicorn on a spare port and a provider subprocess beside
+  it proves the pieces work in an arrangement nobody deploys — it will
+  miss service names (`http://souk:8000` resolves in compose and nowhere
+  else), volume-persisted identity keys, and startup ordering.
+- **Anything Python goes through `uv`.** `uv sync --group dev`, `uv run
+  pytest`, `uv run souk-server`, `uv run alembic`. Never a bare `python`,
+  `pip` or a manually activated venv: each subproject
+  (`souk-agent-sdk/`, `souk-client-sdk/`, `agent-template/`,
+  `providers/*`) has its own environment, and `uv run` from that
+  directory is what picks the right one.
+- **Environment variables come from a file, via `uv run --env-file`.**
+  ```bash
+  uv run --env-file ../../.env pydantic-ai-agent
+  ```
+  Not `export`, and not hand-parsing the file: `.env` values here are
+  quoted (`LLM_BASE_URL = "https://..."`), and a naive `split("=")`
+  hands the URL to httpx with its quotes still attached, which surfaces
+  three layers away as "connection error" from the model. `--env-file`
+  gets this right; a probe that re-implements it gets it wrong.
+
+## Verify by running something
+
+Inherited from upstream and re-earned here several times over. Reading
+produced confident wrong answers; a throwaway probe found the defect.
+
+- The MCP docent's `browse_souk` took no arguments, and a live model
+  called it with `{}""` — invalid JSON, retried once, identical, run
+  dead. Every tool taking a parameter was called cleanly. No unit test
+  could find this: the tool worked perfectly against `mcp.Client` *and*
+  against `fastmcp` directly. Only a real model failed it.
+- Config-driven agents could not declare skills at all — `AgentHandle`
+  had the field, `AgentConfig` did not, `main.py` never passed one — so
+  every agent registered through the runner was findable only by someone
+  who already knew its name. Found by asking the docent to find itself.
+- `search_agents` matched whole phrases only, so "who can help with
+  poetry" found nothing while the stall it wanted sat there tagged
+  `poetry`. The caller is a model relaying a person; it passes sentences.
+
+When you catch yourself about to write "this should work", write the
+probe instead — and run it through compose, per the rules above.
+
+## Testing
+
+- Run the suite on **both** backends. SQLite is the default;
+  `SOUK_DATABASE_URL=postgresql+psycopg://…` for the other (`docker
+  compose up paradedb -d`). Dialect bugs only appear on one side.
+- **A green suite does not mean the app starts.** Nothing under `tests/`
+  imports `souk_server/server.py`. After any broad edit, build the app:
+  ```bash
+  uv run python -c "from souk.config import CoreSettings; from souk.core import Souk; from souk_server.server import create_app; create_app(Souk(CoreSettings(token_signing_secret='x'))); print('app builds')"
+  ```
+- WebSocket tests drive the real ASGI app over `httpx-ws` in the same
+  event loop as the `souk` fixture. A threaded test client would be
+  driving the broker's loop-bound queues cross-loop.
+- The MCP client holds an anyio task group, so it is entered *inside*
+  each test rather than supplied as a fixture — pytest-asyncio can
+  finalise a fixture from a different task than it set up in, which a
+  cancel scope cannot survive.
+
+## Design invariants
+
+Breaking one has caused a real bug here or upstream.
+
+- **This repo owns both ends of every wire it defines.** Gateway, both
+  SDKs, the reference providers and the directory UI live here; upstream
+  AgentSouk is souk core and its docs, nothing network-facing
+  (AgentSouk#27). `docs/server-mode.md` is the spec of record for the
+  frame protocol.
+- **Core is network-free, and this is where every I/O decision lives.**
+  Ports, TLS, CORS, framing, edge auth. `create_app` binds nothing.
+- **Serving state stays out of core's database.** No gateway table in
+  core's schema, no revision in `souk/alembic/`, and no code path putting
+  core state and serving state in one transaction — see
+  `docs/server-mode.md`.
+- **The docent gives directions and stops.** No MCP tool may run,
+  resume or cancel anything; invocation is A2A's, which souk already
+  serves without deviation. A test asserts the tool list.
+- **Skills only reach souk through `agent_card_extra`.**
+  `repo.register_agents` builds the agent card from name + description +
+  `agent_card_extra` and silently drops everything else.
+
+## Where the design lives
+
+`docs/server-mode.md` — the wire, the MCP docent, the DB boundary, and
+the decisions that were tried and rejected. Read it before changing the
+frame protocol, the docent's surface, or anything about persistence; if
+the code contradicts it, one of them needs fixing, deliberately.

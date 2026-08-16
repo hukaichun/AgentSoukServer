@@ -27,6 +27,7 @@ from typing import Any
 
 from a2a.utils.constants import AGENT_CARD_WELL_KNOWN_PATH
 from mcp.server import MCPServer
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 
 from souk.core import Souk
@@ -165,6 +166,28 @@ def _matches(agent: AgentSummary, needle: str) -> bool:
     if needle in text:
         return True
     return any(word in text for word in needle.split() if len(word) >= 3)
+
+
+def transport_security_for(allowed_hosts: list[str]) -> TransportSecuritySettings:
+    """Translate this gateway's host policy into the MCP SDK's.
+
+    `"*"` has to become *disabling* the check, not an entry in the list:
+    the SDK matches `allowed_hosts` exactly (plus a `host:*` port
+    pattern) and knows no wildcard, so a literal `"*"` allows exactly one
+    host — one named `*`. That fails closed, which sounds harmless until
+    you watch it: the docent reaching souk by its compose service name
+    got 421 Misdirected Request from a config that read as "allow
+    everything", while every other surface on the same listener worked.
+    """
+    if "*" in allowed_hosts:
+        return TransportSecuritySettings(enable_dns_rebinding_protection=False)
+    return TransportSecuritySettings(
+        allowed_hosts=list(allowed_hosts),
+        # Origins get the same list: a browser-based MCP client sends one,
+        # and a host allowed to be addressed should be allowed to ask.
+        allowed_origins=[f"http://{h}" for h in allowed_hosts]
+        + [f"https://{h}" for h in allowed_hosts],
+    )
 
 
 def create_docent(souk: Souk, public_base_url: str) -> MCPServer:

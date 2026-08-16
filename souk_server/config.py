@@ -32,6 +32,22 @@ class ServingSettings(BaseSettings):
     # local souk.
     cors_allow_origins: list[str] = ["*"]
 
+    # Host header values the MCP docent (/mcp) will answer to. The MCP
+    # SDK enables DNS-rebinding protection by default and allows only
+    # localhost, which is right for a personal MCP server on a laptop and
+    # wrong for a gateway: the first thing that happened when the docent
+    # was moved into compose and reached souk by its service name was a
+    # 421 Misdirected Request, with everything else on the same listener
+    # working.
+    #
+    # Defaulting to "*" is a judgement about what is behind this door,
+    # not a shrug: /mcp is read-only and serves exactly the roster
+    # `GET /agents` already serves unauthenticated, so a rebinding attack
+    # that reached it would learn nothing it could not fetch directly.
+    # Pin it to real hostnames anyway in a deployment where that stops
+    # being true.
+    mcp_allowed_hosts: list[str] = ["*"]
+
     # Base URL callers use to reach this souk's HTTP surface, used to build
     # per-agent Agent Card URLs. Override in deployments behind a proxy/LB.
     # Deliberately not a core setting even though it ends up in protocol

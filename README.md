@@ -98,7 +98,7 @@ Two supported terminations — pick one, but off-localhost you need one:
 docker compose up --build
 ```
 
-brings up the trio: **paradedb** (Postgres), **souk-migrate** (one-shot `alembic upgrade head`, then exits), and **souk** (the gateway, after migration completes). The migration is deliberately its own service — DDL runs with different credentials than the DML-only role the server needs; the gateway never creates tables at startup.
+brings up the stack: **paradedb** (Postgres), **souk-migrate** (one-shot `alembic upgrade head`, then exits), **souk** (the gateway, after migration completes), and **docent** (the guide at the gate — needs `.env` with LLM credentials; see `.env.example`). The migration is deliberately its own service — DDL runs with different credentials than the DML-only role the server needs; the gateway never creates tables at startup.
 
 Building the image requires the submodule checked out (`git clone --recurse-submodules`) — `scripts/` and `souk/` are COPYed from it.
 

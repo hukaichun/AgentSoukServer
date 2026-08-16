@@ -22,10 +22,13 @@ services:
   # running server a DML-only role instead. Local dev reuses the same
   # `souk` Postgres user for both here, for simplicity only.
   #
-  # working_dir is souk core inside the AgentSouk submodule (the library
-  # owns its tables, so alembic runs from there, not from souk_server);
-  # `uv run` there syncs souk's own environment at container start —
-  # network-dependent, inherited from the upstream compose unchanged.
+  # Runs from /app against souk's alembic.ini by path — the schema still
+  # belongs to core, but this uses the environment the image already
+  # built. Pointing working_dir at /app/AgentSouk/souk instead (which the
+  # upstream compose did, since the library owns its tables) makes `uv
+  # run` sync a *second*, unbuilt environment at container start: it
+  # needs the network every time the stack comes up, and it failed here
+  # on a PyPI timeout with the image sitting right there, fully built.
   souk-migrate:
     # Same image tag as `souk` below (which shares this same build config)
     # so Compose builds it once, not twice, under two different names.
@@ -33,8 +36,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    working_dir: /app/AgentSouk/souk
-    command: ["uv", "run", "alembic", "upgrade", "head"]
+    working_dir: /app
+    command: ["uv", "run", "alembic", "-c", "AgentSouk/souk/alembic.ini", "upgrade", "head"]
     depends_on:
       paradedb:
         condition: service_healthy
@@ -67,5 +70,37 @@ services:
       # Must match souk-migrate's above — see that service's comment.
       SOUK_DB_SCHEMA: ${SOUK_DB_SCHEMA:-public}
 
+  # The stall at the gate: the guide that knows who else is here. An
+  # ordinary provider — own key, own row in the roster, work claimed over
+  # WS /ws/provider — that reaches the market through the gateway's own
+  # MCP surface (/mcp) rather than GET /agents, which is what makes it
+  # the first real consumer of that surface rather than a special case.
+  #
+  # Needs an LLM: copy .env.example to .env and fill in LLM_BASE_URL /
+  # LLM_API_KEY / LLM_MODEL_NAME (or ANTHROPIC_API_KEY and change the
+  # config's `model:`). Compose reads .env from this directory for the
+  # ${...} below.
+  docent:
+    build:
+      context: .
+      dockerfile: providers/pydantic-ai-agent/Dockerfile
+    depends_on:
+      - souk
+    volumes:
+      - ./providers/pydantic-ai-agent/config.docent.yaml:/app/config.yaml:ro
+      # Without this the docent mints a fresh Ed25519 identity on every
+      # recreate, and the previous one's agent_id is left in the roster as
+      # an orphan — two "docent" entries, one of them permanently offline.
+      # Persisting the key is what makes `docker compose up --build`
+      # idempotent (souk keys ownership on the public key, not the name).
+      - docent_identity:/data
+    environment:
+      SOUK_IDENTITY_KEY_PATH: /data/souk_identity.key
+      LLM_BASE_URL: "${LLM_BASE_URL}"
+      LLM_MODEL_NAME: "${LLM_MODEL_NAME}"
+      LLM_API_KEY: "${LLM_API_KEY}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+
 volumes:
   paradedb_data:
+  docent_identity:
