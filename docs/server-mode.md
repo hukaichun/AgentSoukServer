@@ -297,6 +297,20 @@ unneeded). Search filters that roster in Python rather than querying —
 a market's worth of stalls is not a log, and if a deployment ever
 outgrows it, that is when a core query earns its place.
 
+**The docent is also a stall.**
+`providers/pydantic-ai-agent/config.docent.yaml` runs it as an ordinary
+provider — its own key, a row in the roster, runs claimed over
+`/ws/provider` — reaching the market through `/mcp` as a real MCP
+client rather than through `GET /agents`. Two things that buys: every
+frontend gets a guide instead of each one building its own, and the
+surface above acquires a consumer, so a question `/mcp` cannot answer
+shows up as a guide that cannot answer it, in a running process rather
+than in review. (`souk_tools.py` — the same capability as plain
+function tools — named this exact moment as when to prefer a real MCP
+server, and stays off in that config so the model has one way to ask,
+not two.) It runs unthrottled on purpose: backpressure is a feature at a
+working stall and a bad front door at the gate.
+
 **The one question the docent cannot answer: "are they busy right
 now?"** Capacity is per-stall in souk's model (`maxClaim` is a
 provider's budget across everything it hosts), and the roster carries

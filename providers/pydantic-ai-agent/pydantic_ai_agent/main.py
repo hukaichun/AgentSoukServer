@@ -172,6 +172,12 @@ async def main() -> None:
             AgentHandle(
                 name=agent_cfg.name,
                 description=agent_cfg.description,
+                # skills last: a config naming both means the dedicated
+                # field wins over a hand-rolled card entry.
+                agent_card_extra={
+                    **agent_cfg.agent_card_extra,
+                    **({"skills": agent_cfg.skills} if agent_cfg.skills else {}),
+                },
                 run_stream=make_run_stream(
                     agent, signing_key, cfg.souk_http_url, use_kyok=agent_cfg.use_kyok
                 ),

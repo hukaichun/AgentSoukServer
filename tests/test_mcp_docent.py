@@ -203,6 +203,43 @@ async def test_search_finds_by_skill_and_answers_with_the_stall(souk):
         assert found["agents"][0]["provider"]["public_key"] == poet_key
 
 
+async def test_search_survives_a_visitors_sentence_not_just_a_keyword(souk):
+    """The caller is a model relaying a person, and a model handed a tool
+    called "search" will pass the whole sentence. Whole-phrase-only
+    matching found nothing for exactly the stall that was standing
+    there — so any significant word counts."""
+    await _register(
+        souk,
+        "Yusuf's",
+        {
+            "name": "translator",
+            "description": "Classical Arabic",
+            "agent_card_extra": {"skills": [{"name": "translate", "tags": ["poetry"]}]},
+        },
+    )
+
+    found = (
+        await _search(souk, "who here can help me with poetry")
+    )
+
+    assert found["match_count"] == 1
+
+
+async def _search(souk, query: str) -> dict:
+    async with _docent(souk) as client:
+        return (await client.call_tool("search_agents", {"query": query})).structured_content
+
+
+async def test_short_words_in_a_sentence_do_not_match_the_whole_market(souk):
+    """The other half of the same decision: "the"/"for"/"with" must not
+    turn a search into a roster dump."""
+    await _register(souk, "Halima's", {"name": "translator", "description": "Any language pair"})
+
+    found = await _search(souk, "is the one for me")
+
+    assert found["match_count"] == 0
+
+
 async def test_search_with_no_match_is_an_empty_answer_not_an_error(souk):
     async with _docent(souk) as client:
         await _register(souk, "Halima's", {"name": "translator"})

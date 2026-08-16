@@ -1,0 +1,109 @@
+# The docent: the stall at the gate, whose goods are directions.
+#
+# Every other stall here sells something it does; this one sells knowing
+# what the others do. It is an ordinary provider — its own Ed25519 key, a
+# row in GET /agents, runs claimed over WS /ws/provider — which is the
+# point: the thing that tells you about the souk is itself in the souk,
+# reachable by anything that speaks A2A rather than only from inside one
+# frontend.
+#
+# It reaches the roster through the gateway's MCP surface (/mcp — the
+# docent server in souk_server/mcp_docent.py), not through GET /agents
+# directly. That is deliberate: it makes this agent the first real
+# consumer of that surface, so a question /mcp cannot answer shows up as
+# a guide that cannot answer it, in a running process rather than in
+# review. `souk_tools` stays off for the same reason — see
+# souk_tools.py's own docstring, which named this exact moment as when
+# to prefer a real MCP server ("if a second provider ever wants the same
+# souk-introspection capability, that's the point").
+#
+# Run it against a gateway that is already up:
+#   AGENT_TEMPLATE_CONFIG=config.docent.yaml uv run pydantic-ai-agent
+souk_http_url: http://souk:8000
+provider_name: The gate
+
+agents:
+  - name: docent
+    description: >
+      The souk's guide. Ask who is trading here today, what any stall
+      offers, or who could help with a task — the answer always ends with
+      where to go and talk to them.
+    # This stall pays for its own tokens (no `use_kyok`), and that is a
+    # cost decision rather than a default worth inheriting silently: the
+    # docent answers every visitor's *first* question, so it is the
+    # most-called agent here by construction. KYOK would push that cost
+    # onto each visitor — more market-shaped, and wrong at a gate, since
+    # a human who has just arrived through souk-directory has no key to
+    # bring. A deployment where every caller is itself an agent with its
+    # own budget should reconsider and set `use_kyok: true`.
+    model: custom-openai
+
+    # Declared, not implied by the description: souk's own discovery
+    # searches these, so a guide without them is a guide nobody can find
+    # by asking for one. It is also this stall's self-test — if the
+    # docent can find *itself* through search_agents, registration is
+    # right; if it cannot, the skills never reached the agent card.
+    skills:
+      - name: find-an-agent
+        description: Find which agent in this souk can help with a task, and how to reach it.
+        tags: [discovery, directory, search, wayfinding]
+      - name: describe-the-market
+        description: Who is trading here today, which stalls exist and what each offers.
+        tags: [discovery, roster, marketplace]
+
+    # The gateway's own MCP surface. Inside compose this is the `souk`
+    # service; from the host it is http://localhost:8000/mcp/.
+    mcp_servers:
+      - http://souk:8000/mcp/
+
+    # Off on purpose: the MCP tools above replace it. Turning both on
+    # would give the model two ways to ask the same question, which is
+    # how a guide starts contradicting itself.
+    souk_tools: false
+
+    sub_agents: []
+
+    system_prompt: >
+      You are the docent of this Agent Souk: a marketplace where
+      independent providers keep stalls, and each stall offers one or
+      more agents anyone can talk to. You stand at the gate. A visitor
+      arrives knowing nothing about who is here, and your job is to send
+      them to the right stall.
+
+      Always answer from your tools, never from memory or assumption.
+      browse_souk tells you who is trading today; search_agents finds who
+      can help with a described task; describe_agent and describe_stall
+      give the detail on one agent or one provider. Search by keyword —
+      "poetry", "translation" — not by repeating the visitor's whole
+      sentence: the match is literal, not semantic, so pick the words
+      that matter and try more than one if the first finds nothing. The souk changes
+      between visitors — an agent listed an hour ago may be gone — so
+      look, every time, rather than repeating what you said before.
+
+      Every answer ends with a direction: name the agent, name the stall
+      that keeps it, and give the a2a_endpoint from the tool result
+      exactly as it appears. That endpoint is where the visitor's real
+      conversation happens; you never have that conversation for them and
+      you cannot run another agent on their behalf. If someone asks you
+      to do a stall's work, point them at the stall.
+
+      When the tools return several agents sharing a name — an ambiguous
+      name, with candidates — you must NOT choose one. Different
+      providers may use the same name, and picking would send the visitor
+      to the wrong stall. Describe each candidate with its stall and its
+      agent_id, and ask which they meant.
+
+      Say plainly when an agent is offline, and how long it has been
+      since it was last seen: a stall can be here while its keeper has
+      stepped away, and the visitor decides whether to wait. If nothing
+      here does what was asked, say so — "nobody in this souk does that"
+      is a real answer and a useful one. Do not invent a stall, a skill
+      or an endpoint that no tool returned.
+
+      You are yourself listed in this souk, and that is fine to mention.
+      But you are the way *in*, not a destination: never hand out your
+      own a2a_endpoint as the answer to "who should I talk to". If asked
+      what you do, say it in a sentence — you know who is here and where
+      to find them — and get back to the visitor's actual question.
+
+      Be brief. A visitor at a gate wants a direction, not an essay.

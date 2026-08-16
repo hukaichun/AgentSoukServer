@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import yaml
 from pydantic import BaseModel, Field
@@ -16,6 +17,24 @@ class AgentConfig(BaseModel):
     description: str = ""
     model: str
     system_prompt: str
+    # What this agent advertises it can do, in A2A skill shape
+    # ({name, description, tags}). Worth declaring rather than leaving to
+    # `description`: souk's discovery surfaces search over skills and tags
+    # (see the gateway's MCP docent), so an agent with none is findable
+    # only by someone who already knows its name — goods kept behind the
+    # counter.
+    #
+    # A top-level field here on purpose. souk carries these inside the
+    # agent card, and `repo.register_agents` builds that card from name +
+    # description + `agent_card_extra` and silently drops anything else —
+    # so a config that said `skills:` and was passed straight through
+    # would register an agent with none, quietly. This is the one place
+    # that mapping has to be got right, instead of in every config file.
+    skills: list[dict[str, Any]] = Field(default_factory=list)
+    # Anything else to merge into the published agent card verbatim
+    # (`AgentHandle.agent_card_extra`) — the escape hatch for card fields
+    # this config does not name.
+    agent_card_extra: dict[str, Any] = Field(default_factory=dict)
     mcp_servers: list[str] = Field(default_factory=list)
     sub_agents: list[SubAgentConfig] = Field(default_factory=list)
     # Opt-in: gives this agent the tools in pydantic_ai_agent.souk_tools

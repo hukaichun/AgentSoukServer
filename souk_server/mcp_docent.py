@@ -140,7 +140,15 @@ def describe_market(agents: list[AgentSummary], public_base_url: str) -> dict[st
 
 
 def _matches(agent: AgentSummary, needle: str) -> bool:
-    """Substring match over everything an agent says about itself.
+    """Keyword match over everything an agent says about itself.
+
+    The whole phrase first, then any single word of it — because the
+    caller is a language model relaying a visitor, and a model handed a
+    tool called "search" will pass the visitor's sentence. Measured, not
+    guessed: "who can help with poetry" matched nothing under
+    whole-phrase-only, while the stall it was looking for was sitting
+    there with "poetry" in its tags. Short words are dropped so that
+    "with"/"the"/"for" do not match the entire market.
 
     Deliberately in Python over the whole roster rather than a query: a
     souk's roster is a market's worth of stalls, not a log, and souk has no
@@ -153,7 +161,10 @@ def _matches(agent: AgentSummary, needle: str) -> bool:
         if isinstance(skill, dict):
             haystack += [str(skill.get("name", "")), str(skill.get("description", ""))]
             haystack += [str(tag) for tag in skill.get("tags", []) or []]
-    return needle in " ".join(haystack).lower()
+    text = " ".join(haystack).lower()
+    if needle in text:
+        return True
+    return any(word in text for word in needle.split() if len(word) >= 3)
 
 
 def create_docent(souk: Souk, public_base_url: str) -> MCPServer:
@@ -185,7 +196,9 @@ def create_docent(souk: Souk, public_base_url: str) -> MCPServer:
         description=(
             "Find agents whose name, description or skills mention "
             "something. Use it when asked for help with a task rather than "
-            "for a specific agent by name."
+            "for a specific agent by name. Search by keyword ('poetry', "
+            "'translation'), not by whole sentence — matching is literal, "
+            "not semantic."
         ),
         annotations=READ_ONLY,
     )
