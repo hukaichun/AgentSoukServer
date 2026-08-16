@@ -284,11 +284,17 @@ async function renderCallChain(soukUrl: string, forThreadId: string): Promise<vo
     const stopHtml = stops
       .map((node, i) => {
         const name = escapeHtml(node.agent_name);
-        // Name the stall whenever it is known — a hop reading "translator"
-        // is ambiguous in any souk where two providers keep one, and this
-        // strip exists precisely to show a walk between two stalls.
+        // Name the stall only where the walk actually crosses into it.
+        // Rendering it on every hop was the first thing that looked wrong
+        // on a real chain: a three-hop delegation inside one stall printed
+        // the same storefront three times and wrapped the strip onto two
+        // lines, saying nothing on any of them. The root is covered by the
+        // page header, and an unchanged stall means nobody went anywhere —
+        // so the label appears exactly where a visitor would have had to
+        // walk, and disappears when the work never left the counter.
         const stall = stallNameByKey.get(node.provider_key);
-        const at = stall ? `<span class="stop-stall">${escapeHtml(stall)}</span>` : "";
+        const crossed = i > 0 && node.provider_key !== stops[i - 1].provider_key;
+        const at = crossed && stall ? `<span class="stop-stall">${escapeHtml(stall)}</span>` : "";
         const link = i > 0 ? `<span class="link"></span>` : "";
         return `${link}<span class="stop ${i === 0 ? "root" : ""}" title="${escapeHtml(
           node.provider_key
