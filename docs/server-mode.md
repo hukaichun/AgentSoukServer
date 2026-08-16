@@ -323,6 +323,58 @@ drives the claim loop), so the honest version is per-process serving
 state, not a core projection — and it would read as authoritative while
 being blind to workers connected to another replica.
 
+## Serving state stays out of core's database
+
+**Today the gateway persists nothing.** Its only database access is
+`deps.get_session`, which borrows core's session and hands it to a route;
+every table in the deployment belongs to `souk`, is created by
+`souk/alembic/`, and is migrated by the one-shot `souk-migrate` service.
+That is not an accident to preserve by luck — it is the state this rule
+protects.
+
+**When serving *does* need persistence, it is isolated from core's, and
+the isolation is structural rather than a naming convention.** Whatever
+it turns out to be — edge-auth records, rate limits, admin state, an MCP
+event store for resumable streams — it does not get a table in core's
+schema and never gets a revision in `souk/alembic/`.
+
+Three reasons, in the order they bite:
+
+1. **A shared migration chain merges the two repos.** `souk/alembic/` is
+   upstream's, versioned with core. A gateway table added there makes
+   `alembic upgrade head` from souk responsible for serving state, and
+   makes this repo's schema a function of the submodule pin.
+2. **It would break core's own readiness answer.** `Souk.health` compares
+   `alembic_version` against `EXPECTED_SCHEMA_REVISION`, a literal in
+   `souk/db_schema.py`. A chain carrying gateway revisions would move
+   past what core expects, and core would report a database it is
+   perfectly able to serve as not ready.
+3. **The DDL/DML split is already load-bearing here.** `souk-migrate`
+   exists so DDL runs with credentials the server itself never holds
+   (README). Serving tables mean a *second* migrate step with the same
+   split, not a merged one.
+
+**Follow upstream's mechanism rather than inventing one** (see
+`AgentSouk/souk/souk/db_schema.py` and `souk/alembic/env.py`): a schema
+namespace read from the environment, quoted in exactly one place, ignored
+on SQLite (which has no schema namespace at all), with a dependency-free
+module holding the constants so both the app and its `env.py` can import
+them without dragging in required settings. The serving version is the
+same shape under its own names — a `SOUK_SERVER_DB_SCHEMA`, an
+`alembic/` in this repo, its own expected-revision check.
+
+Whether the two live in one database under separate schemas, or in two
+databases entirely, is a deployment choice and both must keep working —
+which sets the real test, and it is not the schema name:
+
+> **No code path may put core state and serving state in one
+> transaction.**
+
+A shared session or a single `begin()` spanning both makes them one
+database in practice however they are namespaced, and forecloses the
+split deployment silently. Serving persistence therefore gets its own
+engine and sessionmaker, not `souk.session()`.
+
 ## Where examples live
 
 Split by what an example teaches, not by where it happens to run:
