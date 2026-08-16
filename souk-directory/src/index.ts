@@ -41,7 +41,15 @@ function render(agents: AgentRosterEntry[]): void {
   const container = document.getElementById("agents")!;
   const soukUrl = getSoukUrl();
   if (agents.length === 0) {
-    container.innerHTML = `<p class="empty-state">No agents match.</p>`;
+    // Two different nothings, and telling a newcomer the wrong one is
+    // worse than saying nothing: an empty souk reported as "no agents
+    // match" reads as a failed search, so the reader hunts for a filter
+    // they never typed. The roster being empty is a fact about the
+    // market; matching nothing is a fact about the query.
+    container.innerHTML =
+      allAgents.length === 0
+        ? `<p class="empty-state">This souk has no agents listed yet.</p>`
+        : `<p class="empty-state">No agents match.</p>`;
     return;
   }
   container.innerHTML = groupByProvider(agents)
@@ -83,14 +91,27 @@ function applyFilter(): void {
 async function load(soukUrl: string): Promise<void> {
   const container = document.getElementById("agents")!;
   container.innerHTML = `<p class="empty-state">Loading…</p>`;
+  // Fetching and rendering are caught separately because they fail for
+  // unrelated reasons and only one of them is the network's fault. Wrapping
+  // both said "Couldn't reach <souk>" for anything thrown while drawing —
+  // which is how a roster this page simply could not read presented as an
+  // unreachable server, sending the reader to check the wrong thing.
   try {
     allAgents = await fetchAgents(soukUrl);
-    applyFilter();
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     container.innerHTML = `<p class="empty-state">Couldn't reach ${escapeHtml(soukUrl)}: ${escapeHtml(
       message
     )}</p>`;
+    return;
+  }
+  try {
+    applyFilter();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    container.innerHTML = `<p class="empty-state">Reached ${escapeHtml(
+      soukUrl
+    )}, but couldn't read its roster: ${escapeHtml(message)}</p>`;
   }
 }
 
