@@ -29,6 +29,7 @@ from souk_agent_sdk.client import (
     AgentHandle,
     SoukIdentityMismatch,
     SoukProvider,
+    SoukQueryFailed,
     souk_challenge_payload,
 )
 
@@ -159,8 +160,9 @@ async def test_the_proof_signs_both_nonces_and_the_hello_that_was_sent(tmp_path)
     """Verified by rebuilding the payload from the frames the stub
     actually received — so a provider that signed the right shape over the
     wrong bytes fails here rather than passing."""
+    from souk_provider_sdk import verify_signature
+
     from souk_agent_sdk.client import provider_proof_payload
-    from souk_agent_sdk.identity import verify_signature
 
     async with StubGateway() as gateway:
         provider = _provider(
@@ -419,3 +421,147 @@ async def test_a_dropped_socket_does_not_end_the_run_and_its_frames_flush_on_the
             with contextlib.suppress(asyncio.CancelledError):
                 await conn2
             await provider.runtime.aclose(cancel_in_flight=True)
+
+
+# --- queries: request/response over a one-way wire --------------------------
+
+
+async def test_a_query_goes_out_with_a_correlation_id_and_its_answer_comes_back(tmp_path):
+    """The first thing on this wire that expects a reply. Everything else a
+    provider sends is fire-and-forget, which is why the queryId exists at
+    all: several questions may be outstanding on one socket, and an answer
+    has to find the caller that asked."""
+    async with StubGateway() as gateway:
+        provider = _provider(
+            gateway,
+            [AgentHandle(name="echo", run_stream=_echo_run_stream)],
+            identity_key_path=str(tmp_path / "k.key"),
+        )
+        async with _connected(gateway, provider):
+            asked = asyncio.create_task(provider.thread_messages("t1", limit=3))
+
+            query = await gateway.next_frame()
+            assert query["type"] == "query"
+            assert query["method"] == "thread_messages"
+            assert query["params"] == {"threadId": "t1", "limit": 3}
+            assert query["queryId"]
+
+            await gateway.push(
+                {
+                    "type": "queryResult",
+                    "queryId": query["queryId"],
+                    "result": [{"role": "user", "content": "hi"}],
+                }
+            )
+            assert await asyncio.wait_for(asked, RECEIVE_TIMEOUT) == [
+                {"role": "user", "content": "hi"}
+            ]
+
+
+async def test_two_queries_in_flight_get_their_own_answers(tmp_path):
+    """Answered out of order, on purpose: correlation is the point of the
+    id, and a queue would have served the wrong caller."""
+    async with StubGateway() as gateway:
+        provider = _provider(
+            gateway,
+            [AgentHandle(name="echo", run_stream=_echo_run_stream)],
+            identity_key_path=str(tmp_path / "k.key"),
+        )
+        async with _connected(gateway, provider):
+            first = asyncio.create_task(provider.thread_messages("t1"))
+            second = asyncio.create_task(provider.thread_messages("t2"))
+            q1 = await gateway.next_frame()
+            q2 = await gateway.next_frame()
+
+            for query in (q2, q1):
+                await gateway.push(
+                    {
+                        "type": "queryResult",
+                        "queryId": query["queryId"],
+                        "result": [{"thread": query["params"]["threadId"]}],
+                    }
+                )
+
+            assert await asyncio.wait_for(first, RECEIVE_TIMEOUT) == [{"thread": "t1"}]
+            assert await asyncio.wait_for(second, RECEIVE_TIMEOUT) == [{"thread": "t2"}]
+
+
+async def test_an_error_answer_raises_rather_than_returning_nothing(tmp_path):
+    """`[]` is a real answer — a thread with nothing in it — so a failure
+    that returned it would have an agent summarise an empty history as if
+    it were the conversation."""
+    async with StubGateway() as gateway:
+        provider = _provider(
+            gateway,
+            [AgentHandle(name="echo", run_stream=_echo_run_stream)],
+            identity_key_path=str(tmp_path / "k.key"),
+        )
+        async with _connected(gateway, provider):
+            asked = asyncio.create_task(provider.thread_messages("t_not_mine"))
+            query = await gateway.next_frame()
+            await gateway.push(
+                {
+                    "type": "queryResult",
+                    "queryId": query["queryId"],
+                    "error": "no such thread for this provider",
+                }
+            )
+            with pytest.raises(SoukQueryFailed, match="no such thread"):
+                await asyncio.wait_for(asked, RECEIVE_TIMEOUT)
+
+
+async def test_a_socket_that_dies_fails_its_outstanding_queries_at_once(tmp_path):
+    """Not left to time out. The answer is already known, and a caller
+    waiting the full timeout for a certainty is only a slower failure —
+    and unlike a run, a query is not retried on the next connection: the
+    agent asked mid-run, and whether it still wants the answer is the
+    agent's to decide."""
+    async with StubGateway() as gateway:
+        provider = _provider(
+            gateway,
+            [AgentHandle(name="echo", run_stream=_echo_run_stream)],
+            identity_key_path=str(tmp_path / "k.key"),
+        )
+        provider.runtime.start()
+        conn = asyncio.create_task(provider._run_connection())
+        try:
+            async with asyncio.timeout(RECEIVE_TIMEOUT):
+                await gateway.connected.wait()
+            asked = asyncio.create_task(provider.thread_messages("t1"))
+            await gateway.next_frame()
+
+            await gateway._conn.close()
+
+            with pytest.raises(SoukQueryFailed, match="closed"):
+                await asyncio.wait_for(asked, RECEIVE_TIMEOUT)
+        finally:
+            conn.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await conn
+            await provider.runtime.aclose(cancel_in_flight=True)
+
+
+async def test_an_answer_to_a_question_nobody_is_waiting_on_is_dropped(tmp_path):
+    """A late reply — its caller timed out, or its socket already failed
+    it — must not take the connection down with it."""
+    async with StubGateway() as gateway:
+        provider = _provider(
+            gateway,
+            [AgentHandle(name="echo", run_stream=_echo_run_stream)],
+            identity_key_path=str(tmp_path / "k.key"),
+        )
+        async with _connected(gateway, provider):
+            await gateway.push(
+                {"type": "queryResult", "queryId": "never-asked", "result": []}
+            )
+            # Still serving.
+            await gateway.push(
+                {
+                    "type": "run",
+                    "runId": "r1",
+                    "threadId": "t1",
+                    "agentName": "echo",
+                    "input": {"runId": "r1"},
+                }
+            )
+            assert (await gateway.next_frame())["type"] == "ack"

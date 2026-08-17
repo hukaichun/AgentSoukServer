@@ -38,7 +38,8 @@ from fastapi import APIRouter, WebSocket
 from souk.errors import AgentNotFound
 from souk.identity import verify_signature
 from souk.models import AgentRef
-from souk_provider_sdk import SoukConnection
+from souk_provider_sdk import CONNECTED_PROVIDER_ATTRS
+from souk_provider_sdk.contract import LINK_QUERY_METHODS
 from souk_server.handshake import (
     HANDSHAKE_VERSION,
     new_nonce,
@@ -70,20 +71,37 @@ router = APIRouter()
 # leave a wait with no bound at all if souk ever offers without one.
 ACK_TIMEOUT_SECONDS = 30.0
 
+# What a provider may ask souk, and it is deliberately short. Upstream's
+# `contract.LINK_QUERY_METHODS` states the rule: this is not a mirror of
+# souk's API, because every method admitted here is one more frame type
+# every transport has to carry. Read from upstream rather than retyped, so
+# a method added there without a frame here fails a test instead of a
+# provider.
+QUERY_METHODS = frozenset(LINK_QUERY_METHODS)
+
 # How often a live socket re-asks whether souk still lists the agents it
 # attached for. The condition it catches is rare and permanent, so
 # noticing it a minute late costs nothing — see `_watch_registration`.
 OWNERSHIP_RECHECK_SECONDS = 120.0
 
 
-class SocketProvider(SoukConnection):
+class SocketProvider:
     """`broker.ConnectedProvider` with a socket underneath.
 
-    Subclasses the SDK's base rather than duck-typing the four members,
-    which is the point of that base existing: souk sizes a capacity
-    bucket from `max_concurrent_runs`, and a connection that forgets it
-    attaches perfectly well and then fails inside the broker. Here it
-    fails at construction instead.
+    **Not a `SoukLink`,** and upstream's own docstring says so. A link is
+    one provider joined to one souk, both directions in one object; this
+    lives on souk's side, holds an outbound queue and no runtime, and only
+    ever carries work *outward*. The object opposite it — the socket
+    client in souk-agent-sdk — is the one that subclasses `SoukLink`,
+    because it really does own both halves of the connection.
+
+    So the four members below are duck-typed against souk's own
+    `ConnectedProvider` protocol rather than inherited. That loses the
+    fails-at-construction property a base class gave, which is why the
+    constructor asserts against `CONNECTED_PROVIDER_ATTRS` instead: souk
+    sizes a capacity bucket from `max_concurrent_runs`, and a connection
+    that forgets it attaches perfectly well and then fails inside the
+    broker, three layers from the cause.
 
     Holds no per-run state beyond the acks it is waiting on: every frame
     names its run, and souk keeps the only routing table.
@@ -92,6 +110,13 @@ class SocketProvider(SoukConnection):
     def __init__(
         self, public_key: str, outbound: asyncio.Queue, max_concurrent_runs: int | None
     ) -> None:
+        # Against the class, not the instance: `public_key` and
+        # `max_concurrent_runs` are properties, so asking `self` would run
+        # their getters against fields this constructor has not assigned
+        # yet and report every one of them missing.
+        missing = sorted(a for a in CONNECTED_PROVIDER_ATTRS if not hasattr(type(self), a))
+        if missing:
+            raise TypeError(f"{type(self).__name__} is not a ConnectedProvider: missing {missing}")
         self._public_key = public_key
         self._max_concurrent_runs = max_concurrent_runs
         self._outbound = outbound
@@ -105,15 +130,17 @@ class SocketProvider(SoukConnection):
     def max_concurrent_runs(self) -> int | None:
         return self._max_concurrent_runs
 
-    async def offer(self, run: Any) -> bool:
+    async def deliver(self, run: Any) -> bool:
         """Write this run to the wire and wait for the answer.
 
-        `offer` rather than `deliver`: the base class does the mapping
-        from souk's `ClaimedRun` to the SDK's `DeliveredRun`, which is
-        the one place either side's field names are allowed to appear.
-        A transport that overrode `deliver` would be naming souk's shape
-        again — which is exactly how the first provider to be handed a
-        run died, on `input_json`.
+        This is the one place souk's field names appear, and it is a
+        deliberate, single place rather than a habit: `run` is souk's
+        `ClaimedRun`, and what goes on the wire is this repo's frame. The
+        mapping used to be inherited from the SDK, which is where it
+        belongs for a provider-side link — but a gateway is not one, so it
+        does the mapping itself and confines it here. Reading souk's
+        objects freehand throughout is how the first provider ever handed
+        a run died, on `input_json`.
 
         Answering late is the same as declining, whichever deadline ran
         out: the ack arrives for a run nobody is waiting on any more, and
@@ -127,7 +154,7 @@ class SocketProvider(SoukConnection):
                 "type": "run",
                 "runId": run.run_id,
                 "threadId": run.thread_id,
-                "agentName": run.agent_name,
+                "agentName": run.agent.name,
                 "input": run.run_input,
             }
         )
@@ -160,6 +187,67 @@ class SocketProvider(SoukConnection):
             if not waiter.done():
                 waiter.set_result(False)
         self._acks.clear()
+
+
+async def _answer_query(
+    souk: "Souk", public_key: str, parsed: dict[str, Any], outbound: asyncio.Queue
+) -> None:
+    """One `query` frame, answered on the same socket by `queryId`.
+
+    The first thing on this wire that is not fire-and-forget, and the
+    reason it exists is a real gap rather than convenience: a provider
+    sees exactly what the *caller* sent for its run and nothing more. An
+    AG-UI client resends its whole history every turn by convention;
+    A2A's `message/send` carries one message. The same agent, unchanged,
+    cannot tell a tenth turn from a first — and souk has held the thread
+    the whole time.
+
+    **`limit` is applied here, not by the caller.** The parameter exists
+    to keep the response frame bounded; trimming after receiving would
+    bound nothing and put a months-old thread on the wire to do it.
+
+    **A provider may only read threads for agents it serves**, which the
+    upstream design did not call for and this adds. Thread ids are not
+    guessable, but "not guessable" is not an authorization rule: a
+    provider that served one run knows that thread id permanently, and
+    would otherwise keep reading the conversation after being de-listed,
+    or after the agent moved to somebody else's stall. The thread names
+    its agent, and an agent is `(provider_key, name)`, so the check is a
+    comparison souk can already make.
+    """
+    query_id = parsed.get("queryId")
+    method = parsed.get("method")
+    params = parsed.get("params") or {}
+
+    def answer(**fields: Any) -> None:
+        outbound.put_nowait({"type": "queryResult", "queryId": query_id, **fields})
+
+    if not isinstance(query_id, str) or not query_id:
+        outbound.put_nowait({"type": "error", "message": "query needs a queryId"})
+        return
+    if method not in QUERY_METHODS:
+        answer(error=f"unknown query method {method!r}")
+        return
+
+    thread_id = params.get("threadId")
+    limit = params.get("limit")
+    if not isinstance(thread_id, str) or not thread_id:
+        answer(error="thread_messages needs a threadId")
+        return
+    if limit is not None and not (isinstance(limit, int) and limit > 0):
+        answer(error="limit must be a positive integer")
+        return
+
+    thread = await souk.get_thread(thread_id)
+    if thread is None or thread["provider_key"] != public_key:
+        # One answer for "no such thread" and "not yours", deliberately:
+        # telling them apart would confirm a thread exists to somebody who
+        # may not read it, which is the whole of what the check is for.
+        answer(error="no such thread for this provider")
+        return
+
+    messages = await souk.get_thread_messages(thread_id)
+    answer(result=messages[-limit:] if limit is not None else messages)
 
 
 async def _watch_registration(
@@ -376,6 +464,12 @@ async def provider_socket(websocket: WebSocket) -> None:
                     outbound.put_nowait(
                         {"type": "error", "runId": run_id, "message": "finish refused"}
                     )
+            elif kind == "query":
+                # Spawned rather than awaited: a query hits the database,
+                # and awaiting it here would stop this socket reading —
+                # including the acks and events of every run in flight on
+                # it — for the length of that read.
+                asyncio.create_task(_answer_query(souk, public_key, parsed, outbound))
             else:
                 outbound.put_nowait({"type": "error", "message": f"unexpected frame {kind!r}"})
     finally:

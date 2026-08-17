@@ -59,7 +59,7 @@ from souk.config import CoreSettings
 from souk.core import Souk
 from souk.identity import provider_fingerprint
 from souk.models import AgentRef
-from souk_provider_sdk import InProcessProvider, ProviderIdentity, ProviderRuntime
+from souk_provider_sdk import InProcessLink, ProviderIdentity, ProviderRuntime
 from souk_server.handshake import HANDSHAKE_VERSION, new_nonce, provider_proof_payload
 from souk_server.server import create_app
 
@@ -267,7 +267,10 @@ async def attach(souk: Souk):
         runtime = ProviderRuntime(identity, provider, **kwargs)
         started.append(runtime)
         runtime.start()
-        await souk.attach_provider(InProcessProvider(souk, runtime), list(names))
+        # Constructing the link is what joins it to the runtime, so it has
+        # to happen before any work arrives — a runtime with no link drops
+        # its output silently.
+        await souk.attach_provider(InProcessLink(souk, runtime), list(names))
         return runtime
 
     yield _attach

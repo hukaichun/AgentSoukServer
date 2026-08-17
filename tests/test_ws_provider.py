@@ -31,6 +31,7 @@ import pytest
 from httpx_ws import WebSocketDisconnect, aconnect_ws
 from httpx_ws.transport import ASGIWebSocketTransport
 
+from souk import repo
 from souk.config import CoreSettings
 from souk.core import Souk
 from souk.identity import verify_signature
@@ -598,3 +599,142 @@ async def test_a_provider_whose_agents_vanished_is_closed_so_it_re_registers(
             with pytest.raises(WebSocketDisconnect) as excinfo:
                 await socket._ws.receive_text(timeout=RECEIVE_TIMEOUT)
             assert excinfo.value.code == 1008
+
+
+# --- queries: the first frame on this wire that expects an answer -----------
+
+
+async def _query(socket: _Socket, **params) -> dict:
+    await socket.send(
+        {
+            "type": "query",
+            "queryId": "q1",
+            "method": "thread_messages",
+            "params": params,
+        }
+    )
+    frame = await socket.recv()
+    assert frame["type"] == "queryResult", frame
+    assert frame["queryId"] == "q1"
+    return frame
+
+
+async def test_a_provider_can_ask_for_the_history_its_run_input_never_carried(
+    souk, register, client
+):
+    """The gap the query exists for. A provider sees exactly what the
+    *caller* sent for its run: an AG-UI client resends its whole history
+    every turn, A2A's `message/send` carries one message, and the same
+    agent cannot tell a tenth turn from a first. souk has held the thread
+    all along, and this is how it says so.
+    """
+    served = await register("greeter")
+    thread_id = await souk.create_thread(served.ref())
+    async with souk.session() as session:
+        run = await repo.create_run(session, thread_id, served.ref(), "ag-ui", {})
+        await repo.append_thread_messages(
+            session,
+            thread_id,
+            run["run_id"],
+            [{"role": "user", "content": "one"}, {"role": "assistant", "content": "two"}],
+        )
+        await session.commit()
+
+    async with _provider_client(souk) as ws_client:
+        async with _connect(ws_client) as ws:
+            socket = await _handshake(ws, served.identity, ["greeter"])
+            answer = await _query(socket, threadId=thread_id)
+
+            assert [m["content"] for m in answer["result"]] == ["one", "two"]
+
+
+async def test_limit_is_applied_by_souk_not_by_the_caller(souk, register):
+    """The parameter exists to keep the response frame bounded. Applied on
+    the way back it would bound nothing — a months-old thread would already
+    have crossed the wire to be trimmed."""
+    served = await register("greeter")
+    thread_id = await souk.create_thread(served.ref())
+    async with souk.session() as session:
+        run = await repo.create_run(session, thread_id, served.ref(), "ag-ui", {})
+        await repo.append_thread_messages(
+            session,
+            thread_id,
+            run["run_id"],
+            [{"role": "user", "content": str(i)} for i in range(6)],
+        )
+        await session.commit()
+
+    async with _provider_client(souk) as ws_client:
+        async with _connect(ws_client) as ws:
+            socket = await _handshake(ws, served.identity, ["greeter"])
+            answer = await _query(socket, threadId=thread_id, limit=2)
+
+            # The most recent, because context is wanted from the recent end.
+            assert [m["content"] for m in answer["result"]] == ["4", "5"]
+
+
+async def test_a_provider_cannot_read_a_thread_that_is_not_its_own(souk, register):
+    """Not in the upstream design, and added here. Thread ids are not
+    guessable, but unguessable is not an authorization rule: a provider
+    that served one run knows that thread id permanently, and would
+    otherwise keep reading the conversation after being de-listed or after
+    the agent moved to another stall.
+
+    The refusal is the same as for a thread that does not exist — telling
+    them apart would confirm a thread's existence to somebody who may not
+    read it, which is the whole of what the check is for.
+    """
+    mine = await register("greeter")
+    theirs = await register("greeter")
+    their_thread = await souk.create_thread(theirs.ref())
+
+    async with _provider_client(souk) as ws_client:
+        async with _connect(ws_client) as ws:
+            socket = await _handshake(ws, mine.identity, ["greeter"])
+
+            refused = await _query(socket, threadId=their_thread)
+            missing = await _query(socket, threadId="thread_does_not_exist")
+
+            assert "result" not in refused
+            assert refused["error"] == missing["error"]
+
+
+@pytest.mark.parametrize(
+    "params,expected",
+    [
+        pytest.param({}, "threadId", id="no-thread-id"),
+        pytest.param({"threadId": "t", "limit": 0}, "limit", id="zero-limit"),
+        pytest.param({"threadId": "t", "limit": "5"}, "limit", id="non-integer-limit"),
+    ],
+)
+async def test_a_malformed_query_is_answered_not_dropped(souk, register, params, expected):
+    """Answered on the same queryId, because the far side is waiting on
+    exactly that: a query that gets no reply is a caller blocked until its
+    timeout, for a mistake souk could see immediately."""
+    served = await register("greeter")
+    async with _provider_client(souk) as ws_client:
+        async with _connect(ws_client) as ws:
+            socket = await _handshake(ws, served.identity, ["greeter"])
+            answer = await _query(socket, **params)
+            assert expected in answer["error"]
+
+
+async def test_an_unknown_query_method_is_refused_by_name(souk, register):
+    served = await register("greeter")
+    async with _provider_client(souk) as ws_client:
+        async with _connect(ws_client) as ws:
+            socket = await _handshake(ws, served.identity, ["greeter"])
+            await socket.send({"type": "query", "queryId": "q9", "method": "list_agents"})
+            frame = await socket.recv()
+            assert frame["queryId"] == "q9"
+            assert "list_agents" in frame["error"]
+
+
+def test_the_wire_carries_every_query_the_link_declares():
+    """`contract.LINK_QUERY_METHODS` is upstream's list of what a provider
+    may ask. A method added there without a frame here would compile, pass
+    every test, and fail at a provider — so this is the one place the two
+    are compared."""
+    from souk_provider_sdk.contract import LINK_QUERY_METHODS
+
+    assert set(ws_provider.QUERY_METHODS) == set(LINK_QUERY_METHODS)

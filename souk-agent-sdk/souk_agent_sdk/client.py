@@ -47,9 +47,10 @@ from souk_provider_sdk import (
     HandleProvider,
     ProviderIdentity,
     ProviderRuntime,
+    SoukLink,
+    verify_signature,
 )
 
-from souk_agent_sdk.identity import verify_signature
 
 logger = logging.getLogger("souk_agent_sdk")
 
@@ -64,6 +65,11 @@ WELCOME_TIMEOUT_SECONDS = 10.0
 # quietly later.
 HANDSHAKE_VERSION = 1
 NONCE_BYTES = 32
+
+# How long an agent waits for souk to answer a question. Generous: it is a
+# database read on the far side of a socket, and the failure it guards is
+# a lost frame, not a slow one.
+QUERY_TIMEOUT_SECONDS = 30.0
 
 
 def souk_challenge_payload(provider_nonce: str, souk_nonce: str) -> bytes:
@@ -92,8 +98,29 @@ class SoukIdentityMismatch(Exception):
     """
 
 
-class SoukProvider:
-    """One identity, its agents, and the socket between them and souk."""
+class SoukQueryFailed(Exception):
+    """A question this provider asked souk did not come back.
+
+    Raised rather than answered with an empty list, and the distinction is
+    not pedantic: `thread_messages` returning `[]` is a real answer — a
+    thread with nothing in it — and a caller that cannot tell that from
+    "the socket died" will summarise an empty history as if it were the
+    conversation.
+    """
+
+
+class SoukProvider(SoukLink):
+    """One identity, its agents, and the socket between them and souk.
+
+    A `SoukLink`, because over a wire this object genuinely is both
+    directions: run frames arrive on the same socket that event frames
+    leave by. The gateway's own `SocketProvider` is deliberately *not* one
+    — it holds no runtime and only carries work outward.
+
+    Constructing this attaches it to the runtime, so it must exist before
+    the runtime is given work: events produced while the runtime has no
+    link are dropped by design.
+    """
 
     def __init__(
         self,
@@ -125,27 +152,115 @@ class SoukProvider:
         self.identity = ProviderIdentity.load_or_create(identity_key_path)
         self.agents = {agent.name: agent for agent in agents}
         self._outbound: asyncio.Queue = asyncio.Queue()
+        # Questions asked and not yet answered, by queryId. The only
+        # per-request state on this side, and the reason the wire needs a
+        # correlation id at all: everything else here is fire-and-forget.
+        self._pending: dict[str, asyncio.Future] = {}
         # The provider's own loop, which knows nothing about any of this.
-        # Results leave through the two callbacks: it hands back a run_id
-        # and an event, and turning those into frames is this file's whole
-        # remaining job.
+        # It reports through `self` — the link — and setting that is this
+        # constructor's job, not the runtime's.
         self.runtime = ProviderRuntime(
             self.identity,
             HandleProvider(list(agents)),
-            on_event=self._on_event,
-            on_finish=self._on_finish,
             max_concurrent_runs=max_concurrent_runs,
         )
+        self.runtime.link = self
+
+    # ---- souk → provider
 
     @property
     def public_key(self) -> str:
         return self.identity.public_key
 
-    def _on_event(self, run_id: str, event: Any) -> None:
+    @property
+    def max_concurrent_runs(self) -> int | None:
+        return self.runtime.max_concurrent_runs
+
+    async def offer(self, run: DeliveredRun) -> bool:
+        """souk offers a run. Never called on this side — a socket
+        provider is offered work by a `run` frame, which `_offer` below
+        turns into `runtime.deliver`. It exists because `SoukLink` names
+        both directions and this is the half a wire routes differently."""
+        return await self.runtime.deliver(run)
+
+    def cancel(self, run_id: str) -> None:
+        """souk is asking for a run to stop. A request, and this provider
+        complies — the runtime cancels the task, which is the only way to
+        interrupt an arbitrary async generator. Reached from the `cancel`
+        frame; souk never calls it directly on this side of a wire."""
+        self.runtime.cancel(run_id)
+
+    # ---- provider → souk
+
+    async def report_event(self, run_id: str, event: Any) -> None:
         self._outbound.put_nowait({"type": "event", "runId": run_id, "event": event})
 
-    def _on_finish(self, run_id: str) -> None:
+    async def finish_run(self, run_id: str) -> None:
         self._outbound.put_nowait({"type": "finish", "runId": run_id})
+
+    async def thread_messages(
+        self, thread_id: str, *, limit: int | None = None
+    ) -> list[dict[str, Any]]:
+        """This thread's messages, oldest first — the one thing a provider
+        cannot work out for itself.
+
+        What arrives in `run_input` is exactly what the *caller* sent for
+        this run: an AG-UI client resends its whole history every turn,
+        while A2A's `message/send` carries one message. The same agent
+        cannot tell a tenth turn from a first, and souk has held the
+        thread all along.
+
+        `limit` is sent rather than applied on return. The parameter
+        exists to keep the response frame bounded, and trimming after
+        receiving would have already put a months-old thread on the wire.
+        """
+        query_id = secrets.token_hex(8)
+        loop = asyncio.get_running_loop()
+        waiter: asyncio.Future = loop.create_future()
+        self._pending[query_id] = waiter
+        self._outbound.put_nowait(
+            {
+                "type": "query",
+                "queryId": query_id,
+                "method": "thread_messages",
+                "params": {"threadId": thread_id, "limit": limit},
+            }
+        )
+        try:
+            return await asyncio.wait_for(waiter, timeout=QUERY_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            raise SoukQueryFailed(
+                f"souk did not answer thread_messages({thread_id}) in "
+                f"{QUERY_TIMEOUT_SECONDS:.0f}s"
+            ) from None
+        finally:
+            self._pending.pop(query_id, None)
+
+    def _resolve_query(self, frame: dict[str, Any]) -> None:
+        waiter = self._pending.get(frame.get("queryId"))
+        if waiter is None or waiter.done():
+            # An answer to a question nobody is waiting on — the query
+            # timed out, or its socket died and it was already failed.
+            # Dropping it is right: the caller has had its answer.
+            return
+        if frame.get("error") is not None:
+            waiter.set_exception(SoukQueryFailed(str(frame["error"])))
+        else:
+            waiter.set_result(frame.get("result") or [])
+
+    def _fail_pending_queries(self, reason: str) -> None:
+        """The socket is gone: nothing can answer these.
+
+        Failed rather than left to time out, because the answer is already
+        known and an agent waiting the full timeout for a certainty is
+        just a slower failure. Not retried on the next connection either:
+        the agent asked in the middle of a run, and whether that run still
+        wants the answer is the agent's to decide, not this queue's.
+        """
+        for waiter in self._pending.values():
+            if not waiter.done():
+                waiter.set_exception(SoukQueryFailed(reason))
+        self._pending.clear()
 
     @property
     def _ws_url(self) -> str:
@@ -321,13 +436,20 @@ class SoukProvider:
                         # The ack is the runtime's answer, not this file's
                         # opinion: it takes the run or it is full.
                         await self._offer(frame)
+                    elif kind == "queryResult":
+                        self._resolve_query(frame)
                     elif kind == "cancel":
-                        self.runtime.cancel(frame.get("runId"))
+                        self.cancel(frame.get("runId"))
                     elif kind == "error":
                         logger.warning("souk rejected a frame: %s", frame)
                     else:
                         logger.warning("unexpected frame from souk, ignoring: %s", frame)
             finally:
+                # Queries die with the socket; runs do not. A run is
+                # addressed by runId and its frames go out on whatever
+                # connection is next, but a question was asked of *this*
+                # connection and nothing will ever answer it.
+                self._fail_pending_queries("souk connection closed")
                 writer.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await writer

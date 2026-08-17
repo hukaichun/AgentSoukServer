@@ -219,7 +219,78 @@ stays reserved for server-side failure the client didn't cause.
 | ↑ | `{"type": "event", "runId", "event"}` | one AG-UI event; authorized against `Run.claimed_by` |
 | ↑ | `{"type": "finish", "runId"}` | that run's stream ended |
 | ↓ | `{"type": "cancel", "runId"}` | a request, not an order — outcome decided when the stream ends |
+| ↑ | `{"type": "query", "queryId", "method", "params"}` | a question about the work souk gave this provider |
+| ↓ | `{"type": "queryResult", "queryId", "result"?, "error"?}` | its answer, correlated by `queryId` |
 | ↓ | `{"type": "error", "message", "runId"?}` | server-side rejection of a frame (bad runId, not the holder) |
+
+### Queries: the one thing here that expects an answer
+
+Every other frame is fire-and-forget. `query` is not, and it is worth
+being explicit about why it earns the machinery — a correlation id, a
+pending map, a timeout, and a rule for a socket that dies mid-question.
+
+**A provider sees exactly what the caller sent for its run, and nothing
+more.** An AG-UI client resends its whole history every turn by
+convention; A2A's `message/send` carries one message. The same agent,
+unchanged, cannot tell a tenth turn from a first — and souk has held the
+thread the whole time. `souk_provider_sdk.SoukLink.thread_messages` is
+the question, and this is how it crosses a wire.
+
+```json
+↑ {"type": "query", "queryId": "9f3c…", "method": "thread_messages",
+   "params": {"threadId": "thread_…", "limit": 20}}
+↓ {"type": "queryResult", "queryId": "9f3c…", "result": [ …messages… ]}
+```
+
+- **`limit` is applied by souk**, not by the caller on return. The
+  parameter exists to keep the response frame bounded; trimming after
+  receiving would bound nothing and put a months-old thread on the wire to
+  do it.
+- **A provider may only read threads for agents it serves.** Not in the
+  upstream design and added here. Thread ids are not guessable, but
+  unguessable is not an authorization rule: a provider that served one run
+  knows that thread id permanently, and would otherwise keep reading the
+  conversation after being de-listed, or after the agent moved to another
+  stall. A thread names its agent and an agent is `(provider_key, name)`,
+  so souk can already make the comparison. "Not yours" and "no such
+  thread" get the *same* answer — telling them apart would confirm a
+  thread's existence to somebody who may not read it.
+- **A malformed query is answered, not dropped.** The far side is waiting
+  on that `queryId`; silence costs it the full timeout for a mistake souk
+  could see at once.
+- **A dead socket fails its outstanding queries immediately**, rather than
+  leaving them to time out. Unlike a run — which is addressed by `runId`
+  and whose frames go out on whatever connection is next — a question was
+  asked of *this* connection and nothing will ever answer it. It is not
+  retried on reconnect either: the agent asked mid-run, and whether it
+  still wants the answer is the agent's to decide.
+- **What may be asked is deliberately short.** Upstream's
+  `contract.LINK_QUERY_METHODS` states the rule — this is not a mirror of
+  souk's API, because every method admitted is one more frame type every
+  transport must carry. The gateway reads that set rather than retyping
+  it, so a method added upstream without a frame here fails a test instead
+  of a provider.
+
+Adding these frames does **not** bump `version`. They are additive: a
+provider that never asks is unaffected, and an older gateway answers an
+unknown frame type with `error`. The version selects the *handshake*,
+which is the part that genuinely cannot interoperate across shapes.
+
+### Which object is which
+
+`SoukLink` is one provider joined to one souk — both directions, one
+object — and the socket client in souk-agent-sdk is one, because over a
+wire that is literally true: run frames arrive on the same socket event
+frames leave by.
+
+The gateway's `SocketProvider` is **not** one, and upstream's own docstring
+says so. It sits on souk's side, holds an outbound queue and no runtime,
+and only carries work outward. It satisfies souk's `ConnectedProvider`
+protocol structurally, and checks itself against
+`contract.CONNECTED_PROVIDER_ATTRS` at construction — because souk sizes a
+capacity bucket from `max_concurrent_runs`, and a connection that forgets
+it attaches perfectly well and then fails inside the broker, three layers
+from the cause.
 
 A declined offer costs the run nothing: it stays queued and is offered
 again when something changes — a run arriving, a provider registering, one
