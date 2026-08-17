@@ -14,7 +14,8 @@ capability, *that's* the point to extract this into a real, shared MCP
 server (or a small package) — not before.
 
 Talks to souk purely through its already-public HTTP API (`GET /agents`,
-`GET /a2a/{name}/.well-known/agent.json`), the exact same surface
+`GET /a2a/{provider}/{name}/.well-known/agent-card.json`), the exact
+same surface
 `souk-directory` and any external caller use — no privileged access,
 nothing souk needs to know about this provider for.
 This is what keeps provider/souk independence intact: souk isn't even
@@ -60,7 +61,7 @@ await provider.run_forever()
     "identity": """
 ### Provider & Caller Identity Model
 - **Ed25519 Keypair**: Created on first launch (default `souk_identity.key`). Back it up like any credential.
-- **Agent Ownership**: Scoped to `(public_key, name)`. Re-registering with the same key maintains `agent_id`.
+- **Agent Ownership**: An agent *is* `(public_key, name)` — souk mints no id for it, so re-registering with the same key is the same agent, and a name registered by another key is a different one.
 - **Actor Chain**: When delegating across agents, each hop appends an EdDSA JWT signed by that agent's private key, bound to `prevHash` of the previous token.
 """,
     "quickstart": """
@@ -96,26 +97,61 @@ def build_souk_tools(souk_http_url: str) -> list[Tool]:
             for agent in agents:
                 status = "online" if agent["online"] else "offline"
                 description = agent["description"] or "(no description)"
-                lines.append(f"- {agent['name']} ({status}, agent_id={agent['agent_id']}): {description}")
+                stall = agent.get("provider_name") or agent["fingerprint"]
+                # The pair, because the name alone is not an address: two
+                # stalls may both offer `translator`, and this list is
+                # exactly where a model would otherwise learn one name and
+                # then use it as if it identified somebody.
+                lines.append(
+                    f"- {agent['name']} @ {stall} ({status}, "
+                    f"provider={agent['fingerprint']}): {description}"
+                )
             return "\n".join(lines)
         except Exception as e:
             return f"Error listing souk agents: {e}"
 
-    async def get_agent_card(agent_name_or_id: str) -> str:
-        """Fetch the detailed Agent Card for a specific agent by name or agent_id.
+    async def get_agent_card(agent_name: str, provider: str = "") -> str:
+        """Fetch the detailed Agent Card for one agent on this souk.
         Use this when a user asks about specific capabilities, parameters, skills,
         or schema details of an agent on this souk.
+
+        Args:
+            agent_name: the agent's name, as shown by list_souk_agents.
+            provider: which stall, when more than one offers that name —
+                the `provider=` value from list_souk_agents. Optional when
+                the name is unique.
         """
         try:
             async with httpx.AsyncClient() as client:
-                url = f"{souk_http_url}/a2a/{agent_name_or_id}/.well-known/agent.json"
+                roster = await client.get(f"{souk_http_url}/agents")
+                roster.raise_for_status()
+                matches = [
+                    a
+                    for a in roster.json()["agents"]
+                    if a["name"] == agent_name
+                    and (not provider or provider in (a["provider_key"], a["fingerprint"]))
+                ]
+                if not matches:
+                    return f"Agent '{agent_name}' was not found on this souk."
+                if len(matches) > 1:
+                    stalls = ", ".join(
+                        f"{a.get('provider_name') or 'unnamed'} (provider={a['fingerprint']})"
+                        for a in matches
+                    )
+                    return (
+                        f"Several stalls offer '{agent_name}': {stalls}. "
+                        "Ask again with the provider of the one you meant."
+                    )
+                found = matches[0]
+                url = (
+                    f"{souk_http_url}/a2a/{found['fingerprint']}/{found['name']}"
+                    "/.well-known/agent-card.json"
+                )
                 resp = await client.get(url)
-                if resp.status_code == 404:
-                    return f"Agent '{agent_name_or_id}' was not found on this souk."
                 resp.raise_for_status()
                 card = resp.json()
-            
-            name = card.get("name", agent_name_or_id)
+
+            name = card.get("name", agent_name)
             desc = card.get("description", "No description provided.")
             version = card.get("version", "1.0.0")
             skills = card.get("skills", [])
@@ -131,7 +167,7 @@ def build_souk_tools(souk_http_url: str) -> list[Tool]:
             ]
             return "\n".join(output)
         except Exception as e:
-            return f"Error fetching agent card for '{agent_name_or_id}': {e}"
+            return f"Error fetching agent card for '{agent_name}': {e}"
 
     async def get_souk_stats(category: Literal["all", "online", "offline"] = "all") -> str:
         """Get real-time operational statistics and health status of this souk gateway.

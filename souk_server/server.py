@@ -77,10 +77,6 @@ def create_app(souk: Souk, serving: ServingSettings | None = None) -> FastAPI:
     # module-level state and two apps can serve two different souks.
     app.state.souk = souk
     app.state.serving_settings = serving
-    # Per-app, not module-level, for the same reason the souk itself is on
-    # app.state: two apps in one process must not share a cancel-routing
-    # table (see ws_provider.WorkerSessions).
-    app.state.worker_sessions = ws_provider.WorkerSessions()
     app.add_middleware(
         CORSMiddleware,
         allow_origins=serving.cors_allow_origins,

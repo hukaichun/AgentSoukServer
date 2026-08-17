@@ -16,6 +16,10 @@ classifiers = ["Private :: Do Not Upload"]
 # noticing they are in the wrong package.
 dependencies = [
     "souk",
+    # Upstream states the provider contract itself now — identity, the
+    # port, and the provider's own loop, with no transport in it. This
+    # gateway builds the socket around exactly that contract.
+    "souk-provider-sdk",
     "fastapi>=0.115",
     # [standard] brings websockets, which serves /ws/provider and /ws/kyok
     # — the ws relays need no dependency of their own.
@@ -36,6 +40,7 @@ souk-server = "souk_server.server:main"
 # yet. Clone with --recurse-submodules or `uv sync` has nothing to resolve.
 [tool.uv.sources]
 souk = { path = "AgentSouk/souk", editable = true }
+souk-provider-sdk = { path = "AgentSouk/souk-provider-sdk", editable = true }
 
 # httpx drives the ASGI app in tests without binding a port; httpx-ws does
 # the same for the two WebSocket relays.

@@ -8,8 +8,28 @@ from pydantic import BaseModel, Field
 
 
 class SubAgentConfig(BaseModel):
+    """One delegation edge: what to call the tool, and who it reaches.
+
+    Ordinarily just a name — `- name: translator` — and the address is
+    resolved from the roster on first use (see resolve.py). The finished
+    URL cannot be written here: it contains the callee's own key
+    fingerprint, which does not exist until that provider has started once.
+    """
+
+    # The tool the model sees: `call_{name}`.
     name: str
-    a2a_url: str  # full A2A JSON-RPC URL, e.g. http://souk:8000/a2a/other-agent/rpc
+    # Who it reaches, if that differs from the tool's name. Defaults to
+    # `name`.
+    agent: str = ""
+    # Which stall, when more than one offers that name — the provider's
+    # public key or its 16-hex fingerprint, from any roster row. Required
+    # only when the name is genuinely ambiguous, and the error says so
+    # rather than picking a winner.
+    provider: str = ""
+    # Escape hatch: a complete A2A JSON-RPC URL, used verbatim and never
+    # looked up. For an agent on a *different* souk, or one reached through
+    # something other than this gateway.
+    a2a_url: str = ""
 
 
 class AgentConfig(BaseModel):

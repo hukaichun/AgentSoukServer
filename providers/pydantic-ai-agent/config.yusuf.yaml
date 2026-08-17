@@ -1,9 +1,11 @@
 # Yusuf's Workshop — the other two-agent stall, and the other half of
 # the name collision: this `translator` and Zahra's share a display name
-# on purpose. Souk assigns agent_ids per (public_key, name), so both are
-# real and distinct; it is the *name* route that becomes ambiguous, which
-# is exactly the case the docent refuses to guess at and a directory has
-# to render. Part of the `demo` profile in docker-compose.yml.
+# on purpose. An agent *is* `(provider_key, name)`, so both are real and
+# distinct and neither shadows the other; what a bare name cannot do is
+# pick between them. There is no route that tries — the docent hands back
+# both stalls, a directory renders the choice, and a delegation that
+# named this bare would be refused rather than guessed. Part of the
+# `demo` profile in docker-compose.yml.
 souk_http_url: http://souk:8000
 provider_name: Yusuf's Workshop
 

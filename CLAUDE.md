@@ -52,6 +52,30 @@ produced confident wrong answers; a throwaway probe found the defect.
 When you catch yourself about to write "this should work", write the
 probe instead — and run it through compose, per the rules above.
 
+**And then do not call the probe verification.** A passing probe proves
+one ordering, the one you happened to write. The gateway once sent a
+provider its first `run` frame *before* the `welcome`, because the broker
+starts offering inside `attach_provider`'s own awaits — and any client
+reading exactly one frame there raises and reconnects into the same race
+forever. The probe missed it by starting its run after connecting, which
+is the single ordering a real provider cannot rely on. The test suite
+found it in one line. The two methods catch different sets and neither
+catches all of it; "verified end to end" is a claim about one path.
+
+## Docker
+
+- Every `[tool.uv.sources]` path entry needs its own `COPY` in the
+  Dockerfile. A missing one fails at `uv sync` with "Distribution not
+  found at: file:///app/…", during build, long before any import — which
+  reads as a broken image rather than as a missing line. Both images here
+  were missing `AgentSouk/souk-provider-sdk` the day the SDK arrived.
+- `docker compose run -v "$PWD/x:/app/y"` resolves `$PWD` in *this
+  shell*, whose directory persists across commands. Pointed at a path
+  that does not exist, Docker creates it — root-owned — so a stale `cd`
+  leaves a directory named after your config file somewhere unrelated.
+  Removing it needs a container (`docker run --rm -v "$PWD/dir:/w" alpine
+  rm -rf /w/thing`), not `rm`.
+
 ## Testing
 
 - Run the suite on **both** backends. SQLite is the default;

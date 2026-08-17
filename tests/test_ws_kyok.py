@@ -23,7 +23,6 @@ import pytest
 from httpx_ws import WebSocketDisconnect, aconnect_ws
 from httpx_ws.transport import ASGIWebSocketTransport
 
-from souk import repo
 from souk.kyok import issue_kyok_token
 from souk_server.server import create_app
 
@@ -56,11 +55,19 @@ def _chunk(content: str = "", role: str | None = None, finish_reason: str | None
     }
 
 
-async def _register_agent(session, new_identity, name: str = "greeter"):
-    identity = new_identity()
-    agent_ids = await repo.register_agents(session, identity.public_key, [{"name": name}])
-    await session.commit()
-    return identity, agent_ids[name]
+async def _live(register, souk, run_id: str, session_id: str):
+    """A registered agent, a run the broker is dispatching, and a token
+    naming both — the setup every test below shares.
+
+    `souk.enqueue_run` rather than `souk.broker.enqueue_run`: the broker's
+    own entry point takes a handler map, and a run enqueued without one
+    reaches its pipeline and finds nothing to dispatch to. Nobody is
+    attached, which is right — KYOK is about a call the provider makes
+    *during* a run, and these tests supply the run, not the provider.
+    """
+    served = await register("greeter")
+    souk.enqueue_run(run_id, served.ref(), "thread_1", {}, "ag-ui")
+    return served, issue_kyok_token(run_id, session_id, served.ref(), "test-signing-secret")
 
 
 def _client(souk) -> httpx.AsyncClient:
@@ -117,12 +124,10 @@ async def test_a_bad_handshake_closes_the_socket(souk, first_frame):
 # --- round trips -------------------------------------------------------------
 
 
-async def test_full_round_trip_non_streaming(session, souk, new_identity):
-    identity, agent_id = await _register_agent(session, new_identity)
+async def test_full_round_trip_non_streaming(souk, register):
     run_id, session_id = "run_ws_nonstream", "sess_ws_nonstream"
-    souk.broker.enqueue_run(run_id, agent_id, "thread_1", {}, "ag-ui")
+    served, token = await _live(register, souk, run_id, session_id)
     try:
-        token = issue_kyok_token(run_id, session_id, agent_id, "test-signing-secret")
         body = json.dumps({"messages": [{"role": "user", "content": "hi"}]}).encode()
 
         async with _client(souk) as client:
@@ -131,7 +136,7 @@ async def test_full_round_trip_non_streaming(session, souk, new_identity):
                 resp = await client.post(
                     "/kyok/v1/chat/completions",
                     content=body,
-                    headers=_kyok_headers(token, identity._key, body),
+                    headers=_kyok_headers(token, served.identity._key, body),
                 )
                 assert resp.status_code == 200, resp.text
                 return resp.json()
@@ -158,12 +163,10 @@ async def test_full_round_trip_non_streaming(session, souk, new_identity):
         souk.broker.forget(run_id)
 
 
-async def test_full_round_trip_streaming(session, souk, new_identity):
-    identity, agent_id = await _register_agent(session, new_identity)
+async def test_full_round_trip_streaming(souk, register):
     run_id, session_id = "run_ws_stream", "sess_ws_stream"
-    souk.broker.enqueue_run(run_id, agent_id, "thread_1", {}, "ag-ui")
+    served, token = await _live(register, souk, run_id, session_id)
     try:
-        token = issue_kyok_token(run_id, session_id, agent_id, "test-signing-secret")
         body = json.dumps({"messages": [], "stream": True}).encode()
 
         async with _client(souk) as client:
@@ -173,7 +176,7 @@ async def test_full_round_trip_streaming(session, souk, new_identity):
                     "POST",
                     "/kyok/v1/chat/completions",
                     content=body,
-                    headers=_kyok_headers(token, identity._key, body),
+                    headers=_kyok_headers(token, served.identity._key, body),
                 ) as resp:
                     assert resp.status_code == 200
                     return [line async for line in resp.aiter_lines() if line]
@@ -195,12 +198,10 @@ async def test_full_round_trip_streaming(session, souk, new_identity):
         souk.broker.forget(run_id)
 
 
-async def test_an_error_frame_fails_the_completion_fast(session, souk, new_identity):
-    identity, agent_id = await _register_agent(session, new_identity)
+async def test_an_error_frame_fails_the_completion_fast(souk, register):
     run_id, session_id = "run_ws_error", "sess_ws_error"
-    souk.broker.enqueue_run(run_id, agent_id, "thread_1", {}, "ag-ui")
+    served, token = await _live(register, souk, run_id, session_id)
     try:
-        token = issue_kyok_token(run_id, session_id, agent_id, "test-signing-secret")
         body = json.dumps({"messages": [], "stream": True}).encode()
 
         async with _client(souk) as client:
@@ -210,7 +211,7 @@ async def test_an_error_frame_fails_the_completion_fast(session, souk, new_ident
                     "POST",
                     "/kyok/v1/chat/completions",
                     content=body,
-                    headers=_kyok_headers(token, identity._key, body),
+                    headers=_kyok_headers(token, served.identity._key, body),
                 ) as resp:
                     return [line async for line in resp.aiter_lines() if line]
 
@@ -234,15 +235,13 @@ async def test_an_error_frame_fails_the_completion_fast(session, souk, new_ident
         souk.broker.forget(run_id)
 
 
-async def test_one_socket_multiplexes_concurrent_completions(session, souk, new_identity):
+async def test_one_socket_multiplexes_concurrent_completions(souk, register):
     """requestId multiplexing — strictly better than poll_one's
     one-per-cycle handover: two completions in flight on one socket,
     answered out of order."""
-    identity, agent_id = await _register_agent(session, new_identity)
     run_id, session_id = "run_ws_multiplex", "sess_ws_multiplex"
-    souk.broker.enqueue_run(run_id, agent_id, "thread_1", {}, "ag-ui")
+    served, token = await _live(register, souk, run_id, session_id)
     try:
-        token = issue_kyok_token(run_id, session_id, agent_id, "test-signing-secret")
 
         async with _client(souk) as client:
 
@@ -251,7 +250,7 @@ async def test_one_socket_multiplexes_concurrent_completions(session, souk, new_
                 resp = await client.post(
                     "/kyok/v1/chat/completions",
                     content=body,
-                    headers=_kyok_headers(token, identity._key, body),
+                    headers=_kyok_headers(token, served.identity._key, body),
                 )
                 assert resp.status_code == 200, resp.text
                 return resp.json()["choices"][0]["message"]["content"]
@@ -284,7 +283,7 @@ async def test_one_socket_multiplexes_concurrent_completions(session, souk, new_
 
 
 async def test_an_answer_is_only_accepted_on_the_socket_the_request_was_delivered_to(
-    session, souk, new_identity
+    souk, register
 ):
     """The security fix itself. A second connection — same session, so it
     would have passed any credential check the socket could make — presents
@@ -292,11 +291,9 @@ async def test_an_answer_is_only_accepted_on_the_socket_the_request_was_delivere
     the completion still gets its real answer from the socket that holds
     it: requestId is a multiplexing key within a connection, not a bearer
     capability."""
-    identity, agent_id = await _register_agent(session, new_identity)
     run_id, session_id = "run_ws_binding", "sess_ws_binding"
-    souk.broker.enqueue_run(run_id, agent_id, "thread_1", {}, "ag-ui")
+    served, token = await _live(register, souk, run_id, session_id)
     try:
-        token = issue_kyok_token(run_id, session_id, agent_id, "test-signing-secret")
         body = json.dumps({"messages": [{"role": "user", "content": "hi"}]}).encode()
 
         async with _client(souk) as client:
@@ -308,7 +305,7 @@ async def test_an_answer_is_only_accepted_on_the_socket_the_request_was_delivere
                     client.post(
                         "/kyok/v1/chat/completions",
                         content=body,
-                        headers=_kyok_headers(token, identity._key, body),
+                        headers=_kyok_headers(token, served.identity._key, body),
                     )
                 )
                 request = await holder.recv()
@@ -339,15 +336,13 @@ async def test_an_answer_is_only_accepted_on_the_socket_the_request_was_delivere
 
 
 async def test_a_dropped_socket_fails_its_in_flight_completions_fast(
-    session, souk, new_identity
+    souk, register
 ):
     """A truncated answer must fail the completion, not complete it — and
     fail it now, not after the claim timeout."""
-    identity, agent_id = await _register_agent(session, new_identity)
     run_id, session_id = "run_ws_dropped", "sess_ws_dropped"
-    souk.broker.enqueue_run(run_id, agent_id, "thread_1", {}, "ag-ui")
+    served, token = await _live(register, souk, run_id, session_id)
     try:
-        token = issue_kyok_token(run_id, session_id, agent_id, "test-signing-secret")
         body = json.dumps({"messages": [], "stream": True}).encode()
 
         async with _client(souk) as client:
@@ -357,7 +352,7 @@ async def test_a_dropped_socket_fails_its_in_flight_completions_fast(
                     "POST",
                     "/kyok/v1/chat/completions",
                     content=body,
-                    headers=_kyok_headers(token, identity._key, body),
+                    headers=_kyok_headers(token, served.identity._key, body),
                 ) as resp:
                     return [line async for line in resp.aiter_lines() if line]
 

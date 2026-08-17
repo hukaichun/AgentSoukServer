@@ -51,9 +51,15 @@ agents:
     # Cross-stall delegation: `scribe` lives under a different provider
     # identity entirely (config.yusuf.yaml), so this exercises the A2A
     # hop between two stalls rather than within one — the thing a market
-    # shows that a list of agents cannot. Addressed by name because
-    # `scribe` is unique here; the two `translator`s deliberately are not,
-    # which is why neither is a delegation target.
+    # shows that a list of agents cannot.
+    #
+    # A name and nothing else, because the address cannot be written
+    # here: it contains Yusuf's key fingerprint, which does not exist
+    # until his container has started once. It is resolved from the
+    # roster on first delegation (see pydantic_ai_agent/resolve.py) —
+    # which works precisely because `scribe` is unique in this market.
+    # The two `translator`s deliberately are not, which is why neither is
+    # a delegation target: pointing at one would get the refusal, naming
+    # both stalls, rather than a guess.
     sub_agents:
       - name: scribe
-        a2a_url: http://souk:8000/a2a/scribe/rpc

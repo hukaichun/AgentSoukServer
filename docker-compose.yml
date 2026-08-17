@@ -89,10 +89,12 @@ services:
     volumes:
       - ./providers/pydantic-ai-agent/config.docent.yaml:/app/config.yaml:ro
       # Without this the docent mints a fresh Ed25519 identity on every
-      # recreate, and the previous one's agent_id is left in the roster as
-      # an orphan — two "docent" entries, one of them permanently offline.
-      # Persisting the key is what makes `docker compose up --build`
-      # idempotent (souk keys ownership on the public key, not the name).
+      # recreate, and the old one's row is left in the roster as an orphan
+      # — two "docent" entries under two different keys, one of them
+      # permanently offline. Persisting the key is what makes `docker
+      # compose up --build` idempotent: an agent is `(provider_key,
+      # name)`, so a new key is a new agent no matter what it calls
+      # itself.
       - docent_identity:/data
     environment:
       SOUK_IDENTITY_KEY_PATH: /data/souk_identity.key
@@ -170,6 +172,25 @@ services:
       LLM_MODEL_NAME: "${LLM_MODEL_NAME}"
       LLM_API_KEY: "${LLM_API_KEY}"
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+
+  # The frontend: a human-browsable directory for this souk, and the thing
+  # that makes the stack visible to a person rather than to curl. Open
+  # http://localhost:8080/index.html once the stack is up.
+  #
+  # Deliberately has no `depends_on` and no souk URL in its environment.
+  # It is a pure static server — the compiled page talks to the gateway
+  # from the *browser*, so the URL that matters is the one the user's
+  # machine can reach (http://localhost:8000, which `souk` publishes
+  # above and which src/app.ts already defaults to), never a
+  # compose-internal hostname. `?souk=` overrides it for any other
+  # gateway. Nothing here needs souk to be up to start, and the page says
+  # so itself when the gateway is missing.
+  souk-directory:
+    build:
+      context: ./souk-directory
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
 
 volumes:
   paradedb_data:

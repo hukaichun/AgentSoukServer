@@ -18,9 +18,7 @@ agents:
     souk_tools: true
     sub_agents:
       - name: translator
-        a2a_url: http://souk:8000/a2a/translator/rpc
       - name: summarizer
-        a2a_url: http://souk:8000/a2a/summarizer/rpc
 
   # Sits between souk-guide and translator — demonstrates a multi-hop A2A
   # chain (souk-guide -> summarizer -> translator), not just one level of
@@ -37,7 +35,6 @@ agents:
     mcp_servers: []
     sub_agents:
       - name: translator
-        a2a_url: http://souk:8000/a2a/translator/rpc
 
   - name: translator
     description: Translates text to English.

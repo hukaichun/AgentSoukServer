@@ -20,9 +20,7 @@ agents:
     mcp_servers: []
     sub_agents:
       - name: echo_a
-        a2a_url: http://souk:8000/a2a/echo_a/rpc
       - name: echo_b
-        a2a_url: http://souk:8000/a2a/echo_b/rpc
 
   - name: echo_a
     description: Branch A — delegates to the shared leaf agent.
@@ -33,7 +31,6 @@ agents:
     mcp_servers: []
     sub_agents:
       - name: leaf
-        a2a_url: http://souk:8000/a2a/leaf/rpc
 
   - name: echo_b
     description: Branch B — delegates to the shared leaf agent.
@@ -44,7 +41,6 @@ agents:
     mcp_servers: []
     sub_agents:
       - name: leaf
-        a2a_url: http://souk:8000/a2a/leaf/rpc
 
   - name: leaf
     description: Shared leaf — just echoes back with a marker.
@@ -61,7 +57,7 @@ agents:
   # never carries context_id unless the tool explicitly stores/passes one
   # back). looper_a's system prompt is a base case for anything starting
   # with "PING" so this can't recurse indefinitely. Verifies: souk handles
-  # the *same agent_id* appearing twice in one lineage tree without
+  # the *same agent* appearing twice in one lineage tree without
   # deadlocking or corrupting state, and /tree shows the full A -> B -> A
   # chain as three distinct thread nodes.
   - name: looper_a
@@ -76,7 +72,6 @@ agents:
     mcp_servers: []
     sub_agents:
       - name: looper_b
-        a2a_url: http://souk:8000/a2a/looper_b/rpc
 
   - name: looper_b
     description: Test agent — calls back into looper_a to close the loop.
@@ -88,4 +83,3 @@ agents:
     mcp_servers: []
     sub_agents:
       - name: looper_a
-        a2a_url: http://souk:8000/a2a/looper_a/rpc

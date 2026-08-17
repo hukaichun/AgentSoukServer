@@ -1,83 +1,121 @@
-"""Covers the A2A HTTP surface: id vs name routing (including the 409
-disambiguation for a name collision) and the offline fast-fail path (A7a)
-added this session.
+"""The A2A HTTP surface: pair routing, and the offline fast-fail path.
+
+Half of what this file used to cover no longer exists to cover. There were
+three ways to reach an agent — by name, by id, by pair — and two tests here
+existed only to hold them level: one asserted the name and id routes served
+the same card, another asserted that a name collision 409'd with candidates
+while the id routes still worked. Both are gone with the routes. What
+replaces them is the property those tests were working around: the pair is
+unambiguous, so two providers offering `greeter` need no disambiguation
+scheme, and there is nothing for a caller to get wrong.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
-
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select
 
 from souk import repo
-from souk.schema import agents, thread_history
+from souk.schema import runs
 
 
-async def _register(client, identity, name, **extra):
-    body = identity.register_body([{"name": name, **extra}])
-    resp = await client.post("/agents/register", json=body)
+async def _register(client, identity, name, **extra) -> str:
+    """Register through the HTTP surface and hand back the URL prefix.
+
+    Deliberately not the `register` fixture: this suite is about the routes,
+    and `POST /agents/register` is one of them. The fingerprint comes from
+    the identity rather than the response body — the roster carries it, but
+    a test that reads it back from souk would pass even if the gateway put
+    somebody else's agent in the URL it builds.
+    """
+    resp = await client.post("/agents/register", json=identity.register_body([{"name": name, **extra}]))
     assert resp.status_code == 201, resp.text
-    return resp.json()["agent_ids"][name]
+    return f"{identity.fingerprint}/{name}"
 
 
-async def test_name_and_id_routes_return_the_same_card(client, new_identity):
+async def test_the_card_is_served_by_pair_and_says_where_the_rpc_is(client, new_identity):
     identity = new_identity()
-    agent_id = await _register(client, identity, "greeter", description="hi")
+    path = await _register(client, identity, "greeter", description="hi")
 
-    by_name = await client.get("/a2a/greeter/.well-known/agent-card.json")
-    by_id = await client.get(f"/a2a/id/{agent_id}/.well-known/agent-card.json")
+    resp = await client.get(f"/a2a/{path}/.well-known/agent-card.json")
 
-    assert by_name.status_code == by_id.status_code == 200
-    assert by_name.json() == by_id.json()
+    assert resp.status_code == 200, resp.text
     # v1.0 replaced the card's single `url` with a list of interfaces, each
-    # stating its own binding and protocol version.
-    assert by_name.json()["supportedInterfaces"][0]["url"].endswith(f"/a2a/id/{agent_id}/rpc")
+    # stating its own binding and protocol version. Core no longer fills it
+    # in — the gateway does, because only it knows where it serves.
+    interface = resp.json()["supportedInterfaces"][0]
+    assert interface["url"].endswith(f"/a2a/{path}/rpc")
+    assert interface["protocolBinding"] == "JSONRPC"
+
+
+async def test_the_full_public_key_addresses_the_same_agent_as_its_fingerprint(client, new_identity):
+    """Core tells the two apart by length, so both work. The fingerprint is
+    what this gateway puts in a URL; the key is what a caller holding the
+    real thing already has, and making it re-derive a short form to be
+    understood would be a gateway inventing an identity souk does not use."""
+    identity = new_identity()
+    await _register(client, identity, "greeter", description="hi")
+
+    by_fingerprint = await client.get(f"/a2a/{identity.fingerprint}/greeter/.well-known/agent-card.json")
+    by_key = await client.get(f"/a2a/{identity.public_key}/greeter/.well-known/agent-card.json")
+
+    assert by_fingerprint.status_code == by_key.status_code == 200
+    assert by_fingerprint.json() == by_key.json()
+
+
+async def test_two_providers_may_offer_the_same_name_and_neither_shadows_the_other(
+    client, new_identity
+):
+    """What the 409-with-candidates test used to be about. The collision is
+    still real and still allowed; it is simply no longer addressable, so
+    there is no winner to pick and no disambiguation to describe."""
+    a, b = new_identity(), new_identity()
+    path_a = await _register(client, a, "greeter", description="from a")
+    path_b = await _register(client, b, "greeter", description="from b")
+
+    card_a = await client.get(f"/a2a/{path_a}/.well-known/agent-card.json")
+    card_b = await client.get(f"/a2a/{path_b}/.well-known/agent-card.json")
+
+    assert card_a.status_code == card_b.status_code == 200
+    assert card_a.json()["description"] == "from a"
+    assert card_b.json()["description"] == "from b"
 
 
 async def test_the_pre_v1_card_path_is_not_served(client, new_identity):
     """Only the current path. The old one was served for a while, answering
     with the *new* body — which has no top-level `url`, so a pre-v1 client
     found a card it could not use to locate the RPC endpoint. That is not an
-    accommodation, and whether to offer a real one is a gateway decision, not
-    this library's."""
-    agent_id = await _register(client, new_identity(), "greeter", description="hi")
+    accommodation, and whether to offer a real one is a gateway decision."""
+    path = await _register(client, new_identity(), "greeter", description="hi")
 
-    resp = await client.get(f"/a2a/id/{agent_id}/.well-known/agent.json")
+    resp = await client.get(f"/a2a/{path}/.well-known/agent.json")
 
     assert resp.status_code == 404
 
 
-async def test_ambiguous_name_409s_with_candidates_while_id_routes_still_work(client, new_identity):
-    a, b = new_identity(), new_identity()
-    id_a = await _register(client, a, "greeter")
-    id_b = await _register(client, b, "greeter")
+async def test_a_name_alone_no_longer_addresses_anything(client, new_identity):
+    """The route is gone, not relaxed. Worth asserting rather than assuming:
+    a bare `/a2a/greeter/rpc` matching nothing is the outcome, but so is it
+    matching `/a2a/{provider}/{name}` with provider='greeter' — which would
+    have been a 404 either way and told us nothing about which."""
+    await _register(client, new_identity(), "greeter")
 
-    resp = await client.get("/a2a/greeter/.well-known/agent-card.json")
-    assert resp.status_code == 409
-    candidate_ids = {c["agent_id"] for c in resp.json()["detail"]["candidates"]}
-    assert candidate_ids == {id_a, id_b}
-
-    for agent_id in (id_a, id_b):
-        resp = await client.get(f"/a2a/id/{agent_id}/.well-known/agent-card.json")
-        assert resp.status_code == 200
+    assert (await client.get("/a2a/greeter/.well-known/agent-card.json")).status_code == 404
+    assert (await client.post("/a2a/greeter/rpc", json={})).status_code == 404
 
 
-async def test_offline_target_fails_fast_instead_of_queueing(client, new_identity, session):
-    identity = new_identity()
-    agent_id = await _register(client, identity, "translator")
+async def test_offline_target_fails_fast_instead_of_queueing(client, register, session):
+    """Registered but unattached: nobody is serving it, so the run must end
+    rather than wait. `online` is `is_serving` now, so this needs no clock
+    manipulation — the old version of this test aged `last_seen_at` by 120
+    seconds to push the agent outside a heartbeat window that no longer
+    exists."""
+    served = await register("translator")
 
-    await session.execute(
-        update(agents)
-        .where(agents.c.agent_id == agent_id)
-        .values(last_seen_at=datetime.now(timezone.utc) - timedelta(seconds=120))
-    )
-    await session.commit()
-
-    thread_id = await repo.create_thread(session, agent_id)
+    thread_id = await repo.create_thread(session, served.ref())
     await session.commit()
 
     resp = await client.post(
-        f"/a2a/id/{agent_id}/rpc",
+        f"/a2a/{served.path()}/rpc",
         json={
             "jsonrpc": "2.0",
             "id": "1",
@@ -88,23 +126,22 @@ async def test_offline_target_fails_fast_instead_of_queueing(client, new_identit
             },
         },
     )
-    assert resp.status_code == 200
+    assert resp.status_code == 200, resp.text
     result = resp.json()["result"]
     assert result["status"]["state"] == "TASK_STATE_FAILED"
 
     run = (
         await session.execute(
-            select(thread_history.c.status, thread_history.c.metadata).where(
-                thread_history.c.run_id == result["id"],
-                thread_history.c.kind == "run_status",
-            )
+            select(runs.c.status, runs.c.metadata).where(runs.c.run_id == result["id"])
         )
     ).mappings().first()
     assert run["status"] == "failed"
     assert run["metadata"]["failureReason"] == "agent_offline"
 
 
-async def test_a2a_can_never_bypass_a_paused_run_even_with_a_resume_flag(client, new_identity, session):
+async def test_a2a_can_never_bypass_a_paused_run_even_with_a_resume_flag(
+    client, register, session
+):
     """A2A has no resume mechanism at all — see souk/pause.py's module
     docstring for why that's deliberate (an agent must never be the one
     resolving another provider's interrupt). A second tasks/send on the
@@ -112,22 +149,19 @@ async def test_a2a_can_never_bypass_a_paused_run_even_with_a_resume_flag(client,
     convention, must not bypass an active, paused run — it just gets
     told the current state back, exactly like a plain duplicate call.
     """
-    identity = new_identity()
-    agent_id = await _register(client, identity, "approver")
+    served = await register("approver")
 
     # Built directly via repo, not through a live tasks/send — that would
-    # block draining a run nothing ever claims/finishes (see
-    # test_offline_target_fails_fast_instead_of_queueing for the same
-    # reason the *other* test sidesteps this differently).
-    thread_id = await repo.create_thread(session, agent_id)
-    created = await repo.create_run(session, thread_id, agent_id, "a2a", {})
+    # block draining a run nothing ever claims/finishes.
+    thread_id = await repo.create_thread(session, served.ref())
+    created = await repo.create_run(session, thread_id, served.ref(), "a2a", {})
     await repo.mark_run_status(
         session, created["run_id"], "input-required", metadata={"interrupts": [{"id": "int_1"}]}
     )
     await session.commit()
 
     second = await client.post(
-        f"/a2a/id/{agent_id}/rpc",
+        f"/a2a/{served.path()}/rpc",
         json={
             "jsonrpc": "2.0",
             "id": "2",
@@ -140,17 +174,11 @@ async def test_a2a_can_never_bypass_a_paused_run_even_with_a_resume_flag(client,
             },
         },
     )
-    assert second.status_code == 200
+    assert second.status_code == 200, second.text
     result = second.json()["result"]
     # Still the *original* run — a new one never started.
     assert result["id"] == created["run_id"]
     assert result["status"]["state"] == "TASK_STATE_INPUT_REQUIRED"
 
-    still_one_run = (
-        await session.execute(
-            select(func.count()).select_from(thread_history).where(
-                thread_history.c.kind == "run_status"
-            )
-        )
-    ).scalar()
+    still_one_run = (await session.execute(select(func.count()).select_from(runs))).scalar()
     assert still_one_run == 1

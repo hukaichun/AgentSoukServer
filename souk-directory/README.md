@@ -6,9 +6,15 @@ chat with one directly from the browser.
 TypeScript, compiled to plain ES modules with `tsc` (no bundler, no
 framework), served as static files — no backend of its own, a pure
 browser client of a souk's already-public HTTP API (`GET /agents`,
-`POST /agui/id/{agent_id}`, A2A agent cards). Independent project, like
+`POST /agui/{provider}/{name}`, A2A agent cards). Independent project, like
 every other top-level directory in this repo: nothing here imports from
 `souk/` or `souk-agent-sdk/`.
+
+An agent is addressed by the pair `(provider, name)` — souk mints no id —
+so every link this page builds carries both: `agent.html?provider=<16-hex
+fingerprint>&name=<name>`. The full provider key works in that slot too.
+A name alone is not an address: two stalls in one souk may each keep a
+`translator`.
 
 ## Running
 

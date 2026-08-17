@@ -21,7 +21,8 @@ from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
 from souk.core import Souk
-from souk_server.deps import get_souk
+from souk.models import AgentRef
+from souk_server.deps import get_souk, resolve_ref
 from souk.errors import AgentNotFound
 from souk_server.models import CreateThreadRequest, CreateThreadResponse
 from souk.protocols.agui import AGUIAdapter, ThreadSnapshot
@@ -29,29 +30,20 @@ from souk.protocols.agui import AGUIAdapter, ThreadSnapshot
 router = APIRouter()
 
 
-async def _create_thread(souk: Souk, agent_id: str, body: CreateThreadRequest) -> CreateThreadResponse:
-    if await souk.get_agent(agent_id) is None:
-        raise AgentNotFound(f"agent '{agent_id}' is not registered")
-    return CreateThreadResponse(thread_id=await souk.create_thread(agent_id, metadata=body.metadata))
+async def _create_thread(souk: Souk, agent: AgentRef, body: CreateThreadRequest) -> CreateThreadResponse:
+    if await souk.get_agent(agent) is None:
+        raise AgentNotFound(f"agent '{agent.name}' is not registered for that provider")
+    return CreateThreadResponse(thread_id=await souk.create_thread(agent, metadata=body.metadata))
 
 
-@router.post("/threads/id/{agent_id}")
-async def create_thread_by_id(
-    agent_id: str,
-    body: CreateThreadRequest = CreateThreadRequest(),
-    souk: Souk = Depends(get_souk),
-) -> CreateThreadResponse:
-    return await _create_thread(souk, agent_id, body)
-
-
-@router.post("/threads/{name}")
-async def create_thread_by_name(
+@router.post("/threads/{provider}/{name}")
+async def create_thread(
+    provider: str,
     name: str,
     body: CreateThreadRequest = CreateThreadRequest(),
     souk: Souk = Depends(get_souk),
 ) -> CreateThreadResponse:
-    agent_id = await AGUIAdapter(souk).resolve_agent_id(name)
-    return await _create_thread(souk, agent_id, body)
+    return await _create_thread(souk, await resolve_ref(souk, provider, name), body)
 
 
 @router.get("/threads/{thread_id}")
@@ -80,8 +72,8 @@ async def get_thread_tree(thread_id: str, souk: Souk = Depends(get_souk)) -> dic
     return tree
 
 
-async def _run_agent(souk: Souk, agent_id: str, body: RunAgentInput):
-    result = await AGUIAdapter(souk).run(agent_id, body)
+async def _run_agent(souk: Souk, agent: AgentRef, body: RunAgentInput):
+    result = await AGUIAdapter(souk).run(agent, body)
 
     if isinstance(result, ThreadSnapshot):
         # The resolved thread_id is already the top-level `thread_id` field
@@ -100,16 +92,8 @@ async def _run_agent(souk: Souk, agent_id: str, body: RunAgentInput):
     return EventSourceResponse(stream())
 
 
-@router.post("/agui/id/{agent_id}", response_model=None)
+@router.post("/agui/{provider}/{name}", response_model=None)
 async def run_agent_by_id(
-    agent_id: str, body: RunAgentInput, souk: Souk = Depends(get_souk)
+    provider: str, name: str, body: RunAgentInput, souk: Souk = Depends(get_souk)
 ) -> EventSourceResponse | JSONResponse:
-    return await _run_agent(souk, agent_id, body)
-
-
-@router.post("/agui/{name}", response_model=None)
-async def run_agent_by_name(
-    name: str, body: RunAgentInput, souk: Souk = Depends(get_souk)
-) -> EventSourceResponse | JSONResponse:
-    agent_id = await AGUIAdapter(souk).resolve_agent_id(name)
-    return await _run_agent(souk, agent_id, body)
+    return await _run_agent(souk, await resolve_ref(souk, provider, name), body)

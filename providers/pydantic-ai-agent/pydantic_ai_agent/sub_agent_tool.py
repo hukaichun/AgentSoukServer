@@ -16,6 +16,7 @@ from pydantic_ai import RunContext, Tool
 from souk_agent_sdk.a2a_client import call_agent_streaming
 
 from pydantic_ai_agent.config import SubAgentConfig
+from pydantic_ai_agent.resolve import ResolvedAddress, SubAgentUnresolvable
 
 
 @dataclass
@@ -49,12 +50,23 @@ class AgentDeps:
     sub_agent_context_ids: dict[str, str] = field(default_factory=dict)
 
 
-def build_sub_agent_tools(sub_agents: list[SubAgentConfig]) -> list[Tool]:
-    return [_make_tool(sub) for sub in sub_agents]
+def build_sub_agent_tools(sub_agents: list[SubAgentConfig], souk_http_url: str) -> list[Tool]:
+    return [_make_tool(sub, ResolvedAddress(sub, souk_http_url)) for sub in sub_agents]
 
 
-def _make_tool(sub: SubAgentConfig) -> Tool:
+def _make_tool(sub: SubAgentConfig, resolved: ResolvedAddress) -> Tool:
     async def call_sub_agent(ctx: RunContext[AgentDeps], message: str) -> str:
+        # Resolved here rather than at startup: a sub-agent is usually a
+        # sibling container that has not registered yet at boot, and a
+        # delegation edge should not become a boot order. See resolve.py.
+        try:
+            address = await resolved.get()
+        except SubAgentUnresolvable as e:
+            # Back to the model as an answer, not up as a crash: it is the
+            # one that can say something useful to whoever asked, and an
+            # unreachable sub-agent is not a reason to fail the whole run.
+            return f"({sub.name} could not be reached: {e})"
+
         # souk assigns every thread id itself (see souk.ids /
         # souk.repo.ensure_thread), the sub-agent tool never mints one.
         # `referenceTaskIds` (real A2A, see souk_agent_sdk.a2a_client)
@@ -83,17 +95,40 @@ def _make_tool(sub: SubAgentConfig) -> Tool:
         # RUN_FINISHED event a naive translation would otherwise send).
         pending = False
         async for update in call_agent_streaming(
-            sub.a2a_url,
+            address.url,
             message,
             context_id=context_id,
             reference_task_ids=reference_task_ids,
             actor_chain=ctx.deps.actor_chain,
         ):
+            # The provider rides along, and it is not decoration: this is
+            # the *only* live signal that a delegation is happening — the
+            # thread tree only materialises once the run has finished — so
+            # it is what any UI must draw a delegation from. A bare name
+            # cannot say which stall the work went to when two of them
+            # keep an agent by that name, which is exactly the ambiguity
+            # the by-name routes were deleted over. The address was
+            # resolved a few lines up; throwing away its identity here
+            # would reintroduce that ambiguity in the one message that
+            # describes a delegation while it is still in flight.
+            #
+            # `sub_agent` stays the *tool's* name, unchanged, because that
+            # is the label a consumer already keys on. `agent_name` is who
+            # was actually called, which differs when a config's `agent:`
+            # does. Both are None-free only when known: an explicit
+            # `a2a_url` pointing somewhere unrecognizable says so rather
+            # than guessing.
             await ctx.deps.progress_queue.put(
                 {
                     "type": "CUSTOM",
                     "name": "sub_agent_progress",
-                    "value": {"sub_agent": sub.name, **update},
+                    "value": {
+                        "sub_agent": sub.name,
+                        "provider": address.provider,
+                        "provider_key": address.provider_key,
+                        "agent_name": address.agent_name,
+                        **update,
+                    },
                 }
             )
             # A2A v1.0 wraps every streamed item in a StreamResponse whose
