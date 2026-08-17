@@ -67,6 +67,14 @@ services:
       # this repo's own local-dev stack; a real deployment must set its
       # own via SOUK_TOKEN_SIGNING_SECRET.
       SOUK_TOKEN_SIGNING_SECRET: dev-insecure-change-me
+      # This souk's own Ed25519 identity — what lets a provider tell this
+      # souk from another one answering the same URL. Fixed here so the
+      # value below can be a provider's pinned key; a real deployment
+      # generates its own (`SoukIdentity.generate_hex()`) and provisions
+      # it like any other secret. A value rather than a file because every
+      # replica of one souk must present the same identity, and because it
+      # has to survive a container that owns no volume.
+      SOUK_IDENTITY_PRIVATE_KEY: ${SOUK_IDENTITY_PRIVATE_KEY:-ed2f1426228cc76fdceb83066aad7b5f27011d98240ebee9bd28afb31952f9e3}
       # Must match souk-migrate's above — see that service's comment.
       SOUK_DB_SCHEMA: ${SOUK_DB_SCHEMA:-public}
 
@@ -98,6 +106,10 @@ services:
       - docent_identity:/data
     environment:
       SOUK_IDENTITY_KEY_PATH: /data/souk_identity.key
+      # The souk this provider will talk to, pinned. Refuses to hand its
+      # proof to anything else answering that URL. See the `souk`
+      # service's SOUK_IDENTITY_PRIVATE_KEY — this is its public half.
+      SOUK_PUBLIC_KEY: ${SOUK_PUBLIC_KEY:-6ecc7c33af8471e478777041e0fdf9662ba6f76c3044365ce16a7b09c476e506}
       LLM_BASE_URL: "${LLM_BASE_URL}"
       LLM_MODEL_NAME: "${LLM_MODEL_NAME}"
       LLM_API_KEY: "${LLM_API_KEY}"
@@ -134,6 +146,10 @@ services:
       - zahra_identity:/data
     environment:
       SOUK_IDENTITY_KEY_PATH: /data/souk_identity.key
+      # The souk this provider will talk to, pinned. Refuses to hand its
+      # proof to anything else answering that URL. See the `souk`
+      # service's SOUK_IDENTITY_PRIVATE_KEY — this is its public half.
+      SOUK_PUBLIC_KEY: ${SOUK_PUBLIC_KEY:-6ecc7c33af8471e478777041e0fdf9662ba6f76c3044365ce16a7b09c476e506}
       LLM_BASE_URL: "${LLM_BASE_URL}"
       LLM_MODEL_NAME: "${LLM_MODEL_NAME}"
       LLM_API_KEY: "${LLM_API_KEY}"
@@ -151,6 +167,10 @@ services:
       - yusuf_identity:/data
     environment:
       SOUK_IDENTITY_KEY_PATH: /data/souk_identity.key
+      # The souk this provider will talk to, pinned. Refuses to hand its
+      # proof to anything else answering that URL. See the `souk`
+      # service's SOUK_IDENTITY_PRIVATE_KEY — this is its public half.
+      SOUK_PUBLIC_KEY: ${SOUK_PUBLIC_KEY:-6ecc7c33af8471e478777041e0fdf9662ba6f76c3044365ce16a7b09c476e506}
       LLM_BASE_URL: "${LLM_BASE_URL}"
       LLM_MODEL_NAME: "${LLM_MODEL_NAME}"
       LLM_API_KEY: "${LLM_API_KEY}"
@@ -168,6 +188,10 @@ services:
       - teahouse_identity:/data
     environment:
       SOUK_IDENTITY_KEY_PATH: /data/souk_identity.key
+      # The souk this provider will talk to, pinned. Refuses to hand its
+      # proof to anything else answering that URL. See the `souk`
+      # service's SOUK_IDENTITY_PRIVATE_KEY — this is its public half.
+      SOUK_PUBLIC_KEY: ${SOUK_PUBLIC_KEY:-6ecc7c33af8471e478777041e0fdf9662ba6f76c3044365ce16a7b09c476e506}
       LLM_BASE_URL: "${LLM_BASE_URL}"
       LLM_MODEL_NAME: "${LLM_MODEL_NAME}"
       LLM_API_KEY: "${LLM_API_KEY}"

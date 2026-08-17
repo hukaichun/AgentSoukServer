@@ -42,7 +42,6 @@ from __future__ import annotations
 
 import os
 import tempfile
-import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -60,9 +59,9 @@ from souk.config import CoreSettings
 from souk.core import Souk
 from souk.identity import provider_fingerprint
 from souk.models import AgentRef
-from souk_provider_sdk import InProcessProvider, ProviderIdentity, ProviderRuntime
+from souk_provider_sdk import InProcessLink, ProviderIdentity, ProviderRuntime
+from souk_server.handshake import HANDSHAKE_VERSION, new_nonce, provider_proof_payload
 from souk_server.server import create_app
-from souk_server.ws_provider import connect_signing_payload
 
 ALEMBIC_INI = (
     Path(__file__).resolve().parent.parent / "AgentSouk" / "souk" / "alembic.ini"
@@ -80,9 +79,20 @@ DATABASE_URL = os.environ.get(
 _TABLES_CHILD_FIRST = ("run_events", "thread_messages", "runs", "threads", "agents", "providers")
 
 
+# A fixed key rather than a generated one: a test that asserts what a
+# provider pinned needs the same souk to be the same souk across runs, and
+# generating one per session would make "is this the souk I meant" a
+# question with no stable answer to write down.
+TEST_SOUK_IDENTITY = "11" * 32
+
+
 @pytest.fixture(scope="session")
 def settings() -> CoreSettings:
-    return CoreSettings(database_url=DATABASE_URL, token_signing_secret=TEST_SIGNING_SECRET)
+    return CoreSettings(
+        database_url=DATABASE_URL,
+        token_signing_secret=TEST_SIGNING_SECRET,
+        identity_private_key=TEST_SOUK_IDENTITY,
+    )
 
 
 @pytest.fixture(scope="session")
@@ -185,16 +195,24 @@ class Identity(ProviderIdentity):
         }
 
     def hello(self, names: list[str], **extra) -> dict:
-        timestamp = int(time.time())
+        """Frame one. No signature in it — the proof comes later, over a
+        nonce souk chooses, which is the whole of what changed."""
         return {
             "type": "hello",
+            "version": HANDSHAKE_VERSION,
             "publicKey": self.public_key,
-            "signature": self._key.sign(
-                connect_signing_payload(self.public_key, names, timestamp)
-            ).hex(),
-            "timestamp": timestamp,
             "agentNames": sorted(names),
+            "nonce": new_nonce(),
             **extra,
+        }
+
+    def proof(self, hello_raw: str, provider_nonce: str, souk_nonce: str) -> dict:
+        """Frame three, over the exact hello text that went on the wire."""
+        return {
+            "type": "proof",
+            "signature": self.sign(
+                provider_proof_payload(provider_nonce, souk_nonce, hello_raw)
+            ),
         }
 
 
@@ -249,7 +267,10 @@ async def attach(souk: Souk):
         runtime = ProviderRuntime(identity, provider, **kwargs)
         started.append(runtime)
         runtime.start()
-        await souk.attach_provider(InProcessProvider(souk, runtime), list(names))
+        # Constructing the link is what joins it to the runtime, so it has
+        # to happen before any work arrives — a runtime with no link drops
+        # its output silently.
+        await souk.attach_provider(InProcessLink(souk, runtime), list(names))
         return runtime
 
     yield _attach

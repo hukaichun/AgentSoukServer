@@ -190,6 +190,14 @@ async def main() -> None:
         handles,
         identity_key_path=identity_key_path,
         provider_name=cfg.provider_name,
+        # Which souk this provider will talk to. From the environment
+        # rather than the config file because it is a fact about the
+        # deployment, not about the agents: the same config runs against a
+        # dev souk and a production one, and only the key differs.
+        # Unset means "whichever answers the URL" — see
+        # SoukProvider._check_souk_identity for what that does and does
+        # not check.
+        souk_public_key=os.environ.get("SOUK_PUBLIC_KEY") or None,
     )
     await provider.run_forever()
 

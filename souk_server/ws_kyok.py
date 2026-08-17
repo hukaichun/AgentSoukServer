@@ -135,7 +135,8 @@ async def kyok_socket(websocket: WebSocket) -> None:
     souk: "Souk" = websocket.app.state.souk
 
     await websocket.accept()
-    hello = await receive_hello(websocket)
+    received = await receive_hello(websocket)
+    hello = received[0] if received else None
     if hello is None:
         return
     session_id = hello.get("sessionId")

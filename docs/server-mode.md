@@ -100,54 +100,117 @@ which agent, offers each run to it, and the answer comes back as a frame.
 The socket carries the offer; `souk_provider_sdk.ProviderRuntime`, on the
 far side, decides.
 
-That inversion deleted two things rather than moving them, and both are
-worth stating because a reader who knows the old design will look for
-them.
+### Opening a socket: a mutual challenge-response
 
-**There is no session token.** The socket is opened with a signature from
-the provider's own Ed25519 key, so nothing bearer-shaped exists to leak,
-and nothing expires underneath a long-lived connection. The dual-track
-header/hello design below survives only as a shape: the credential is
-still in the first frame, but it is a signature, not a token, and the
-`Authorization` header track is gone with the token it carried. An edge
-middleware wanting to gate before accept has to verify the same signature
-itself — which it can, since verification needs only the public key.
+Four frames, two round trips, and **each side signs bytes the other
+chose**. The payloads live in `souk_server/handshake.py`, which is the
+spec both halves are written against; the SDK states them separately
+rather than importing them, because a provider must not need the gateway
+installed to be a provider.
 
-```json
-{
-  "type": "hello",
-  "publicKey": "<hex>",
-  "signature": "<hex>",
-  "timestamp": 1755300000,
-  "agentNames": ["translator", "summarizer"],
-  "maxConcurrentRuns": 2
-}
+```
+provider → hello      { version, publicKey, agentNames,
+                        maxConcurrentRuns, nonce }
+souk     → challenge  { soukPublicKey, nonce, signature }
+provider → proof      { signature }
+souk     → welcome    { }
 ```
 
-The signature covers
-`souk-provider-connect:<publicKey>:<comma-joined sorted agentNames>:<timestamp>`.
-The prefix is deliberately *not* the registration payload's, even though
-it covers the same facts: reusing it would make a captured registration
-signature replayable as a connection, and within the freshness window
-that is somebody else's runs delivered to you. The names being inside
-what was signed is what stops a hello claiming a set the signature did
-not cover.
+```
+sig_s = souk.sign(     b"souk-auth:souk:"     + nonce_p + b":" + nonce_s )
+sig_p = identity.sign( b"souk-auth:provider:" + nonce_p + b":" + nonce_s
+                       + b":" + sha256(hello_raw) )
+```
 
-The payload format is this gateway's, not core's — signing a socket open
-is a serving act, and souk supplies only the primitives it is built from
-(`verify_signature`, `is_timestamp_fresh`). Every name must be one this
-key registered; core enforces that in `attach_provider`, so a name nobody
-registered is refused at the door rather than advertised and served by
-nobody.
+**What this replaced.** A provider used to open a socket by signing a
+statement it composed itself —
+`souk-provider-connect:{key}:{names}:{timestamp}` — in which the verifier
+chose nothing: no nonce, no server identity, no binding to the connection,
+only a timestamp checked against a 60-second window. Anyone who observed
+that signature could replay it and attach as that provider. The old
+docstring reasoned carefully about the neighbouring case — that reusing
+the *registration* payload would let a captured registration be replayed
+as a connection, hence the differing prefixes — and stopped one step
+short. A prefix stops a signature being replayed as a different kind of
+thing; it does nothing about a connection signature replayed as a
+connection, which needs no change of use at all.
 
-Reply is `{"type": "welcome"}` or a close with 1008 (policy violation)
-and a reason string. **`welcome` is queued before attaching**, and that
-ordering is load-bearing: attaching is what makes the provider reachable,
-and the broker begins offering inside `attach_provider`'s own awaits — so
-queueing it after lets a provider with work already waiting receive a
-`run` frame as the first thing after its hello. A client reading exactly
-one frame there raises and reconnects into the same race forever. 1011
+Why each piece is there:
+
+- **Both nonces in both signatures.** Each side contributes freshness, so
+  a recorded exchange is worth nothing to whoever recorded it.
+- **`souk:` / `provider:` prefixes.** Neither signature can be presented
+  as the other. Without them the two payloads would differ only by a
+  trailing digest.
+- **`sha256(hello_raw)`.** Binds the claims: `agentNames` and
+  `maxConcurrentRuns` cannot be altered in flight. A digest rather than a
+  re-send, because `hello` goes out before `nonce_s` exists — and a
+  digest of *the bytes actually sent*, since key order and separators are
+  free choices in JSON and re-encoding the same values can produce
+  different bytes.
+- **souk signs first.** A provider must be able to walk away from a souk
+  it does not recognise *before* producing anything worth stealing.
+  Signing second would mean handing a credential to whatever answered the
+  URL and only then asking who it was.
+
+`sig_s` is the half souk never had: until now it proved nothing to
+anybody, so a provider connected to a URL and trusted whatever picked up.
+A souk with no `SOUK_IDENTITY_PRIVATE_KEY` says so — `soukPublicKey:
+null`, no signature — rather than failing, which is an honest report of
+today's deployments; a provider that pinned a key refuses it, and one
+that pinned nothing is no worse off than before.
+
+**Provider-side trust.** `SoukProvider(souk_public_key=…)` pins one souk,
+and that is the recommended shape: the provider already receives the souk
+URL from somewhere, and the same channel carries a fingerprint. Unset, the
+provider still checks that whoever answered holds the key it presents —
+enough to notice a broken souk, not enough to notice a substituted one —
+and logs the fingerprint so the value to pin is in reach.
+
+TOFU is deliberately **not** built. It reads as free safety and is not:
+souk's key is provisioned, so any deployment that rotates or regenerates
+it jams every provider at once, with the recovery being to go and clear a
+pin on each. A configured key costs one line and has no such state.
+
+**Channel binding is out — decided, not overlooked.** It is the standard
+answer to a relay, and unusable here: a Zscaler-class proxy terminates and
+re-originates TLS by design, so the two sides never derive the same value
+and the check fails every time. Enforcing it would not harden the
+deployment; it would lock out every enterprise running one, which is the
+deployment this exists for. It was also never the fix — the defect is a
+*stealable* credential, and challenge-response closes that with an
+intercepting proxy in the path:
+
+| | before | after |
+|---|---|---|
+| see the traffic | yes | yes — it terminates TLS, that is its job |
+| capture the credential, connect later as that provider | **yes** | **no** — cannot answer a fresh nonce |
+| tamper with frames on a live connection | yes | yes |
+
+The bottom row stays open, deliberately: run inputs and events are not
+individually signed, an intercepting proxy is in the trust model by
+construction (the enterprise installed it and pushed its CA), and signing
+every frame is a large cost against a threat the operator chose.
+
+**`version` is in `hello`, and there is no compatibility branch.** A hard
+cutover: the old shape carried no version field, so it cannot be accepted
+and told apart from a corrupt frame, and its absence is what the refusal
+names — a bare signature failure is what an attack looks like too, and
+would send whoever is debugging it somewhere unhelpful. Dual-shape
+acceptance was considered and skipped because every provider that exists
+is in this repo behind one SDK; the field is there so the *next* change
+has something to select on, which is when it earns its keep.
+
+**`welcome` is queued before attaching**, and that ordering is
+load-bearing: attaching is what makes the provider reachable, and the
+broker begins offering inside `attach_provider`'s own awaits — so queueing
+it after lets a provider with work already waiting receive a `run` frame
+as the first thing after its proof. A client reading exactly one frame
+there raises and reconnects into the same race forever. Every handshake
+refusal closes with 1008 (policy violation) and a reason string; 1011
 stays reserved for server-side failure the client didn't cause.
+
+### Once attached
 
 | direction | frame | carries |
 |---|---|---|
@@ -156,7 +219,78 @@ stays reserved for server-side failure the client didn't cause.
 | ↑ | `{"type": "event", "runId", "event"}` | one AG-UI event; authorized against `Run.claimed_by` |
 | ↑ | `{"type": "finish", "runId"}` | that run's stream ended |
 | ↓ | `{"type": "cancel", "runId"}` | a request, not an order — outcome decided when the stream ends |
+| ↑ | `{"type": "query", "queryId", "method", "params"}` | a question about the work souk gave this provider |
+| ↓ | `{"type": "queryResult", "queryId", "result"?, "error"?}` | its answer, correlated by `queryId` |
 | ↓ | `{"type": "error", "message", "runId"?}` | server-side rejection of a frame (bad runId, not the holder) |
+
+### Queries: the one thing here that expects an answer
+
+Every other frame is fire-and-forget. `query` is not, and it is worth
+being explicit about why it earns the machinery — a correlation id, a
+pending map, a timeout, and a rule for a socket that dies mid-question.
+
+**A provider sees exactly what the caller sent for its run, and nothing
+more.** An AG-UI client resends its whole history every turn by
+convention; A2A's `message/send` carries one message. The same agent,
+unchanged, cannot tell a tenth turn from a first — and souk has held the
+thread the whole time. `souk_provider_sdk.SoukLink.thread_messages` is
+the question, and this is how it crosses a wire.
+
+```json
+↑ {"type": "query", "queryId": "9f3c…", "method": "thread_messages",
+   "params": {"threadId": "thread_…", "limit": 20}}
+↓ {"type": "queryResult", "queryId": "9f3c…", "result": [ …messages… ]}
+```
+
+- **`limit` is applied by souk**, not by the caller on return. The
+  parameter exists to keep the response frame bounded; trimming after
+  receiving would bound nothing and put a months-old thread on the wire to
+  do it.
+- **A provider may only read threads for agents it serves.** Not in the
+  upstream design and added here. Thread ids are not guessable, but
+  unguessable is not an authorization rule: a provider that served one run
+  knows that thread id permanently, and would otherwise keep reading the
+  conversation after being de-listed, or after the agent moved to another
+  stall. A thread names its agent and an agent is `(provider_key, name)`,
+  so souk can already make the comparison. "Not yours" and "no such
+  thread" get the *same* answer — telling them apart would confirm a
+  thread's existence to somebody who may not read it.
+- **A malformed query is answered, not dropped.** The far side is waiting
+  on that `queryId`; silence costs it the full timeout for a mistake souk
+  could see at once.
+- **A dead socket fails its outstanding queries immediately**, rather than
+  leaving them to time out. Unlike a run — which is addressed by `runId`
+  and whose frames go out on whatever connection is next — a question was
+  asked of *this* connection and nothing will ever answer it. It is not
+  retried on reconnect either: the agent asked mid-run, and whether it
+  still wants the answer is the agent's to decide.
+- **What may be asked is deliberately short.** Upstream's
+  `contract.LINK_QUERY_METHODS` states the rule — this is not a mirror of
+  souk's API, because every method admitted is one more frame type every
+  transport must carry. The gateway reads that set rather than retyping
+  it, so a method added upstream without a frame here fails a test instead
+  of a provider.
+
+Adding these frames does **not** bump `version`. They are additive: a
+provider that never asks is unaffected, and an older gateway answers an
+unknown frame type with `error`. The version selects the *handshake*,
+which is the part that genuinely cannot interoperate across shapes.
+
+### Which object is which
+
+`SoukLink` is one provider joined to one souk — both directions, one
+object — and the socket client in souk-agent-sdk is one, because over a
+wire that is literally true: run frames arrive on the same socket event
+frames leave by.
+
+The gateway's `SocketProvider` is **not** one, and upstream's own docstring
+says so. It sits on souk's side, holds an outbound queue and no runtime,
+and only carries work outward. It satisfies souk's `ConnectedProvider`
+protocol structurally, and checks itself against
+`contract.CONNECTED_PROVIDER_ATTRS` at construction — because souk sizes a
+capacity bucket from `max_concurrent_runs`, and a connection that forgets
+it attaches perfectly well and then fails inside the broker, three layers
+from the cause.
 
 A declined offer costs the run nothing: it stays queued and is offered
 again when something changes — a run arriving, a provider registering, one
