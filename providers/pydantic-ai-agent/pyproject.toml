@@ -3,6 +3,11 @@ name = "pydantic-ai-agent"
 version = "0.1.0"
 description = "Example souk provider: config (system prompt + MCP servers + sub-agents) in, souk-connected AG-UI agent out, built on pydantic-ai. One of several provider examples under providers/ — see providers/README.md."
 requires-python = ">=3.12"
+# Apache-2.0, not the repo's AGPL-3.0. A reference provider is something
+# to start from, same as agent-template.
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+
 # Not for an index. This package depends on a sibling in this repo by bare
 # name (souk-agent-sdk), resolvable only through the [tool.uv.sources] path below —
 # uploaded anywhere, that name would resolve to whatever a stranger has

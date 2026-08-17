@@ -140,4 +140,15 @@ From [`docs/server-mode.md`](docs/server-mode.md); the transport work is done:
 4. ✅ **MCP docent** (`/mcp`) — discovery, not invocation: who is in the souk, what each stall offers, and the A2A endpoint to go talk to them ([souk_server/mcp_docent.py](souk_server/mcp_docent.py)). Read-only; calling an agent stays A2A's job.
 5. 🧩 **Examples** — a browser provider (frame-protocol conformance, no SDK), an end-to-end `demo` compose profile, and a managed-gateway embedding sample (edge auth + admin router over the `Souk` facade).
 
-**License**: [Apache 2.0](AgentSouk/LICENSE) (inherited from upstream; this repo has no separate license file yet)
+## ⚖️ License
+
+**The gateway is [AGPL-3.0](LICENSE); the SDKs, the template and the
+reference providers are [Apache-2.0](souk-agent-sdk/LICENSE).** What you
+*run* is copyleft, what you *build against* is not — so a hosted, modified
+souk stays open, while your own agent stays yours. souk core is Apache-2.0
+upstream and unaffected.
+
+See [LICENSING.md](LICENSING.md) for the per-directory map and the
+reasoning. Nobody has to use the SDKs at all: the wire is documented in
+[docs/server-mode.md](docs/server-mode.md), and a provider written from
+that owes this repository nothing.

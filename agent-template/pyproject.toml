@@ -3,6 +3,12 @@ name = "agent-template"
 version = "0.1.0"
 description = "Minimal reference souk provider: the smallest possible souk_agent_sdk.AgentHandle implementation, with no framework baggage. Copy this to start a new provider — see providers/ for fuller examples (MCP tools, sub-agents, multiple LLM backends)."
 requires-python = ">=3.12"
+# Apache-2.0, not the repo's AGPL-3.0. This exists to be copied — that
+# is its entire purpose — and a template nobody may copy freely is not
+# one.
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+
 # Not for an index. This package depends on a sibling in this repo by bare
 # name (souk-agent-sdk), resolvable only through the [tool.uv.sources] path below —
 # uploaded anywhere, that name would resolve to whatever a stranger has

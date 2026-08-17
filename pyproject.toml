@@ -14,9 +14,10 @@ requires-python = ">=3.12"
 # reverse is not true, which is why the licence lives on this side of the
 # boundary and not upstream.
 #
-# See LICENSE. The SDKs in this repo are a separate question — a library a
-# third party links into their own agent is not a server, and AGPL there
-# would oblige every provider author to publish their agent.
+# The SDKs, the template and the reference providers in this repo are
+# Apache-2.0 instead, each with its own LICENSE: a library a third party
+# imports into their own agent is not a server, and AGPL there would
+# oblige every provider author to publish their agent. See LICENSING.md.
 license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
 # Not for an index. This package depends on souk core by bare name,
