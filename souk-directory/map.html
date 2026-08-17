@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>souk market</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="page">
+    <div id="souk-bar"></div>
+    <div class="market-head">
+      <h1 class="brand">souk market</h1>
+      <a class="back-link" id="list-link" href="index.html">the same souk as a list &rarr;</a>
+    </div>
+    <div class="market">
+      <div class="market-map">
+        <svg id="map" viewBox="0 0 1000 620" preserveAspectRatio="xMidYMid meet"></svg>
+        <div id="map-note" class="map-note"></div>
+      </div>
+      <aside class="market-side" id="side">
+        <p class="empty-state">Pick someone in a stall to talk to them.</p>
+      </aside>
+    </div>
+  </div>
+
+  <script type="module" src="dist/map.js"></script>
+</body>
+</html>

@@ -504,6 +504,10 @@ a {
   font-family: var(--mono);
   font-size: 0.8rem;
 }
+/* One row per root-to-leaf walk. A fan-out draws several, each starting
+   from the same first stop — the repetition is the point: those journeys
+   really did all begin at that counter. */
+.route + .route { margin-top: 0.4rem; }
 
 .route .stop {
   display: inline-flex;

@@ -11,6 +11,11 @@ interface ThreadTreeNode {
   thread_id: string;
   provider_key: string;
   agent_name: string;
+  // Only children carry this — the root is the thread you already had, not
+  // a call anyone made. It is what separates a fan from a relay: siblings
+  // issued in one model turn are timestamped sub-millisecond apart, a
+  // sequential second call seconds apart.
+  created_at?: string;
   children: ThreadTreeNode[];
 }
 
@@ -252,18 +257,43 @@ function handleAguiEvent(event: any): void {
   }
 }
 
-// Flattens the (usually linear) delegation tree into an ordered list of
-// stops for the route strip. A real fan-out (one call spawning several
-// sibling sub-calls) still renders as a single depth-first route rather
-// than branching visually — every delegation chain seen in practice so
-// far is linear, and a strip is the right shape for that; a true tree
-// widget would be overkill for the common case it'd rarely serve.
-function flattenRoute(node: ThreadTreeNode): ThreadTreeNode[] {
-  const stops = [node];
-  for (const child of node.children) {
-    stops.push(...flattenRoute(child));
-  }
-  return stops;
+// Every root-to-leaf path through the delegation tree — one row per walk
+// that actually happened.
+//
+// This replaces a depth-first flatten into a single line, which did not
+// merely lose the branching: it *asserted calls that were never made*.
+// Measured on the demo market — one run of souk-guide fanning out to
+// translator and summarizer, with summarizer then calling translator
+// itself — flattened to
+//
+//     souk-guide -> translator -> summarizer -> translator
+//
+// whose middle arrow says translator called summarizer. It did not; they
+// were siblings, started 0.5ms apart. A four-stop relay and a two-way fan
+// with one deep branch are different events, and the flatten rendered them
+// identically, inventing an edge to do it. Paths cannot: every arrow drawn
+// here is an edge that exists in the tree.
+function routesToLeaves(node: ThreadTreeNode): ThreadTreeNode[][] {
+  if (node.children.length === 0) return [[node]];
+  return node.children.flatMap((child) =>
+    routesToLeaves(child).map((path) => [node, ...path])
+  );
+}
+
+// Siblings that began within this window are treated as having been issued
+// together rather than one after another. The gap that matters is orders of
+// magnitude, not milliseconds: concurrent tool calls from one model turn
+// land sub-millisecond apart, while a genuinely sequential second call
+// waits for the first to come back — seconds. Anything in between is rare
+// enough that calling it concurrent costs nothing.
+const SIMULTANEOUS_MS = 250;
+
+function startedTogether(node: ThreadTreeNode): boolean {
+  const times = node.children
+    .map((c) => (c.created_at ? Date.parse(c.created_at) : NaN))
+    .filter((t) => !Number.isNaN(t));
+  if (times.length < 2) return false;
+  return Math.max(...times) - Math.min(...times) <= SIMULTANEOUS_MS;
 }
 
 async function renderCallChain(soukUrl: string, forThreadId: string): Promise<void> {
@@ -280,8 +310,10 @@ async function renderCallChain(soukUrl: string, forThreadId: string): Promise<vo
       container.classList.remove("has-chain");
       return;
     }
-    const stops = flattenRoute(root);
-    const stopHtml = stops
+    const routes = routesToLeaves(root);
+    const fannedOut = startedTogether(root);
+    const renderRoute = (stops: ThreadTreeNode[]): string =>
+      stops
       .map((node, i) => {
         const name = escapeHtml(node.agent_name);
         // Name the stall only where the walk actually crosses into it.
@@ -300,9 +332,17 @@ async function renderCallChain(soukUrl: string, forThreadId: string): Promise<vo
           node.provider_key
         )}"><span class="dot"></span>${name}${at}</span>`;
       })
-      .join("");
+        .join("");
+    const label =
+      routes.length === 1
+        ? "call chain for this reply"
+        : fannedOut
+          ? `call chains for this reply · ${routes.length} sent at once`
+          : `call chains for this reply · ${routes.length}`;
     container.classList.add("has-chain");
-    container.innerHTML = `<div class="chain-label">call chain for this reply</div><div class="route">${stopHtml}</div>`;
+    container.innerHTML =
+      `<div class="chain-label">${label}</div>` +
+      routes.map((stops) => `<div class="route">${renderRoute(stops)}</div>`).join("");
   } catch {
     // Best-effort UI sugar — a failed fetch here shouldn't disrupt the
     // chat itself, which already succeeded by the time this runs.
