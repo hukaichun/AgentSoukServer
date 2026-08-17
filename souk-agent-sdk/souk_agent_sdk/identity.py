@@ -22,7 +22,11 @@ import time
 from pathlib import Path
 
 import jwt
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
 
 # Deliberately more generous than SIGNATURE_FRESHNESS_WINDOW_SECONDS
 # used elsewhere (60s) — an actor chain is typically built once at the
@@ -50,6 +54,32 @@ def public_key_hex(private_key: Ed25519PrivateKey) -> str:
 
 def sign(private_key: Ed25519PrivateKey, payload: bytes) -> str:
     return private_key.sign(payload).hex()
+
+
+def verify_signature(public_key_hex: str, signature_hex: str, payload: bytes) -> bool:
+    """Did the holder of this public key sign these bytes?
+
+    The verifying half, needed here because this side now checks a
+    signature too: souk proves itself when a socket opens (see
+    `client._check_souk_identity`). souk core publishes the same function,
+    but this package deliberately does not depend on core — a provider
+    should not need souk's database layer installed to be a provider — and
+    this is four lines against `cryptography`, which is already a
+    dependency.
+
+    False rather than raising, for every way it can fail: a malformed key,
+    a malformed signature and a signature that simply does not verify are
+    the same answer to the only question being asked, and a caller that
+    had to catch three exception types to learn "no" would eventually
+    catch two.
+    """
+    try:
+        Ed25519PublicKey.from_public_bytes(bytes.fromhex(public_key_hex)).verify(
+            bytes.fromhex(signature_hex), payload
+        )
+        return True
+    except (InvalidSignature, ValueError):
+        return False
 
 
 def registration_signing_payload(agent_names: list[str], timestamp: int) -> bytes:

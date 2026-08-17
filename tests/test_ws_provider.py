@@ -31,8 +31,14 @@ import pytest
 from httpx_ws import WebSocketDisconnect, aconnect_ws
 from httpx_ws.transport import ASGIWebSocketTransport
 
+from souk.config import CoreSettings
+from souk.core import Souk
+from souk.identity import verify_signature
 from souk_server import ws_provider
+from souk_server.handshake import souk_challenge_payload
 from souk_server.server import create_app
+
+from tests.conftest import DATABASE_URL
 
 RECEIVE_TIMEOUT = 2.0
 
@@ -74,8 +80,21 @@ def _connect(client: httpx.AsyncClient, **kwargs):
 
 
 async def _handshake(ws, identity, names: list[str], **hello_extra) -> _Socket:
+    """All four frames, the way a real provider does them.
+
+    The hello is serialized once and that exact text is what the proof
+    signs a digest of — re-encoding the dict here would be the test
+    agreeing with itself while disagreeing with the wire.
+    """
     socket = _Socket(ws)
-    await socket.send(identity.hello(names, **hello_extra))
+    hello = identity.hello(names, **hello_extra)
+    hello_raw = json.dumps(hello)
+    await ws.send_text(hello_raw)
+
+    challenge = await socket.recv()
+    assert challenge["type"] == "challenge", challenge
+    await socket.send(identity.proof(hello_raw, hello["nonce"], challenge["nonce"]))
+
     assert (await socket.recv()) == {"type": "welcome"}
     return socket
 
@@ -104,39 +123,149 @@ async def _claimed(souk, run_id: str) -> None:
 # --- the signed handshake ---------------------------------------------------
 
 
-async def test_a_signature_over_the_connect_payload_opens_the_socket(souk, register):
+async def test_a_mutual_challenge_response_opens_the_socket(souk, register):
     served = await register("greeter")
     async with _provider_client(souk) as client:
         async with _connect(client) as ws:
             await _handshake(ws, served.identity, ["greeter"])
 
 
-async def test_nothing_bearer_shaped_is_accepted_in_its_place(souk, register):
-    """There is no token track any more, so the frame that used to be a
-    complete, valid hello — a session token and a list of ids — is now just
-    a hello with no signature in it."""
+async def test_souk_signs_the_provider_nonce_before_the_provider_signs_anything(souk, register):
+    """The order is the security property, not an implementation detail: a
+    provider must be able to walk away from a souk it does not recognise
+    *before* producing anything worth stealing. So the challenge — souk's
+    own key, and its signature over the nonce we chose — has to arrive
+    while this side has still sent nothing but a nonce."""
     served = await register("greeter")
     async with _provider_client(souk) as client:
         async with _connect(client) as ws:
-            await ws.send_text(
-                json.dumps({"type": "hello", "token": "looks-like-auth", "agentNames": ["greeter"]})
+            socket = _Socket(ws)
+            hello = served.identity.hello(["greeter"])
+            await ws.send_text(json.dumps(hello))
+
+            challenge = await socket.recv()
+
+            assert challenge["type"] == "challenge"
+            assert challenge["soukPublicKey"] == souk.identity_public_key
+            assert verify_signature(
+                challenge["soukPublicKey"],
+                challenge["signature"],
+                souk_challenge_payload(hello["nonce"], challenge["nonce"]),
+            )
+
+
+async def test_a_captured_handshake_does_not_open_a_second_socket(souk, register):
+    """The defect this replaced, asserted as a property rather than
+    assumed gone. Every frame of a complete, successful handshake is
+    replayed verbatim onto a fresh connection — which is exactly what
+    anything that observed one holds — and it must not attach.
+
+    Under the old self-signed shape this passed: the provider composed its
+    own statement, so a copy of it worked for whoever held it, for the
+    whole freshness window.
+    """
+    served = await register("greeter")
+    async with _provider_client(souk) as client:
+        async with _connect(client) as ws:
+            socket = _Socket(ws)
+            hello_raw = json.dumps(served.identity.hello(["greeter"]))
+            await ws.send_text(hello_raw)
+            challenge = await socket.recv()
+            proof = served.identity.proof(
+                hello_raw, json.loads(hello_raw)["nonce"], challenge["nonce"]
+            )
+            await socket.send(proof)
+            assert (await socket.recv()) == {"type": "welcome"}
+
+        # Same hello, same proof, a new connection. souk chooses a new
+        # nonce, so the recorded proof answers a question nobody asked.
+        async with _connect(client) as ws:
+            socket = _Socket(ws)
+            await ws.send_text(hello_raw)
+            replayed_challenge = await socket.recv()
+            assert replayed_challenge["nonce"] != challenge["nonce"]
+            await socket.send(proof)
+            with pytest.raises(WebSocketDisconnect) as excinfo:
+                await ws.receive_text(timeout=RECEIVE_TIMEOUT)
+            assert excinfo.value.code == 1008
+
+
+async def test_the_proof_is_bound_to_the_claims_the_hello_made(souk, register):
+    """`sha256(hello)` is inside what the provider signs, so the claims
+    cannot be edited in flight. Here the hello on the wire asks for two
+    agents while the proof was computed over a hello asking for one —
+    which is what a middlebox adding an agent name would produce."""
+    served = await register("greeter", "translator")
+    honest = served.identity.hello(["greeter"])
+    honest_raw = json.dumps(honest)
+    tampered_raw = json.dumps({**honest, "agentNames": ["greeter", "translator"]})
+
+    async with _provider_client(souk) as client:
+        async with _connect(client) as ws:
+            socket = _Socket(ws)
+            await ws.send_text(tampered_raw)
+            challenge = await socket.recv()
+            # Signed over the hello that was *not* sent.
+            await socket.send(
+                served.identity.proof(honest_raw, honest["nonce"], challenge["nonce"])
             )
             with pytest.raises(WebSocketDisconnect) as excinfo:
                 await ws.receive_text(timeout=RECEIVE_TIMEOUT)
             assert excinfo.value.code == 1008
 
 
+async def test_a_souk_signature_cannot_be_presented_as_a_provider_proof(souk, register):
+    """What the `souk:`/`provider:` prefixes are for. Both sides sign the
+    same two nonces; without the prefixes the two payloads would differ
+    only by a trailing digest, and a souk that could be induced to sign
+    would be handing out material for the other direction."""
+    served = await register("greeter")
+    async with _provider_client(souk) as client:
+        async with _connect(client) as ws:
+            socket = _Socket(ws)
+            hello = served.identity.hello(["greeter"])
+            await ws.send_text(json.dumps(hello))
+            challenge = await socket.recv()
+            await socket.send({"type": "proof", "signature": challenge["signature"]})
+            with pytest.raises(WebSocketDisconnect) as excinfo:
+                await ws.receive_text(timeout=RECEIVE_TIMEOUT)
+            assert excinfo.value.code == 1008
+
+
+async def test_a_souk_without_an_identity_says_so_rather_than_failing(register):
+    """An unconfigured souk cannot prove itself, which is what every souk
+    did before this existed. It reports that honestly — a null key, no
+    signature — and leaves the decision to the provider, whose pin is the
+    thing that turns it into a refusal."""
+    unconfigured = Souk(CoreSettings(database_url=DATABASE_URL, token_signing_secret="x"))
+    assert unconfigured.identity_public_key is None
+    served = await register("greeter")
+    async with httpx.AsyncClient(
+        transport=ASGIWebSocketTransport(app=create_app(unconfigured))
+    ) as client:
+        async with _connect(client) as ws:
+            socket = _Socket(ws)
+            await ws.send_text(json.dumps(served.identity.hello(["greeter"])))
+            challenge = await socket.recv()
+            assert challenge["soukPublicKey"] is None
+            assert challenge["signature"] is None
+
+
 @pytest.mark.parametrize(
     "mangle",
     [
-        pytest.param(lambda h: {**h, "signature": "00" * 64}, id="signature-does-not-verify"),
-        pytest.param(lambda h: {**h, "timestamp": int(time.time()) - 86400}, id="stale-timestamp"),
+        pytest.param(lambda h: {k: v for k, v in h.items() if k != "version"}, id="no-version"),
+        pytest.param(lambda h: {**h, "version": 99}, id="unsupported-version"),
         pytest.param(lambda h: {**h, "agentNames": []}, id="no-agent-names"),
         pytest.param(lambda h: {k: v for k, v in h.items() if k != "publicKey"}, id="no-public-key"),
+        pytest.param(lambda h: {k: v for k, v in h.items() if k != "nonce"}, id="no-nonce"),
         pytest.param(lambda h: {"type": "event", "runId": "x"}, id="anything-before-hello"),
     ],
 )
-async def test_a_bad_handshake_closes_the_socket(souk, register, mangle):
+async def test_a_bad_hello_closes_the_socket_before_souk_signs_anything(souk, register, mangle):
+    """Refused at the hello, which is *before* souk produces a signature —
+    so a malformed frame can never make souk sign over bytes an attacker
+    chose."""
     served = await register("greeter")
     async with _provider_client(souk) as client:
         async with _connect(client) as ws:
@@ -146,29 +275,69 @@ async def test_a_bad_handshake_closes_the_socket(souk, register, mangle):
             assert excinfo.value.code == 1008
 
 
-async def test_a_name_this_key_never_registered_is_refused_at_the_door(souk, register):
-    """Registration is the prerequisite and core enforces it, so the socket
-    closes here rather than the agent being advertised and served by
-    nobody. The signature is perfectly valid — it covers the name being
-    claimed, which is exactly the claim being rejected."""
+async def test_the_old_two_frame_handshake_is_refused_by_name(souk, register):
+    """A hard cutover, and the error says which side is behind. A provider
+    on the old shape sends no `version` at all, so it cannot be told apart
+    from a corrupt frame by anything except that absence — and a bare
+    signature failure is what an attack looks like too, which would send
+    whoever is debugging it somewhere unhelpful."""
     served = await register("greeter")
     async with _provider_client(souk) as client:
         async with _connect(client) as ws:
-            await ws.send_text(json.dumps(served.identity.hello(["greeter", "smuggled"])))
+            await ws.send_text(
+                json.dumps(
+                    {
+                        "type": "hello",
+                        "publicKey": served.public_key,
+                        "signature": "00" * 64,
+                        "timestamp": int(time.time()),
+                        "agentNames": ["greeter"],
+                    }
+                )
+            )
+            with pytest.raises(WebSocketDisconnect) as excinfo:
+                await ws.receive_text(timeout=RECEIVE_TIMEOUT)
+            assert excinfo.value.code == 1008
+            assert "version" in excinfo.value.reason
+
+
+@pytest.mark.parametrize(
+    "bad_proof",
+    [
+        pytest.param({"type": "proof", "signature": "00" * 64}, id="does-not-verify"),
+        pytest.param({"type": "proof"}, id="no-signature"),
+        pytest.param({"type": "welcome"}, id="wrong-frame"),
+    ],
+)
+async def test_a_bad_proof_closes_the_socket(souk, register, bad_proof):
+    served = await register("greeter")
+    async with _provider_client(souk) as client:
+        async with _connect(client) as ws:
+            socket = _Socket(ws)
+            await ws.send_text(json.dumps(served.identity.hello(["greeter"])))
+            await socket.recv()
+            await socket.send(bad_proof)
             with pytest.raises(WebSocketDisconnect) as excinfo:
                 await ws.receive_text(timeout=RECEIVE_TIMEOUT)
             assert excinfo.value.code == 1008
 
 
-async def test_a_signature_for_one_name_set_does_not_open_a_socket_for_another(souk, register):
-    """The names are inside what was signed, so a hello cannot claim a set
-    the signature did not cover — even when every name in it is one this
-    provider really registered."""
-    served = await register("greeter", "translator")
-    hello = served.identity.hello(["greeter"])
+async def test_a_name_this_key_never_registered_is_refused_at_the_door(souk, register):
+    """Registration is the prerequisite and core enforces it, so the socket
+    closes here rather than the agent being advertised and served by
+    nobody. The handshake itself is perfectly valid — the proof covers the
+    names being claimed, which is exactly the claim being rejected."""
+    served = await register("greeter")
     async with _provider_client(souk) as client:
         async with _connect(client) as ws:
-            await ws.send_text(json.dumps({**hello, "agentNames": ["greeter", "translator"]}))
+            socket = _Socket(ws)
+            hello = served.identity.hello(["greeter", "smuggled"])
+            hello_raw = json.dumps(hello)
+            await ws.send_text(hello_raw)
+            challenge = await socket.recv()
+            await socket.send(
+                served.identity.proof(hello_raw, hello["nonce"], challenge["nonce"])
+            )
             with pytest.raises(WebSocketDisconnect) as excinfo:
                 await ws.receive_text(timeout=RECEIVE_TIMEOUT)
             assert excinfo.value.code == 1008

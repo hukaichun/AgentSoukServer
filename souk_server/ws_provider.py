@@ -17,28 +17,39 @@ says so, and souk keeps the run.
 Two things the inversion deleted rather than moved. Liveness is no longer
 a heartbeat — `online` is `is_serving`, so being attached *is* being
 online and a socket that drops takes its agents offline at once. And
-there is no session token: the hello frame is signed by the provider's
-own key, so nothing bearer-shaped exists to leak or to expire underneath
-a long-lived connection.
+there is no session token: nothing bearer-shaped exists to leak or to
+expire underneath a long-lived connection.
+
+Opening the socket is a mutual challenge-response — four frames, both
+sides signing bytes the other chose. See `handshake.py` for the payloads
+and for what the self-signed assertion it replaced could not do.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, WebSocket
 
 from souk.errors import AgentNotFound
-from souk.identity import is_timestamp_fresh, verify_signature
+from souk.identity import verify_signature
 from souk.models import AgentRef
 from souk_provider_sdk import SoukConnection
+from souk_server.handshake import (
+    HANDSHAKE_VERSION,
+    new_nonce,
+    provider_proof_payload,
+    souk_challenge_payload,
+)
 from souk_server.ws_common import (
     POLICY_VIOLATION,
     close_frame,
     parse_frame,
+    receive_frame,
     receive_hello,
     write_loop,
 )
@@ -63,23 +74,6 @@ ACK_TIMEOUT_SECONDS = 30.0
 # attached for. The condition it catches is rare and permanent, so
 # noticing it a minute late costs nothing — see `_watch_registration`.
 OWNERSHIP_RECHECK_SECONDS = 120.0
-
-
-def connect_signing_payload(public_key: str, agent_names: list[str], timestamp: int) -> bytes:
-    """What a provider signs to open a socket.
-
-    Deliberately *not* `souk.identity.registration_signing_payload`, even
-    though it covers the same facts: reusing it would make a captured
-    registration signature replayable as a connection, and within the
-    freshness window that is someone else's runs delivered to you. The
-    prefix is what keeps the two apart.
-
-    The format is this gateway's, not core's — signing a socket open is a
-    serving act, and souk supplies only the primitives it is built from
-    (`verify_signature`, `is_timestamp_fresh`).
-    """
-    names = ",".join(sorted(agent_names))
-    return f"souk-provider-connect:{public_key}:{names}:{timestamp}".encode()
 
 
 class SocketProvider(SoukConnection):
@@ -219,13 +213,28 @@ async def _watch_registration(
         return
 
 
-def _bearer_free_hello_error(hello: dict[str, Any]) -> str | None:
+def _hello_error(hello: dict[str, Any]) -> str | None:
+    """What a hello must carry to be worth challenging.
+
+    Checked before souk signs anything, so an unparseable frame cannot
+    make it produce a signature over attacker-chosen bytes. The version is
+    first because a provider on the old two-frame shape has no `version`
+    at all, and saying so by name is far more use than the bad-signature
+    error it would otherwise get — which is what an attack looks like too.
+    """
+    version = hello.get("version")
+    if version != HANDSHAKE_VERSION:
+        if version is None:
+            return (
+                "hello has no version: this souk speaks handshake "
+                f"v{HANDSHAKE_VERSION}, a mutual challenge-response. Upgrade "
+                "souk-agent-sdk."
+            )
+        return f"unsupported handshake version {version!r}; this souk speaks v{HANDSHAKE_VERSION}"
     if not isinstance(hello.get("publicKey"), str):
         return "hello needs a publicKey"
-    if not isinstance(hello.get("signature"), str):
-        return "hello needs a signature"
-    if not isinstance(hello.get("timestamp"), int):
-        return "hello needs an integer timestamp"
+    if not isinstance(hello.get("nonce"), str) or not hello["nonce"]:
+        return "hello needs a nonce"
     names = hello.get("agentNames")
     if not (isinstance(names, list) and names and all(isinstance(n, str) for n in names)):
         return "agentNames must be a non-empty list of strings"
@@ -235,31 +244,87 @@ def _bearer_free_hello_error(hello: dict[str, Any]) -> str | None:
     return None
 
 
+async def _prove_and_verify(
+    websocket: WebSocket, souk: "Souk", hello: dict[str, Any], hello_raw: str
+) -> bool:
+    """Frames two and three: souk answers the provider's nonce, then checks
+    the provider's answer to its own. True if the provider proved itself.
+
+    Closes the socket itself on every failure — there is exactly one way
+    past this function, which is what keeps a half-authenticated
+    connection from existing.
+
+    souk signs first, and that ordering is the point of the exchange
+    rather than an accident of it: a provider must be able to walk away
+    from a souk it does not recognise *before* it has produced anything
+    worth stealing. Signing second would mean handing a credential to
+    whatever answered the URL and only then asking who it was.
+
+    A souk with no identity configured cannot sign, and says so by sending
+    a challenge with `soukPublicKey: null` rather than by failing. That is
+    an honest report of today's deployment, and it is the provider's to
+    act on — one that pinned a key refuses; one that pinned nothing is no
+    worse off than it was before this existed.
+    """
+    souk_nonce = new_nonce()
+    provider_nonce = hello["nonce"]
+    souk_public_key = souk.identity_public_key
+    challenge: dict[str, Any] = {
+        "type": "challenge",
+        "soukPublicKey": souk_public_key,
+        "nonce": souk_nonce,
+        "signature": (
+            souk.sign(souk_challenge_payload(provider_nonce, souk_nonce))
+            if souk_public_key is not None
+            else None
+        ),
+    }
+    if souk_public_key is None:
+        logger.warning(
+            "this souk has no identity, so provider %s cannot tell it from any other — "
+            "set SOUK_IDENTITY_PRIVATE_KEY",
+            hello["publicKey"][:16],
+        )
+    await websocket.send_text(json.dumps(challenge))
+
+    proof = await receive_frame(websocket)
+    if proof is None or proof.get("type") != "proof":
+        await websocket.close(code=POLICY_VIOLATION, reason="expected a proof frame")
+        return False
+    signature = proof.get("signature")
+    if not isinstance(signature, str):
+        await websocket.close(code=POLICY_VIOLATION, reason="proof needs a signature")
+        return False
+    if not verify_signature(
+        hello["publicKey"],
+        signature,
+        provider_proof_payload(provider_nonce, souk_nonce, hello_raw),
+    ):
+        await websocket.close(code=POLICY_VIOLATION, reason="proof does not verify")
+        return False
+    return True
+
+
 @router.websocket("/ws/provider")
 async def provider_socket(websocket: WebSocket) -> None:
     souk: "Souk" = websocket.app.state.souk
 
     await websocket.accept()
-    hello = await receive_hello(websocket)
-    if hello is None:
+    received = await receive_hello(websocket)
+    if received is None:
         return
+    hello, hello_raw = received
 
-    problem = _bearer_free_hello_error(hello)
+    problem = _hello_error(hello)
     if problem:
         await websocket.close(code=POLICY_VIOLATION, reason=problem)
         return
 
+    if not await _prove_and_verify(websocket, souk, hello, hello_raw):
+        return
+
     public_key = hello["publicKey"]
     agent_names = hello["agentNames"]
-    timestamp = hello["timestamp"]
-    if not is_timestamp_fresh(timestamp):
-        await websocket.close(code=POLICY_VIOLATION, reason="stale connect timestamp")
-        return
-    if not verify_signature(
-        public_key, hello["signature"], connect_signing_payload(public_key, agent_names, timestamp)
-    ):
-        await websocket.close(code=POLICY_VIOLATION, reason="connect signature does not verify")
-        return
 
     outbound: asyncio.Queue = asyncio.Queue()
     provider = SocketProvider(public_key, outbound, hello.get("maxConcurrentRuns"))
