@@ -27,6 +27,12 @@ souk-agent-sdk = { path = "../../souk-agent-sdk" }
 [project.scripts]
 pydantic-ai-agent = "pydantic_ai_agent.main:run"
 
+[dependency-groups]
+dev = ["pytest>=8.3", "pytest-asyncio>=0.24"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

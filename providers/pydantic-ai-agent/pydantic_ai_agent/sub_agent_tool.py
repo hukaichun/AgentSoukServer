@@ -40,13 +40,24 @@ class AgentDeps:
     # without one is still allowed, just unattributed.
     actor_chain: list[str] | None = None
     # sub_agent name -> the real contextId (A2A) souk returned on that
-    # sub-agent's most recent call within this run. souk never reuses a
-    # callee thread implicitly (see souk/repo.py's ensure_thread
-    # docstring: lineage via referenceTaskIds and session continuity are
-    # deliberately orthogonal) — a repeated call to the same sub-agent
-    # within one main-agent run wants to keep talking to the same
-    # sub-thread, so this call site has to opt in explicitly, the
-    # standard A2A way, by passing back what it was given last time.
+    # sub-agent's most recent call. souk never reuses a callee thread
+    # implicitly (see souk/repo.py's ensure_thread docstring: lineage via
+    # referenceTaskIds and session continuity are deliberately
+    # orthogonal), so this call site opts in explicitly, the standard A2A
+    # way, by passing back what it was given last time.
+    #
+    # **Scoped to the parent conversation, not to one run.** It used to be
+    # built fresh per run, which meant a second turn of the same
+    # conversation reached the sub-agent on a brand-new thread: the same
+    # scribe, asked to follow up on a letter it had written an hour
+    # earlier, met a stranger with one message. Nobody had noticed because
+    # nothing had asked the sub-agent what it remembered — the moment
+    # `thread_history_limit` did, the callee's thread turned out to be one
+    # message long every single time, by construction.
+    #
+    # `main.py` supplies this dict, keyed by the parent thread, so the two
+    # facts line up: one conversation up here is one conversation down
+    # there.
     sub_agent_context_ids: dict[str, str] = field(default_factory=dict)
 
 
