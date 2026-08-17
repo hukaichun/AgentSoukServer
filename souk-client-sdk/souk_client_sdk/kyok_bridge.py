@@ -17,8 +17,21 @@ The transport is one WebSocket to the gateway's `/ws/kyok`, held for the
 run's whole duration: souk pushes each `completionRequest` down it, and
 this bridge streams the real LLM's chunks back as frames on the same
 socket, multiplexed by requestId — concurrent completions just interleave.
-The `sessionId` sent in `hello` is the same locally-minted routing key the
-old `/kyok/poll` query carried; souk still neither mints nor verifies it.
+The `sessionId` sent in `hello` is minted here, locally — souk neither
+issues nor verifies one, it takes whichever first appears and routes by
+it. **So knowing it is the entire proof**, which is why `open()` mints 128
+bits of `secrets` rather than anything guessable or derived.
+
+It is sent here and nowhere else, and that is the fix rather than the
+design: souk used to put this id verbatim inside the KYOK token it gave
+every provider, and a token is signed rather than sealed. Any provider
+could decode its own, open this socket under the caller's session, and be
+handed another provider's completion — a prompt to read and an answer to
+write, which is injected tool input for whatever acts on it. Core now puts
+`session_routing_key(id)`, a SHA-256, in the token instead, and derives
+the same key from whatever a bridge presents. This side is unchanged
+because this side is the one holding the preimage.
+
 An answer is only accepted on the socket its request was delivered to, so
 a reconnect starts fresh: completions in flight on a dead socket are
 failed by souk immediately rather than retried here.

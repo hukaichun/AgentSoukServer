@@ -14,6 +14,16 @@ agents:
       - name: translate
         description: Translate text between any language pair, plainly and quickly.
         tags: [language, translation, everyday, plain]
+    # Keep Your Own Key (docs/keep-your-own-key.md): when a caller runs
+    # its own bridge and offers to pay, this agent routes that run's LLM
+    # calls through souk's /kyok/v1 relay instead of `model` above. A
+    # caller without a bridge is unaffected — Zahra pays, as always.
+    #
+    # On this agent because it is the one where the story is obvious: a
+    # visitor with their own key wanting a page translated should be able
+    # to pay for their own page. It is also what makes KYOK live in the
+    # demo market rather than only in the tests.
+    use_kyok: true
     system_prompt: >
       You translate. The visitor gives you text; you give back the same
       text in the language they asked for, and nothing else — no notes on
