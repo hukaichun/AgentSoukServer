@@ -29,6 +29,8 @@ so nothing here needs to re-resolve to notice.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import httpx
 
 from pydantic_ai_agent.config import SubAgentConfig
@@ -38,6 +40,27 @@ class SubAgentUnresolvable(Exception):
     """Said in words a model can relay: these end up in front of one."""
 
 
+@dataclass(frozen=True)
+class Address:
+    """Where a sub-agent is, and who it is.
+
+    Both halves, deliberately, because the answer is consumed twice: the
+    URL to call, and the identity to *say* — a delegation is reported live
+    on the caller's own event stream, and a report naming only a name
+    cannot be told apart from a report about somebody else's agent of the
+    same name. Returning a bare URL was how that got lost the first time.
+
+    `provider` is None only for an explicit `a2a_url` that does not look
+    like one of this gateway's pair routes — an agent on another souk, or
+    behind something else. Unknown is said as None rather than guessed.
+    """
+
+    url: str
+    provider: str | None = None
+    provider_key: str | None = None
+    agent_name: str | None = None
+
+
 async def _roster(souk_http_url: str) -> list[dict]:
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.get(f"{souk_http_url.rstrip('/')}/agents")
@@ -45,15 +68,29 @@ async def _roster(souk_http_url: str) -> list[dict]:
     return resp.json()["agents"]
 
 
-async def resolve_a2a_url(sub: SubAgentConfig, souk_http_url: str) -> str:
-    """The A2A JSON-RPC endpoint for this sub-agent.
+def _address_from_url(url: str) -> Address:
+    """Read the pair back out of an explicit URL, when it has one.
+
+    A `.../a2a/{provider}/{name}/rpc` written by hand names an agent just
+    as well as a resolved one does, and a caller who wrote it should not
+    lose the identity in their own progress events for having been
+    explicit. Anything else keeps its URL and admits it knows no pair.
+    """
+    parts = url.rstrip("/").split("/")
+    if len(parts) >= 4 and parts[-1] == "rpc" and parts[-4] == "a2a":
+        return Address(url=url, provider=parts[-3], agent_name=parts[-2])
+    return Address(url=url)
+
+
+async def resolve_address(sub: SubAgentConfig, souk_http_url: str) -> Address:
+    """Where this sub-agent is, and who it is.
 
     An explicit `a2a_url` wins and is not looked up at all — that is the
     escape hatch for an agent on a *different* souk, or one reached through
     something other than this gateway.
     """
     if sub.a2a_url:
-        return sub.a2a_url
+        return _address_from_url(sub.a2a_url)
 
     wanted = sub.agent or sub.name
     base = souk_http_url.rstrip("/")
@@ -78,10 +115,15 @@ async def resolve_a2a_url(sub: SubAgentConfig, souk_http_url: str) -> str:
             f"Set `provider:` on this sub_agent to say which one is meant."
         )
     row = candidates[0]
-    return f"{base}/a2a/{row['fingerprint']}/{row['name']}/rpc"
+    return Address(
+        url=f"{base}/a2a/{row['fingerprint']}/{row['name']}/rpc",
+        provider=row["fingerprint"],
+        provider_key=row["provider_key"],
+        agent_name=row["name"],
+    )
 
 
-class ResolvedURL:
+class ResolvedAddress:
     """One sub-agent's address, resolved at most once per process.
 
     Failures are not cached: a name that was not listed yet is very likely
@@ -92,9 +134,9 @@ class ResolvedURL:
     def __init__(self, sub: SubAgentConfig, souk_http_url: str) -> None:
         self._sub = sub
         self._souk_http_url = souk_http_url
-        self._url: str | None = None
+        self._address: Address | None = None
 
-    async def get(self) -> str:
-        if self._url is None:
-            self._url = await resolve_a2a_url(self._sub, self._souk_http_url)
-        return self._url
+    async def get(self) -> Address:
+        if self._address is None:
+            self._address = await resolve_address(self._sub, self._souk_http_url)
+        return self._address
