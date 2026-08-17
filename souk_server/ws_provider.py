@@ -33,9 +33,11 @@ from fastapi import APIRouter, WebSocket
 
 from souk.errors import AgentNotFound
 from souk.identity import is_timestamp_fresh, verify_signature
+from souk.models import AgentRef
 from souk_provider_sdk import SoukConnection
 from souk_server.ws_common import (
     POLICY_VIOLATION,
+    close_frame,
     parse_frame,
     receive_hello,
     write_loop,
@@ -56,6 +58,11 @@ router = APIRouter()
 # the same policy in two places and let them drift; deleting it would
 # leave a wait with no bound at all if souk ever offers without one.
 ACK_TIMEOUT_SECONDS = 30.0
+
+# How often a live socket re-asks whether souk still lists the agents it
+# attached for. The condition it catches is rare and permanent, so
+# noticing it a minute late costs nothing — see `_watch_registration`.
+OWNERSHIP_RECHECK_SECONDS = 120.0
 
 
 def connect_signing_payload(public_key: str, agent_names: list[str], timestamp: int) -> bytes:
@@ -161,6 +168,57 @@ class SocketProvider(SoukConnection):
         self._acks.clear()
 
 
+async def _watch_registration(
+    souk: "Souk", public_key: str, agent_names: list[str], outbound: asyncio.Queue
+) -> None:
+    """Close this socket if souk stops listing every agent it serves.
+
+    souk checks registration once, when the provider attaches, and the
+    broker then holds the mapping in memory. So a registration that
+    disappears *underneath* a live socket — a restored database, a
+    de-listing, a souk redeployed against a fresh one — leaves the broker
+    serving an agent souk's own roster no longer has. Nothing can route to
+    it, because addressing it needs a row that is gone; nothing complains,
+    because the socket is fine. A healthy container and an invisible agent,
+    indefinitely.
+
+    That is the same failure the retired claim loop had, and it survived
+    the inversion rather than being fixed by it: `claim_work` used to
+    filter unowned ids and carry on, which was correct in itself and left
+    a worker looping forever against agents that no longer existed.
+    Observed once already — a database restored under a running provider
+    left it invisible for half an hour, with one server-side warning per
+    cycle and nothing at all on its own side.
+
+    Closing is the repair, not a punishment. Registration is what puts the
+    name back and the SDK re-registers on every reconnect, so a provider
+    told goodbye here comes back listed. Only when *every* name has gone:
+    losing one of several is a de-listing somebody meant, and the socket
+    still has work to do for the rest.
+
+    Asked per name through `get_agent`, which takes the pair and therefore
+    answers the ownership half by itself. It could not before — an
+    `agent_id` did not carry its owner, so the old version of this had to
+    scan the whole roster to ask the same question.
+    """
+    refs = [AgentRef(provider_key=public_key, name=name) for name in agent_names]
+    while True:
+        await asyncio.sleep(OWNERSHIP_RECHECK_SECONDS)
+        listed = [ref for ref in refs if await souk.get_agent(ref) is not None]
+        if listed:
+            continue
+        logger.warning(
+            "provider %s is attached for agent(s) souk no longer lists (%s) — "
+            "closing so its reconnect re-registers",
+            public_key[:16],
+            agent_names,
+        )
+        outbound.put_nowait(
+            close_frame(POLICY_VIOLATION, "souk no longer lists these agents; re-register")
+        )
+        return
+
+
 def _bearer_free_hello_error(hello: dict[str, Any]) -> str | None:
     if not isinstance(hello.get("publicKey"), str):
         return "hello needs a publicKey"
@@ -227,6 +285,9 @@ async def provider_socket(websocket: WebSocket) -> None:
         return
 
     writer = asyncio.create_task(write_loop(websocket, outbound))
+    watcher = asyncio.create_task(
+        _watch_registration(souk, public_key, agent_names, outbound)
+    )
     try:
         while True:
             frame = await websocket.receive()
@@ -258,6 +319,7 @@ async def provider_socket(websocket: WebSocket) -> None:
         # `online` is `is_serving`, so there is no window where souk still
         # advertises an agent whose socket has gone.
         await souk.detach_provider(public_key)
-        writer.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await writer
+        for task in (watcher, writer):
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task

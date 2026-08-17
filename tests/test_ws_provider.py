@@ -31,6 +31,7 @@ import pytest
 from httpx_ws import WebSocketDisconnect, aconnect_ws
 from httpx_ws.transport import ASGIWebSocketTransport
 
+from souk_server import ws_provider
 from souk_server.server import create_app
 
 RECEIVE_TIMEOUT = 2.0
@@ -390,3 +391,41 @@ async def test_a_frame_for_a_run_this_identity_does_not_hold_gets_an_error_frame
             frame = await socket.recv()
             assert frame["type"] == "error"
             assert frame["runId"] == "run_nobody"
+
+
+# --- a registration that vanishes under a live socket -----------------------
+
+
+async def test_a_provider_whose_agents_vanished_is_closed_so_it_re_registers(
+    souk, register, client, monkeypatch
+):
+    """The failure PR #4 fixed, checked against the new design rather than
+    assumed dead with the claim loop.
+
+    It is not dead. souk validates registration once, at `attach_provider`,
+    and the broker then holds the mapping in memory — so a registration that
+    disappears underneath a live socket (a restored database, a de-listing, a
+    souk redeployed against a fresh one) leaves the broker serving an agent
+    souk's own roster no longer lists. Nothing routes to it, because
+    `resolve_ref` cannot find it; nothing complains, because the socket is
+    fine. A healthy container, an invisible agent, indefinitely — which is
+    exactly the shape of the original incident.
+
+    Closing is the repair, not a punishment: registration is what puts the
+    name back, the SDK re-registers on every reconnect, so a provider told
+    goodbye here returns listed.
+    """
+    monkeypatch.setattr(ws_provider, "OWNERSHIP_RECHECK_SECONDS", 0.05)
+    served = await register("greeter")
+    async with _provider_client(souk) as ws_client:
+        async with _connect(ws_client) as ws:
+            socket = await _handshake(ws, served.identity, ["greeter"])
+            assert (await client.get("/agents")).json()["agents"][0]["online"] is True
+
+            async with souk.engine.begin() as conn:
+                await conn.exec_driver_sql("DELETE FROM agents")
+            assert (await client.get("/agents")).json()["agents"] == []
+
+            with pytest.raises(WebSocketDisconnect) as excinfo:
+                await socket._ws.receive_text(timeout=RECEIVE_TIMEOUT)
+            assert excinfo.value.code == 1008
