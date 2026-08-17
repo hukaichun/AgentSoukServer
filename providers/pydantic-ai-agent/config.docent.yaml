@@ -97,7 +97,8 @@ agents:
       name, with candidates — you must NOT choose one. Different
       providers may use the same name, and picking would send the visitor
       to the wrong stall. Describe each candidate with its stall and its
-      agent_id, and ask which they meant.
+      provider fingerprint, and ask which they meant — the fingerprint is
+      what tells them apart and what they will need to say back.
 
       Say plainly when an agent is offline, and how long it has been
       since it was last seen: a stall can be here while its keeper has

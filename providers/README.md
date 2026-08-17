@@ -27,12 +27,26 @@ rather than growing `/agent-template` — that one stays deliberately minimal.
 
 ## Pinning a sub-agent delegation target
 
-`pydantic-ai-agent/config.example.yaml`'s `sub_agents[].a2a_url` points at a
-name-based route (e.g. `http://souk:8000/a2a/translator/rpc`) — fine for the
-bundled demo, where there's no risk of another provider registering the same
-name. souk agent names aren't unique or reserved, though (any identity may
-register any name — see souk's README, "Provider identity"): a production
-delegation that must reach one *specific* provider, not "whichever agent
-currently owns this name", should target `/a2a/id/{agent_id}/rpc` instead —
-the `agent_id` returned in that provider's own `/agents/register` response
-(also logged on startup by `souk_agent_sdk.SoukProvider.register`).
+A sub-agent is declared by name — `- name: scribe` — and the address is
+resolved from the roster on first delegation. The finished URL cannot be
+written in a config file: it contains the *callee's* key fingerprint, which
+does not exist until that provider has started once and written its key.
+
+Names are not unique or reserved: any identity may register any name (see
+souk's README, "Provider identity"), and the demo market has two stalls
+each keeping a `translator` on purpose. When a name resolves to more than
+one, the delegation is **refused, naming both stalls** — never guessed,
+because guessing is how a caller reaches an agent it never meant to. Say
+which one with `provider:`, taking the fingerprint or the full public key
+from any roster row:
+
+```yaml
+sub_agents:
+  - name: translator          # the tool the model sees: call_translator
+    agent: translator         # who it reaches, if that differs
+    provider: 77e2e50fded4ff48
+```
+
+`a2a_url:` remains as an escape hatch for a complete URL used verbatim and
+never looked up — an agent on a *different* souk, or one reached through
+something other than this gateway.

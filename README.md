@@ -98,7 +98,15 @@ Two supported terminations — pick one, but off-localhost you need one:
 docker compose up --build
 ```
 
-brings up the stack: **paradedb** (Postgres), **souk-migrate** (one-shot `alembic upgrade head`, then exits), **souk** (the gateway, after migration completes), and **docent** (the guide at the gate — needs `.env` with LLM credentials; see `.env.example`). The migration is deliberately its own service — DDL runs with different credentials than the DML-only role the server needs; the gateway never creates tables at startup.
+brings up the stack: **paradedb** (Postgres), **souk-migrate** (one-shot `alembic upgrade head`, then exits), **souk** (the gateway, after migration completes), and **docent** (the guide at the gate — needs `.env` with LLM credentials; see `.env.example`).
+
+For a market with something in it, add the demo profile:
+
+```bash
+docker compose --profile demo up --build
+```
+
+which opens three more stalls beside the docent — **Zahra's Tongues** (a plain translator and a haggler), **Yusuf's Workshop** (a poetry translator and a scribe) and **The Midnight Tea House** (a storyteller). Six agents, four stalls, two of them with more than one agent and one with only one; Zahra's and Yusuf's both call their translator `translator`, so the ambiguous-name path is live rather than theoretical; and the haggler delegates across stalls to Yusuf's scribe, which shows up as real lineage under `GET /threads/{id}/tree`. The migration is deliberately its own service — DDL runs with different credentials than the DML-only role the server needs; the gateway never creates tables at startup.
 
 Building the image requires the submodule checked out (`git clone --recurse-submodules`) — `scripts/` and `souk/` are COPYed from it.
 
