@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -60,21 +59,25 @@ POLL_WAIT_SECONDS = 25.0
 class _Relay:
     """One in-flight completion's answer path: the same
     `KyokAdapter.respond` call the HTTP endpoint made, fed frame by frame
-    instead of by a request body. `respond` consumes NDJSON lines and
-    already understands `{"error": ...}` as "fail this completion", so
-    frames translate to lines and nothing about the relay's semantics —
-    incremental consumption, the done sentinel, error short-circuit — is
-    reimplemented here.
+    instead of by a request body. `respond` takes chunks and already
+    understands `{"error": ...}` as "fail this completion", so nothing
+    about the relay's semantics — incremental consumption, the done
+    sentinel, error short-circuit — is reimplemented here.
+
+    Chunks, not NDJSON. This used to serialise each frame and hand
+    `respond` the bytes so it could parse them straight back, with no
+    network in between: framing invented in order to be undone one call
+    away. Core changed the port and the encoding drops out.
     """
 
     def __init__(self, souk: "Souk", request_id: str) -> None:
         self.request_id = request_id
-        self._queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+        self._queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
         self._task = asyncio.create_task(self._run(souk))
 
     async def _run(self, souk: "Souk") -> None:
         try:
-            await KyokAdapter(souk).respond(self.request_id, self._lines())
+            await KyokAdapter(souk).respond(self.request_id, self._chunks())
         except KyokRejected as e:
             # The completion is already gone — timed out waiting (see
             # CLAIM_TIMEOUT_SECONDS) or abandoned. Nothing to route the
@@ -82,23 +85,23 @@ class _Relay:
             # request_id gets an error frame (alive() below).
             logger.info("kyok ws relay %s: %s", self.request_id, e)
 
-    async def _lines(self):
-        while (line := await self._queue.get()) is not None:
-            yield line
+    async def _chunks(self):
+        while (chunk := await self._queue.get()) is not None:
+            yield chunk
 
     def alive(self) -> bool:
         return not self._task.done()
 
-    def feed(self, message: Any) -> None:
-        self._queue.put_nowait(json.dumps(message).encode() + b"\n")
+    def feed(self, message: dict[str, Any]) -> None:
+        self._queue.put_nowait(message)
 
     def finish(self) -> None:
         self._queue.put_nowait(None)
 
     async def abandon(self) -> None:
         """The socket died mid-answer. A truncated answer must fail the
-        completion, not complete it — feed the error line `respond` treats
-        as exactly that, then let the task drain."""
+        completion, not complete it — feed the error chunk `respond`
+        treats as exactly that, then let the task drain."""
         if self.alive():
             self.feed({"error": "kyok bridge disconnected mid-response"})
             self.finish()

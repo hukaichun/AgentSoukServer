@@ -3,6 +3,22 @@ name = "souk-server"
 version = "0.1.0"
 description = "The reference souk gateway: AG-UI + A2A over HTTP, and the WebSocket relays providers and KYOK bridges connect out to"
 requires-python = ">=3.12"
+# AGPL-3.0, and for a gateway that is the choice with teeth. Every other
+# strong copyleft licence is satisfied by never shipping a binary, which
+# is exactly what running a server is — §13 is the clause that closes it:
+# someone who modifies this and lets people talk to it over a network owes
+# them the modified source, whether or not they ever distribute a copy.
+#
+# souk core is Apache-2.0 upstream and stays that way. Apache-2.0 is
+# one-way compatible with (A)GPLv3, so an AGPL work may include it; the
+# reverse is not true, which is why the licence lives on this side of the
+# boundary and not upstream.
+#
+# See LICENSE. The SDKs in this repo are a separate question — a library a
+# third party links into their own agent is not a server, and AGPL there
+# would oblige every provider author to publish their agent.
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
 # Not for an index. This package depends on souk core by bare name,
 # resolvable only through the [tool.uv.sources] path below (the AgentSouk
 # submodule) — uploaded anywhere, that name would resolve to whatever a
@@ -41,11 +57,20 @@ souk-server = "souk_server.server:main"
 [tool.uv.sources]
 souk = { path = "AgentSouk/souk", editable = true }
 souk-provider-sdk = { path = "AgentSouk/souk-provider-sdk", editable = true }
+# Dev only, and only for one test. Every KYOK test in this repo writes the
+# signing payload out by hand — deliberately, so a change to core's is
+# caught by a disagreement rather than propagated by a shared helper — but
+# that independence also means none of them would go red if
+# `KyokSigningAuth`, the object a real provider attaches to its OpenAI
+# client, drifted from core. One test using the shipped signer against the
+# real app closes that, and this is what it costs.
+souk-agent-sdk = { path = "souk-agent-sdk", editable = true }
 
 # httpx drives the ASGI app in tests without binding a port; httpx-ws does
 # the same for the two WebSocket relays.
 [dependency-groups]
 dev = [
+    "souk-agent-sdk",
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
     "httpx>=0.27",

@@ -14,6 +14,7 @@ plain HTTP; that endpoint is deliberately untouched.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import time
@@ -31,7 +32,7 @@ RECEIVE_TIMEOUT = 2.0
 
 def _kyok_headers(bearer: str, private_key, body: bytes) -> dict:
     timestamp = str(int(time.time()))
-    payload = f"{bearer}:{timestamp}:{hashlib.sha256(body).hexdigest()}".encode()
+    payload = f"souk-kyok-call:{bearer}:{timestamp}:{hashlib.sha256(body).hexdigest()}".encode()
     return {
         "Authorization": f"Bearer {bearer}",
         "X-Souk-Kyok-Timestamp": timestamp,
@@ -377,3 +378,76 @@ async def test_a_dropped_socket_fails_its_in_flight_completions_fast(
         }
     finally:
         souk.broker.forget(run_id)
+
+
+# --- the session id is not in the token -------------------------------------
+
+
+async def test_a_provider_cannot_reach_the_bridge_session_with_what_its_token_carries(
+    souk, register
+):
+    """The vulnerability this socket had, inverted into a test.
+
+    A KYOK token is signed, not sealed — base64 JSON any holder can decode —
+    and it used to carry the caller's bridge `sessionId` verbatim. So a
+    provider could read it out of its own token, open this socket under that
+    session, and be handed *another* provider's completion: its prompt to
+    read, and its answer to write, which is injected tool input for whatever
+    agent acts on the answer. Two runs of one caller sharing a bridge session
+    was all it took.
+
+    Core now puts `session_routing_key(session_id)` — a SHA-256 — in the token
+    instead, and `KyokAdapter.poll` derives the key from the id the bridge
+    presents. So the bridge, which holds the preimage, still works, and this
+    socket is unchanged: it keeps passing whatever `hello` said.
+
+    This tries every string a provider can obtain — each token field, and the
+    token itself — and asserts that none of them is served, while the real
+    bridge is. It goes red if the core fix is reverted.
+    """
+    run_id, session_id = "run_squat", "sess_squat"
+    served, token = await _live(register, souk, run_id, session_id)
+    body = json.dumps({"messages": [{"role": "user", "content": "the caller's secret"}]}).encode()
+
+    claims = json.loads(base64.urlsafe_b64decode(token.split(".")[0]))
+    # Everything the provider can see, plus the whole token. The session id
+    # itself is deliberately *not* in this list — that is the point.
+    guesses = [token, *(str(v) for v in claims.values() if isinstance(v, (str, int)))]
+    assert session_id not in guesses, "the token still carries the session id verbatim"
+
+    async with _client(souk) as client:
+
+        async def provider_call():
+            resp = await client.post(
+                "/kyok/v1/chat/completions",
+                content=body,
+                headers=_kyok_headers(token, served.identity._key, body),
+            )
+            return resp.json()
+
+        async def squatters_get_nothing():
+            for guess in guesses:
+                async with aconnect_ws("http://test/ws/kyok", client) as ws:
+                    squatter = _Bridge(ws)
+                    await squatter.hello(guess)
+                    # No work for anyone who guessed. A real session would
+                    # be handed the completion within a poll cycle.
+                    with pytest.raises(TimeoutError):
+                        await ws.receive_text(timeout=0.4)
+
+        async def the_real_bridge():
+            async with aconnect_ws("http://test/ws/kyok", client) as ws:
+                bridge = _Bridge(ws)
+                await bridge.hello(session_id)
+                request = await bridge.recv()
+                assert request["type"] == "completionRequest"
+                await bridge.answer(
+                    request["requestId"],
+                    [_chunk(content="only the bridge", role="assistant", finish_reason="stop")],
+                )
+
+        await squatters_get_nothing()
+        result, _ = await asyncio.gather(provider_call(), the_real_bridge())
+
+    assert result["choices"][0]["message"]["content"] == "only the bridge"
+    souk.broker.forget(run_id)

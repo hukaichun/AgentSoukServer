@@ -28,6 +28,8 @@ from collections.abc import Generator
 import httpx
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from souk_provider_sdk.identity import kyok_call_payload
+
 from souk_agent_sdk.identity import sign
 
 
@@ -45,9 +47,14 @@ class KyokSigningAuth(httpx.Auth):
 
     def auth_flow(self, request: httpx.Request) -> Generator[httpx.Request, httpx.Response, None]:
         token = request.headers.get("authorization", "").removeprefix("Bearer ")
-        timestamp = str(int(time.time()))
+        timestamp = int(time.time())
         body_hash = hashlib.sha256(request.content).hexdigest()
-        payload = f"{token}:{timestamp}:{body_hash}".encode()
-        request.headers["X-Souk-Kyok-Timestamp"] = timestamp
+        # From souk_provider_sdk rather than spelled out here. What a
+        # provider signs is that package's statement to make, and this one
+        # is only the socket around it — written out a second time, the
+        # operation prefix is a thing to forget, which is exactly what it
+        # was before core added one.
+        payload = kyok_call_payload(token, timestamp, body_hash)
+        request.headers["X-Souk-Kyok-Timestamp"] = str(timestamp)
         request.headers["X-Souk-Kyok-Signature"] = sign(self._private_key, payload)
         yield request
