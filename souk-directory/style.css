@@ -594,3 +594,119 @@ a {
     border-bottom: 1px solid var(--line);
   }
 }
+
+/* ---- the market view (map.html)
+   Exploratory: see src/map.ts. Shares every token with the list, because
+   the point of the comparison is that only the *shape* differs. */
+
+.market-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.market {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 340px;
+  gap: 1rem;
+  align-items: start;
+}
+@media (max-width: 900px) {
+  .market { grid-template-columns: minmax(0, 1fr); }
+}
+
+.market-map {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--paper-raised);
+  padding: 0.5rem;
+  overflow: hidden;
+}
+.market-map svg { width: 100%; height: auto; display: block; }
+
+.map-note {
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  color: var(--ink-soft);
+  padding: 0.35rem 0.5rem 0.1rem;
+  min-height: 1.4em;
+}
+
+/* A stall is a place. The box is deliberately plain — the information is
+   in *where* it is, and decoration would compete with that. */
+.stall-box {
+  fill: var(--paper);
+  stroke: var(--line);
+  stroke-width: 1;
+}
+.stall-sign {
+  font-family: var(--sans);
+  font-size: 13px;
+  font-weight: 600;
+  fill: var(--ink);
+}
+.stall-fp {
+  font-family: var(--mono);
+  font-size: 10px;
+  fill: var(--ink-soft);
+}
+
+.person { cursor: pointer; }
+.person-name {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  fill: var(--ink);
+}
+.person-dot { fill: var(--sage); }
+/* Shut, not gone: the stall stays on the map with its sign and its goods,
+   and only the keeper is absent. */
+.person.away .person-dot { fill: none; stroke: var(--line); stroke-width: 1.5; }
+.person.away .person-name { fill: var(--ink-soft); }
+.person:hover .person-name { fill: var(--brass-ink); }
+
+/* Motion while the run is in flight — the thing a strip drawn afterwards
+   cannot show at all. Two concurrent delegations are two of these, leaving
+   at the same moment. */
+.walker { transition: transform 1.1s ease-in-out; }
+.walker circle { fill: var(--brass); opacity: 0.85; }
+
+/* The finished shape, drawn from the tree rather than from the guesses. */
+.edge {
+  stroke: var(--brass);
+  stroke-width: 1.5;
+  stroke-dasharray: 4 3;
+  opacity: 0.7;
+}
+/* A hop that never left the stall: real, but with no distance to draw. */
+.edge-inplace {
+  fill: none;
+  stroke: var(--brass);
+  stroke-width: 1.5;
+  stroke-dasharray: 3 3;
+  opacity: 0.6;
+}
+
+.market-side {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--paper-raised);
+  padding: 0.85rem;
+  min-height: 320px;
+}
+.side-name { font-weight: 600; }
+.side-stall {
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  color: var(--ink-soft);
+  word-break: break-all;
+  margin: 0.15rem 0 0.4rem;
+}
+.side-log {
+  max-height: 340px;
+  overflow-y: auto;
+  margin: 0.6rem 0;
+}
+.side-form { display: flex; gap: 0.4rem; }
+.side-form input { flex: 1; min-width: 0; }

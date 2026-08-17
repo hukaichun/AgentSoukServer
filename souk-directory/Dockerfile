@@ -11,7 +11,7 @@ RUN npm run build
 
 FROM python:3.12-slim
 WORKDIR /app
-COPY index.html agent.html style.css ./
+COPY index.html agent.html map.html style.css ./
 COPY --from=build /app/dist ./dist
 EXPOSE 8080
 CMD ["python", "-m", "http.server", "8080"]

@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "typecheck": "tsc",
-    "build": "npm run typecheck && esbuild src/index.ts src/agent.ts --bundle --splitting --format=esm --outdir=dist"
+    "build": "npm run typecheck && esbuild src/index.ts src/agent.ts src/map.ts --bundle --splitting --format=esm --outdir=dist"
   },
   "devDependencies": {
     "esbuild": "^0.28.1",
