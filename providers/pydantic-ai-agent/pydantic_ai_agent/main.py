@@ -24,6 +24,7 @@ from souk_agent_sdk.identity import load_or_create_identity, new_actor_chain, pu
 
 from pydantic_ai_agent.config import AgentConfig, load_config
 from pydantic_ai_agent.souk_tools import build_souk_tools
+from pydantic_ai_agent.history import SoukAccess, with_thread_history
 from pydantic_ai_agent.sub_agent_tool import AgentDeps, build_sub_agent_tools
 
 logger = logging.getLogger("pydantic_ai_agent")
@@ -101,7 +102,21 @@ def build_pydantic_agent(cfg: AgentConfig, souk_http_url: str) -> Agent:
     )
 
 
-def make_run_stream(agent: Agent, signing_key, souk_http_url: str, use_kyok: bool = False):
+def make_run_stream(
+    agent: Agent,
+    signing_key,
+    souk_http_url: str,
+    use_kyok: bool = False,
+    souk: SoukAccess | None = None,
+    thread_history_limit: int | None = None,
+):
+    # parent thread_id -> {sub_agent name: contextId}. Process-local and
+    # unbounded, which is the right trade for a provider: the alternative
+    # is asking souk on every delegation for something this side already
+    # knows, and an entry is two short strings. A provider serving a very
+    # long-lived souk would want an LRU here.
+    sub_threads: dict[str, dict[str, str]] = {}
+
     async def run_stream(run_input: dict[str, Any]) -> AsyncIterator[dict[str, Any]]:
         # `combined` is where the AG-UI adapter's own events AND any
         # sub-agent CUSTOM progress events (pushed by tools via AgentDeps)
@@ -110,6 +125,10 @@ def make_run_stream(agent: Agent, signing_key, souk_http_url: str, use_kyok: boo
         # run_input is a real AG-UI RunAgentInput JSON dict from souk (see
         # souk.agui.build_run_agent_input) — camelCase wire keys.
         combined: asyncio.Queue = asyncio.Queue()
+        # Before anything reads `run_input`: what the caller sent may be
+        # one message on a long conversation, and only souk knows which.
+        if souk is not None:
+            run_input = await with_thread_history(run_input, souk, thread_history_limit)
         # Built fresh per run, not once at startup — chains are
         # short-lived (souk_agent_sdk.identity.ACTOR_CHAIN_TTL_SECONDS),
         # a process that lives longer than that would otherwise hand
@@ -122,6 +141,11 @@ def make_run_stream(agent: Agent, signing_key, souk_http_url: str, use_kyok: boo
             thread_id=run_input.get("threadId"),
             run_id=run_input.get("runId"),
             actor_chain=actor_chain,
+            # Per parent conversation, not per run — see AgentDeps. One
+            # conversation with this agent is one conversation with each
+            # of its sub-agents, which is what a person would assume and
+            # what a fresh dict per run quietly denied.
+            sub_agent_context_ids=sub_threads.setdefault(run_input.get("threadId"), {}),
         )
 
         kyok_model = resolve_kyok_model(run_input, souk_http_url, signing_key) if use_kyok else None
@@ -165,6 +189,9 @@ async def main() -> None:
     identity_key_path = os.environ.get("SOUK_IDENTITY_KEY_PATH", "souk_identity.key")
     signing_key = load_or_create_identity(identity_key_path)
 
+    # Filled once the provider exists — see SoukAccess for why the
+    # ordering forces a holder rather than an argument.
+    souk_access = SoukAccess()
     handles = []
     for agent_cfg in cfg.agents:
         agent = build_pydantic_agent(agent_cfg, cfg.souk_http_url)
@@ -179,7 +206,12 @@ async def main() -> None:
                     **({"skills": agent_cfg.skills} if agent_cfg.skills else {}),
                 },
                 run_stream=make_run_stream(
-                    agent, signing_key, cfg.souk_http_url, use_kyok=agent_cfg.use_kyok
+                    agent,
+                    signing_key,
+                    cfg.souk_http_url,
+                    use_kyok=agent_cfg.use_kyok,
+                    souk=souk_access,
+                    thread_history_limit=agent_cfg.thread_history_limit,
                 ),
             )
         )
@@ -199,6 +231,9 @@ async def main() -> None:
         # not check.
         souk_public_key=os.environ.get("SOUK_PUBLIC_KEY") or None,
     )
+    # The provider *is* the link (SoukLink covers both directions), so this
+    # is what gives every agent above a way to ask souk what it holds.
+    souk_access.link = provider
     await provider.run_forever()
 
 

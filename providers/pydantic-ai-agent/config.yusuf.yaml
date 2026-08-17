@@ -38,6 +38,17 @@ agents:
       Turns a rambling account into a clean letter. Dictate the mess;
       the scribe returns something you would be willing to sign.
     model: custom-openai
+    # Reached over A2A, by Zahra's haggler. `message/send` carries a
+    # single message, so without this the scribe meets a stranger on every
+    # call — on a thread it has been writing on all afternoon.
+    #
+    # "Everyone else is reached over AG-UI and their clients resend the
+    # history" is what this comment said, and it was wrong. `SoukClient`
+    # sends the new message only; the thread is souk's to remember. So
+    # every conversational agent here wants this, and the ones that do not
+    # are the single-shot ones (translate this, tell me a tale) where
+    # there is nothing to carry.
+    thread_history_limit: 20
     skills:
       - name: draft-letter
         description: Turn spoken rambling or rough notes into a clean, signable letter.

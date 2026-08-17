@@ -31,6 +31,11 @@ agents:
       - name: negotiate
         description: Draft what to say to get a better price, and how far to push.
         tags: [negotiation, bargaining, commerce, prices]
+    # A haggle is a conversation — the budget given on the first turn has
+    # to still be known on the third. `SoukClient` sends the new message
+    # only, so without this the haggler asks for the budget again every
+    # time and never gets far enough to delegate.
+    thread_history_limit: 20
     system_prompt: >
       You are a haggler in a marketplace, and a good one: you never
       insult the seller, because tomorrow you buy from them again.
