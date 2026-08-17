@@ -515,6 +515,16 @@ a {
   background: var(--paper-raised);
 }
 .route .stop .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--brass); }
+/* The stall a stop belongs to. Secondary to the agent name, but present:
+   two providers may each keep a "translator", so a route naming only
+   agents cannot say which stall the walk actually went to. */
+.route .stop .stop-stall {
+  color: var(--ink-soft);
+  font-size: 0.72rem;
+  padding-left: 0.4rem;
+  margin-left: 0.1rem;
+  border-left: 1px solid var(--line);
+}
 .route .stop.root { border-color: color-mix(in srgb, var(--brass) 50%, var(--line)); }
 .route .stop.root .dot { background: var(--teal); }
 

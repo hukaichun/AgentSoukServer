@@ -21,9 +21,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from souk_server.config import ServingSettings
 from souk.core import Souk
+from souk.errors import AgentNotFound
+from souk.models import AgentRef
 from souk.errors import (
     AgentNotFound,
-    AmbiguousAgentName,
     InvalidRegistration,
     ProviderFingerprintTaken,
     InvalidRunInput,
@@ -58,7 +59,6 @@ _STATUS = {
     AgentNotFound: 404,
     ThreadNotFound: 404,
     RunNotFound: 404,
-    AmbiguousAgentName: 409,
     ThreadOwnershipMismatch: 409,
     ProviderFingerprintTaken: 409,
     InvalidRegistration: 401,
@@ -68,25 +68,7 @@ _STATUS = {
 
 
 def _detail(exc: Exception) -> object:
-    """A display name is not exclusive across identities, so several matches
-    is a normal outcome the caller has to resolve — answered with the
-    candidates and the unambiguous route to retry against, rather than a bare
-    message it can do nothing with."""
-    if isinstance(exc, AmbiguousAgentName):
-        return {
-            "error": f"multiple agents are registered under the name '{exc.name}'",
-            "retry_with": "/agui/id/{agent_id} or /a2a/id/{agent_id}/...",
-            "candidates": [
-                {
-                    "name": c["name"],
-                    "agent_id": c["agent_id"],
-                    "public_key_prefix": c["public_key"][:12],
-                    "joined_at": c["joined_at"].isoformat(),
-                    "description": c["agent_card"].get("description", ""),
-                }
-                for c in exc.candidates
-            ],
-        }
+    """Some errors carry more than their message is worth."""
     if isinstance(exc, ThreadNotFound):
         return f"thread '{exc}' not found"
     if isinstance(exc, InvalidActorChain):
@@ -111,3 +93,16 @@ def install_error_handlers(app: FastAPI) -> None:
 
     for error_type in (*_STATUS, KyokRejected, SoukError):
         app.add_exception_handler(error_type, handle)
+
+
+async def resolve_ref(souk: Souk, provider: str, name: str) -> AgentRef:
+    """Turn a `(provider, name)` path pair into the agent it addresses.
+
+    `provider` may be the full public key or its 16-hex fingerprint —
+    core tells them apart by length, so one path segment takes either and
+    a URL can stay short without giving up the unambiguous form.
+    """
+    found = await souk.resolve_agent(provider, name)
+    if found is None:
+        raise AgentNotFound(f"no agent '{name}' under provider '{provider}'")
+    return AgentRef(provider_key=found["provider_key"], name=found["name"])

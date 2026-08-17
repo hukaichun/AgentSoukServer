@@ -1,24 +1,25 @@
-"""WS /ws/provider: the worker relay, per docs/server-mode.md.
+"""WS /ws/provider: the socket a provider connects out on.
 
-This file is transport and nothing else — the third carrier for the same
-three-call worker port (claim_work / report_event / finish_run) plus a
-cancel push, after in-process and gRPC. What a run *means* lives in core;
-this file frames JSON text messages onto one duplex socket and hands
-everything else to `Souk`.
+This file is transport and nothing else. souk states the provider
+contract itself now (`souk_provider_sdk`), and `broker.ConnectedProvider`
+is the whole of what souk needs to know about anybody: who you are, how
+to hand you a run, how to ask you to stop one. `SocketProvider` below is
+that, with a WebSocket underneath — the gateway's half of a contract
+whose other half is `souk_provider_sdk.ProviderRuntime`, running behind
+the same socket in souk-agent-sdk.
 
-The inversion the gRPC servicer performed is kept, but moves further in:
-under gRPC the *SDK* drove PollForWork; here the server drives the claim
-loop on the worker's behalf, pushing what it claims. The worker's whole
-vocabulary is the frame table in docs/server-mode.md — `hello` in, then
-`run`/`cancel`/`error` down and `event`/`finish` up.
+**souk hands work over; it does not ask for it.** There is no claim loop
+here any more, on either side: the broker finds whoever serves an agent
+and offers each run, `deliver` writes it to the wire, and the ack frame
+that comes back is the return value. Declining is how a full provider
+says so, and souk keeps the run.
 
-Nothing here keeps per-run state, for the same reason the gRPC file
-didn't: every frame names its run, core holds the only routing table, and
-a dropped socket therefore ends nothing — the worker reconnects (a fresh
-`hello`) and reports the rest. The one piece of connection state that
-does exist, the in-flight claim budget, is deliberately per-socket: it is
-flow control for *this* connection's pushes, not an account of what the
-worker holds.
+Two things the inversion deleted rather than moved. Liveness is no longer
+a heartbeat — `online` is `is_serving`, so being attached *is* being
+online and a socket that drops takes its agents offline at once. And
+there is no session token: the hello frame is signed by the provider's
+own key, so nothing bearer-shaped exists to leak or to expire underneath
+a long-lived connection.
 """
 
 from __future__ import annotations
@@ -26,16 +27,15 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections import defaultdict
-from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, WebSocket
 
-from souk.errors import InvalidRegistration
-from souk.identity import verify_session_token
+from souk.errors import AgentNotFound
+from souk.identity import is_timestamp_fresh, verify_signature
+from souk.models import AgentRef
+from souk_provider_sdk import SoukConnection
 from souk_server.ws_common import (
-    INTERNAL_ERROR,
     POLICY_VIOLATION,
     close_frame,
     parse_frame,
@@ -50,268 +50,276 @@ logger = logging.getLogger("souk.ws_provider")
 
 router = APIRouter()
 
-# One cycle of the server-side claim loop: how long each claim_work call
-# long-polls before coming back empty. Also the liveness heartbeat — every
-# cycle marks this worker's agents seen, exactly as PollForWork did.
-CLAIM_WAIT_SECONDS = 25.0
+# A backstop, and deliberately longer than the deadline that actually
+# governs. souk wraps every offer in `RunBroker.deliver_timeout_seconds`
+# (5s) because it has one delivery loop and an offer that never returns
+# stops dispatch for everybody — so souk gives up first, and this never
+# fires in a souk that sets a deadline. Shortening it to "win" would put
+# the same policy in two places and let them drift; deleting it would
+# leave a wait with no bound at all if souk ever offers without one.
+ACK_TIMEOUT_SECONDS = 30.0
 
-# How often an idle socket re-checks that souk still lists the agents it
-# is claiming for. Deliberately slower than a claim cycle: the condition
-# it catches (a registration that vanished under a live socket — a
-# restored database, a de-listing, a souk redeployed against a fresh one)
-# is rare and permanent, so the cost of noticing it a minute late is
-# nothing, while checking every cycle would scan the roster per socket
-# per 25s for a question that is almost always the same.
+# How often a live socket re-asks whether souk still lists the agents it
+# attached for. The condition it catches is rare and permanent, so
+# noticing it a minute late costs nothing — see `_watch_registration`.
 OWNERSHIP_RECHECK_SECONDS = 120.0
 
 
-class WorkerSessions:
-    """Which connected providers souk can currently reach, by public key.
+def connect_signing_payload(public_key: str, agent_names: list[str], timestamp: int) -> bytes:
+    """What a provider signs to open a socket.
 
-    Transplanted from the gRPC servicer, and for the same single message —
-    "please stop run X" — because a cancel has to reach a *connection*, and
-    the claim that created the obligation may have happened on a socket
-    that is gone by the time souk asks. Keyed by identity rather than by
-    connection: both sockets of a provider running two processes (or one
-    briefly holding two across a reconnect) are the same provider, either
-    may hold the run, and asking both is harmless — a socket without the
-    run ignores the frame (the SDK drops frames for unknown run_ids).
+    Deliberately *not* `souk.identity.registration_signing_payload`, even
+    though it covers the same facts: reusing it would make a captured
+    registration signature replayable as a connection, and within the
+    freshness window that is someone else's runs delivered to you. The
+    prefix is what keeps the two apart.
+
+    The format is this gateway's, not core's — signing a socket open is a
+    serving act, and souk supplies only the primitives it is built from
+    (`verify_signature`, `is_timestamp_fresh`).
+    """
+    names = ",".join(sorted(agent_names))
+    return f"souk-provider-connect:{public_key}:{names}:{timestamp}".encode()
+
+
+class SocketProvider(SoukConnection):
+    """`broker.ConnectedProvider` with a socket underneath.
+
+    Subclasses the SDK's base rather than duck-typing the four members,
+    which is the point of that base existing: souk sizes a capacity
+    bucket from `max_concurrent_runs`, and a connection that forgets it
+    attaches perfectly well and then fails inside the broker. Here it
+    fails at construction instead.
+
+    Holds no per-run state beyond the acks it is waiting on: every frame
+    names its run, and souk keeps the only routing table.
     """
 
-    def __init__(self) -> None:
-        self._outbound: dict[str, set[asyncio.Queue]] = defaultdict(set)
+    def __init__(
+        self, public_key: str, outbound: asyncio.Queue, max_concurrent_runs: int | None
+    ) -> None:
+        self._public_key = public_key
+        self._max_concurrent_runs = max_concurrent_runs
+        self._outbound = outbound
+        self._acks: dict[str, asyncio.Future[bool]] = {}
 
-    def add(self, public_key: str, outbound: asyncio.Queue) -> None:
-        self._outbound[public_key].add(outbound)
+    @property
+    def public_key(self) -> str:
+        return self._public_key
 
-    def remove(self, public_key: str, outbound: asyncio.Queue) -> None:
-        self._outbound[public_key].discard(outbound)
-        if not self._outbound[public_key]:
-            del self._outbound[public_key]
+    @property
+    def max_concurrent_runs(self) -> int | None:
+        return self._max_concurrent_runs
 
-    def notify_cancel(self, public_key: str, run_id: str) -> None:
-        """Queue souk's cancel request for the wire. Best-effort by design:
-        returning says the request was queued, never that anything stopped —
-        the outcome is decided by what the run's stream does next."""
-        queues = self._outbound.get(public_key)
-        if not queues:
-            logger.info("cancel for run %s: no open socket for %s", run_id, public_key)
-            return
-        for outbound in queues:
-            outbound.put_nowait({"type": "cancel", "runId": run_id})
+    async def offer(self, run: Any) -> bool:
+        """Write this run to the wire and wait for the answer.
 
+        `offer` rather than `deliver`: the base class does the mapping
+        from souk's `ClaimedRun` to the SDK's `DeliveredRun`, which is
+        the one place either side's field names are allowed to appear.
+        A transport that overrode `deliver` would be naming souk's shape
+        again — which is exactly how the first provider to be handed a
+        run died, on `input_json`.
 
-def _bearer(websocket: WebSocket) -> str:
-    header = websocket.headers.get("authorization", "")
-    return header[len("Bearer ") :] if header.startswith("Bearer ") else header
-
-
-async def _still_owns_any(souk: "Souk", public_key: str, agent_ids: list[str]) -> bool:
-    """Does souk still list any of these agents under this key?
-
-    Asked through `list_agents` rather than a narrower lookup because the
-    roster is what "listed" means — the same view the registry, the
-    directory and the docent answer from — and because `get_agent` does
-    not carry the owning key, so it cannot answer the ownership half at
-    all. A market's worth of stalls is a cheap scan once every couple of
-    minutes per socket.
-    """
-    listed = {a.agent_id for a in await souk.list_agents() if a.public_key == public_key}
-    return bool(listed & set(agent_ids))
-
-
-async def _claim_loop(
-    souk: "Souk",
-    sessions: WorkerSessions,
-    token: str,
-    public_key: str,
-    agent_ids: list[str],
-    max_claim: int | None,
-    in_flight: set[str],
-    credit: asyncio.Event,
-    outbound: asyncio.Queue,
-) -> None:
-    """The server driving claim_work on the worker's behalf. Flow control
-    is the `maxClaim` budget, enforced where it always was — further runs
-    are claimed only while in-flight (claimed − finished, on this socket)
-    is under it. No credit frames; `finish` is the credit (the reader sets
-    `credit` when one arrives).
-    """
-    loop = asyncio.get_running_loop()
-    last_ownership_check = loop.time()
-    while True:
-        remaining = None
-        if max_claim is not None:
-            credit.clear()
-            # Re-check after clear, not before: a finish landing between
-            # the check and the clear must not be lost with the event.
-            remaining = max_claim - len(in_flight)
-            if remaining <= 0:
-                await credit.wait()
-                continue
+        Answering late is the same as declining, whichever deadline ran
+        out: the ack arrives for a run nobody is waiting on any more, and
+        `ack` drops it. souk keeps the run either way.
+        """
+        loop = asyncio.get_running_loop()
+        waiter: asyncio.Future[bool] = loop.create_future()
+        self._acks[run.run_id] = waiter
+        self._outbound.put_nowait(
+            {
+                "type": "run",
+                "runId": run.run_id,
+                "threadId": run.thread_id,
+                "agentName": run.agent_name,
+                "input": run.run_input,
+            }
+        )
         try:
-            runs = await souk.claim_work(
-                token,
-                agent_ids,
-                max_claim=remaining,
-                wait_seconds=CLAIM_WAIT_SECONDS,
-                on_cancel=partial(sessions.notify_cancel, public_key),
+            return await asyncio.wait_for(waiter, timeout=ACK_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "provider %s did not answer the offer of run %s in %.0fs — treating as declined",
+                self.public_key,
+                run.run_id,
+                ACK_TIMEOUT_SECONDS,
             )
-        except InvalidRegistration as e:
-            # The session token aged out under a long-lived socket. Close
-            # with policy — the SDK's reconnect re-registers, which is how
-            # tokens were always refreshed.
-            outbound.put_nowait(close_frame(POLICY_VIOLATION, str(e)))
-            return
-        except Exception:
-            logger.exception("claim loop for %s failed", public_key)
-            outbound.put_nowait(close_frame(INTERNAL_ERROR, "claim loop failed"))
-            return
+            return False
+        finally:
+            self._acks.pop(run.run_id, None)
 
-        # An idle cycle is the cheap moment to ask whether this socket is
-        # still claiming for agents souk knows about. `claim_work` filters
-        # unowned ids out and carries on — correct in itself, and the
-        # reason a worker can loop here forever against agents that no
-        # longer exist: it claims nothing, is touched by nothing, ages out
-        # of the roster, and reports no error, while its container sits
-        # there healthy. Observed, not imagined: a database restored
-        # under a running provider left it invisible for half an hour,
-        # logging one server-side warning per cycle and nothing at all on
-        # its own side.
-        #
-        # Closing is the repair, not the punishment: registering is what
-        # mints agent_ids, the SDK re-registers on every reconnect, so a
-        # worker that says goodbye here comes back owning its agents
-        # again. Same shape as the expired-token close below it.
-        if not runs and loop.time() - last_ownership_check >= OWNERSHIP_RECHECK_SECONDS:
-            last_ownership_check = loop.time()
-            if not await _still_owns_any(souk, public_key, agent_ids):
-                logger.warning(
-                    "worker %s claims for agent id(s) souk no longer lists (%s) — "
-                    "closing so its reconnect re-registers",
-                    public_key,
-                    agent_ids,
-                )
-                outbound.put_nowait(
-                    close_frame(
-                        POLICY_VIOLATION,
-                        "none of these agentIds are listed for this key; re-register",
-                    )
-                )
-                return
+    def ack(self, run_id: str, accepted: bool) -> None:
+        waiter = self._acks.get(run_id)
+        if waiter is not None and not waiter.done():
+            waiter.set_result(accepted)
 
-        for run in runs:
-            in_flight.add(run.run_id)
-            outbound.put_nowait(
-                {
-                    "type": "run",
-                    "runId": run.run_id,
-                    "threadId": run.thread_id,
-                    "agentId": run.agent_id,
-                    "input": run.run_input,
-                }
-            )
+    def cancel(self, run_id: str) -> None:
+        """Ask, and do not wait. souk decides the outcome from what the
+        run's stream does next, not from anything this returns."""
+        self._outbound.put_nowait({"type": "cancel", "runId": run_id})
+
+    def fail_pending(self) -> None:
+        """The socket is gone: nothing can answer these offers."""
+        for waiter in self._acks.values():
+            if not waiter.done():
+                waiter.set_result(False)
+        self._acks.clear()
+
+
+async def _watch_registration(
+    souk: "Souk", public_key: str, agent_names: list[str], outbound: asyncio.Queue
+) -> None:
+    """Close this socket if souk stops listing every agent it serves.
+
+    souk checks registration once, when the provider attaches, and the
+    broker then holds the mapping in memory. So a registration that
+    disappears *underneath* a live socket — a restored database, a
+    de-listing, a souk redeployed against a fresh one — leaves the broker
+    serving an agent souk's own roster no longer has. Nothing can route to
+    it, because addressing it needs a row that is gone; nothing complains,
+    because the socket is fine. A healthy container and an invisible agent,
+    indefinitely.
+
+    That is the same failure the retired claim loop had, and it survived
+    the inversion rather than being fixed by it: `claim_work` used to
+    filter unowned ids and carry on, which was correct in itself and left
+    a worker looping forever against agents that no longer existed.
+    Observed once already — a database restored under a running provider
+    left it invisible for half an hour, with one server-side warning per
+    cycle and nothing at all on its own side.
+
+    Closing is the repair, not a punishment. Registration is what puts the
+    name back and the SDK re-registers on every reconnect, so a provider
+    told goodbye here comes back listed. Only when *every* name has gone:
+    losing one of several is a de-listing somebody meant, and the socket
+    still has work to do for the rest.
+
+    Asked per name through `get_agent`, which takes the pair and therefore
+    answers the ownership half by itself. It could not before — an
+    `agent_id` did not carry its owner, so the old version of this had to
+    scan the whole roster to ask the same question.
+    """
+    refs = [AgentRef(provider_key=public_key, name=name) for name in agent_names]
+    while True:
+        await asyncio.sleep(OWNERSHIP_RECHECK_SECONDS)
+        listed = [ref for ref in refs if await souk.get_agent(ref) is not None]
+        if listed:
+            continue
+        logger.warning(
+            "provider %s is attached for agent(s) souk no longer lists (%s) — "
+            "closing so its reconnect re-registers",
+            public_key[:16],
+            agent_names,
+        )
+        outbound.put_nowait(
+            close_frame(POLICY_VIOLATION, "souk no longer lists these agents; re-register")
+        )
+        return
+
+
+def _bearer_free_hello_error(hello: dict[str, Any]) -> str | None:
+    if not isinstance(hello.get("publicKey"), str):
+        return "hello needs a publicKey"
+    if not isinstance(hello.get("signature"), str):
+        return "hello needs a signature"
+    if not isinstance(hello.get("timestamp"), int):
+        return "hello needs an integer timestamp"
+    names = hello.get("agentNames")
+    if not (isinstance(names, list) and names and all(isinstance(n, str) for n in names)):
+        return "agentNames must be a non-empty list of strings"
+    max_runs = hello.get("maxConcurrentRuns")
+    if max_runs is not None and not isinstance(max_runs, int):
+        return "maxConcurrentRuns must be an integer"
+    return None
 
 
 @router.websocket("/ws/provider")
 async def provider_socket(websocket: WebSocket) -> None:
     souk: "Souk" = websocket.app.state.souk
-    sessions: WorkerSessions = websocket.app.state.worker_sessions
 
-    # Dual-track auth (docs/server-mode.md): a header when the client can
-    # set one — which is also what lets an edge gate the handshake before
-    # accepting — the first frame when it can't. Accepting first is the
-    # hello track's cost; an embedder wanting pre-accept rejection puts a
-    # pure ASGI middleware in front (BaseHTTPMiddleware never sees
-    # websocket scopes).
     await websocket.accept()
     hello = await receive_hello(websocket)
     if hello is None:
         return
 
-    header_token = _bearer(websocket)
-    hello_token = hello.get("token") or ""
-    if header_token and hello_token and header_token != hello_token:
-        await websocket.close(code=POLICY_VIOLATION, reason="header and hello tokens differ")
-        return
-    token = hello_token or header_token
-    public_key = verify_session_token(token, souk.settings.token_signing_secret) if token else None
-    if public_key is None:
-        await websocket.close(code=POLICY_VIOLATION, reason="missing or invalid session token")
+    problem = _bearer_free_hello_error(hello)
+    if problem:
+        await websocket.close(code=POLICY_VIOLATION, reason=problem)
         return
 
-    agent_ids = hello.get("agentIds") or []
-    max_claim = hello.get("maxClaim")
-    if not (isinstance(agent_ids, list) and all(isinstance(a, str) for a in agent_ids)):
-        await websocket.close(code=POLICY_VIOLATION, reason="agentIds must be a list of strings")
+    public_key = hello["publicKey"]
+    agent_names = hello["agentNames"]
+    timestamp = hello["timestamp"]
+    if not is_timestamp_fresh(timestamp):
+        await websocket.close(code=POLICY_VIOLATION, reason="stale connect timestamp")
         return
-    if max_claim is not None and not isinstance(max_claim, int):
-        await websocket.close(code=POLICY_VIOLATION, reason="maxClaim must be an integer")
+    if not verify_signature(
+        public_key, hello["signature"], connect_signing_payload(public_key, agent_names, timestamp)
+    ):
+        await websocket.close(code=POLICY_VIOLATION, reason="connect signature does not verify")
         return
 
     outbound: asyncio.Queue = asyncio.Queue()
-    in_flight: set[str] = set()
-    credit = asyncio.Event()
-    sessions.add(public_key, outbound)
+    provider = SocketProvider(public_key, outbound, hello.get("maxConcurrentRuns"))
+    # Queued *before* attaching, and that is not cosmetic. Attaching is what
+    # makes this provider reachable, and the broker starts offering the
+    # moment it is — inside `attach_provider`'s own awaits. Queue the welcome
+    # afterwards and a provider with queued work receives a `run` frame as
+    # the first thing after its hello, which is not the handshake either
+    # side's docs describe: souk-agent-sdk reads exactly one frame, sees a
+    # run where it expected a welcome, raises, and reconnects into the same
+    # race forever.
+    #
+    # Nothing is written yet — the writer task starts below — so a failed
+    # attach still closes without ever sending this.
     outbound.put_nowait({"type": "welcome"})
+    try:
+        # Registration is the prerequisite, and core enforces it: a name
+        # this key never registered is refused here rather than being
+        # served by nobody later.
+        await souk.attach_provider(provider, agent_names)
+    except (AgentNotFound, ValueError) as e:
+        await websocket.close(code=POLICY_VIOLATION, reason=str(e))
+        return
 
     writer = asyncio.create_task(write_loop(websocket, outbound))
-    claimer = asyncio.create_task(
-        _claim_loop(
-            souk, sessions, token, public_key, agent_ids, max_claim, in_flight, credit, outbound
-        )
+    watcher = asyncio.create_task(
+        _watch_registration(souk, public_key, agent_names, outbound)
     )
     try:
         while True:
             frame = await websocket.receive()
             if frame["type"] == "websocket.disconnect":
                 break
-            parsed = await _parse_worker_frame(frame)
+            parsed = parse_frame(frame)
             if parsed is None:
                 outbound.put_nowait({"type": "error", "message": "unparseable frame"})
                 continue
-            ftype, run_id, event = parsed
-            if ftype == "event":
-                if run_id is None or not souk.report_event(run_id, event, claimed_by=public_key):
+            kind = parsed.get("type")
+            run_id = parsed.get("runId")
+            if kind == "ack":
+                provider.ack(run_id, bool(parsed.get("accepted", True)))
+            elif kind == "event":
+                if not souk.report_event(run_id, parsed.get("event"), claimed_by=public_key):
                     outbound.put_nowait(
-                        {"type": "error", "runId": run_id, "message": "event rejected: unknown run or not the claimer"}
+                        {"type": "error", "runId": run_id, "message": "event refused"}
                     )
-            elif ftype == "finish":
-                if run_id is None or not souk.finish_run(run_id, claimed_by=public_key):
+            elif kind == "finish":
+                if not souk.finish_run(run_id, claimed_by=public_key):
                     outbound.put_nowait(
-                        {"type": "error", "runId": run_id, "message": "finish rejected: unknown run or not the claimer"}
+                        {"type": "error", "runId": run_id, "message": "finish refused"}
                     )
-                # The budget only ever tracked this socket's claims: a
-                # finish for a run claimed on a previous connection is
-                # forwarded above but is not this socket's credit.
-                if run_id in in_flight:
-                    in_flight.discard(run_id)
-                    credit.set()
             else:
-                outbound.put_nowait(
-                    {"type": "error", "message": f"unknown frame type {ftype!r}"}
-                )
+                outbound.put_nowait({"type": "error", "message": f"unexpected frame {kind!r}"})
     finally:
-        claimer.cancel()
-        writer.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await claimer
-        with contextlib.suppress(asyncio.CancelledError):
-            await writer
-        sessions.remove(public_key, outbound)
-        # Deliberately nothing else: this socket going away is not evidence
-        # that the runs it carried have ended. The worker may reconnect and
-        # report them; one that is truly gone is caught by the stall sweep.
-
-
-async def _parse_worker_frame(message: dict[str, Any]) -> tuple[str, str | None, Any] | None:
-    """(type, runId, event) off one raw ASGI message, or None if it isn't
-    JSON text. Split out so the reader loop above stays about semantics."""
-    frame = parse_frame(message)
-    if frame is None:
-        return None
-    ftype = frame.get("type")
-    if not isinstance(ftype, str):
-        return None
-    run_id = frame.get("runId")
-    return ftype, run_id if isinstance(run_id, str) else None, frame.get("event")
+        provider.fail_pending()
+        # Detaching is what takes these agents offline, immediately —
+        # `online` is `is_serving`, so there is no window where souk still
+        # advertises an agent whose socket has gone.
+        await souk.detach_provider(public_key)
+        for task in (watcher, writer):
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task

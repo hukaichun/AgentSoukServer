@@ -89,7 +89,7 @@ def resolve_kyok_model(
 
 def build_pydantic_agent(cfg: AgentConfig, souk_http_url: str) -> Agent:
     toolsets = [MCPToolset(url) for url in cfg.mcp_servers]
-    tools = build_sub_agent_tools(cfg.sub_agents)
+    tools = build_sub_agent_tools(cfg.sub_agents, souk_http_url)
     if cfg.souk_tools:
         tools += build_souk_tools(souk_http_url)
     return Agent(

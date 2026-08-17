@@ -1,6 +1,6 @@
 // Shared helpers for souk-directory — a pure static browser client of a
-// souk's public HTTP API (GET /agents, POST /agui/id/{agent_id}, A2A agent
-// cards). No backend of its own.
+// souk's public HTTP API (GET /agents, POST /agui/{provider}/{name}, A2A
+// agent cards). No backend of its own.
 //
 // The souk base URL is a runtime parameter, never baked into the build
 // (see the project plan: this is the only hook worth building now for
@@ -18,38 +18,52 @@ import { EventSourceParserStream } from "eventsource-parser/stream";
 const SOUK_URL_KEY = "souk-directory:soukUrl";
 const DEFAULT_SOUK_URL = "http://localhost:8000";
 
+// An agent *is* `(provider_key, name)` — souk mints no id for anyone to
+// hold. `fingerprint` is that same identity in 16 hex, which is what goes
+// in a URL; `provider_key` is the thing to compare, since the fingerprint
+// is derived and never authoritative.
 export interface AgentRosterEntry {
-  agent_id: string;
+  provider_key: string;
+  fingerprint: string;
   name: string;
   description: string;
   skills: unknown[];
   joined_at: string;
   last_seen_at: string;
   online: boolean;
-  public_key: string;
   provider_name: string | null;
 }
 
-// Provider identity is purely the public_key (see souk/db.py's providers
-// table docstring) — provider_name is an optional label on top of it, not
-// a replacement. Groups a flat agent list into "who registered these."
+// Provider identity is purely the provider_key — provider_name is an
+// optional label on top of it, not a replacement. Groups a flat agent list
+// into "who registered these." The fingerprint rides along because every
+// link this page builds addresses a stall by it.
 export interface ProviderGroup {
-  publicKey: string;
+  providerKey: string;
+  fingerprint: string;
   providerName: string | null;
   agents: AgentRosterEntry[];
 }
 
-export function shortKey(publicKey: string): string {
-  return publicKey.length <= 14 ? publicKey : `${publicKey.slice(0, 8)}…${publicKey.slice(-6)}`;
+export function shortKey(providerKey: string): string {
+  return providerKey.length <= 14 ? providerKey : `${providerKey.slice(0, 8)}…${providerKey.slice(-6)}`;
 }
 
 export function groupByProvider(agents: AgentRosterEntry[]): ProviderGroup[] {
   const groups = new Map<string, ProviderGroup>();
   for (const agent of agents) {
-    let group = groups.get(agent.public_key);
+    // Keyed on provider_key, not fingerprint: the key is the identity and
+    // the fingerprint is a 16-hex digest of it, so grouping on the digest
+    // would be grouping on something derived.
+    let group = groups.get(agent.provider_key);
     if (!group) {
-      group = { publicKey: agent.public_key, providerName: agent.provider_name, agents: [] };
-      groups.set(agent.public_key, group);
+      group = {
+        providerKey: agent.provider_key,
+        fingerprint: agent.fingerprint,
+        providerName: agent.provider_name,
+        agents: [],
+      };
+      groups.set(agent.provider_key, group);
     }
     group.agents.push(agent);
   }
@@ -57,8 +71,8 @@ export function groupByProvider(agents: AgentRosterEntry[]): ProviderGroup[] {
   // ordered by key so the grouping is at least stable across reloads.
   return [...groups.values()].sort((a, b) => {
     if (!!a.providerName !== !!b.providerName) return a.providerName ? -1 : 1;
-    const an = a.providerName || a.publicKey;
-    const bn = b.providerName || b.publicKey;
+    const an = a.providerName || a.providerKey;
+    const bn = b.providerName || b.providerKey;
     return an.localeCompare(bn);
   });
 }
@@ -126,8 +140,8 @@ export async function fetchAgents(soukUrl: string): Promise<AgentRosterEntry[]> 
 }
 
 // Parses a POST'd EventSource-shaped stream (the browser's native
-// EventSource can't POST, and souk's /agui/id/{agent_id} requires a POST
-// body, so we still drive the fetch ourselves) via eventsource-parser
+// EventSource can't POST, and souk's /agui/{provider}/{name} requires a
+// POST body, so we still drive the fetch ourselves) via eventsource-parser
 // instead of hand-rolling SSE framing — a hand-rolled version of this
 // previously shipped broken (assumed bare `\n\n` between events; sse_
 // starlette actually emits `\r\n\r\n`, so it silently parsed zero events

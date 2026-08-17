@@ -101,6 +101,36 @@ services:
       LLM_API_KEY: "${LLM_API_KEY}"
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
 
+  # A second stall, behind `--profile demo`: souk-guide delegating to
+  # summarizer delegating to translator, so there is a real multi-hop A2A
+  # chain to watch (GET /threads/{id}/tree). Off by default because it
+  # spends LLM tokens on every run and the gateway does not need it.
+  #
+  #   docker compose --profile demo up --build
+  #
+  # Its config names its sub-agents and nothing else. The A2A URL cannot
+  # be written there: it contains this provider's own key fingerprint,
+  # which does not exist until the provider has started once — so the name
+  # is resolved against the roster on first delegation (see
+  # pydantic_ai_agent/resolve.py). Lazily, because a sub-agent is often a
+  # sibling container that has not registered yet at boot, and a
+  # delegation edge must not become a boot order.
+  guide:
+    profiles: ["demo"]
+    build:
+      context: .
+      dockerfile: providers/pydantic-ai-agent/Dockerfile
+    depends_on:
+      - souk
+    volumes:
+      - ./providers/pydantic-ai-agent/config.example.yaml:/app/config.yaml:ro
+      - guide_identity:/data
+    environment:
+      SOUK_IDENTITY_KEY_PATH: /data/souk_identity.key
+      LLM_BASE_URL: "${LLM_BASE_URL}"
+      LLM_MODEL_NAME: "${LLM_MODEL_NAME}"
+      LLM_API_KEY: "${LLM_API_KEY}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
   # The frontend: a human-browsable directory for this souk, and the thing
   # that makes the stack visible to a person rather than to curl. Open
   # http://localhost:8080/index.html once the stack is up.
@@ -123,3 +153,4 @@ services:
 volumes:
   paradedb_data:
   docent_identity:
+  guide_identity:

@@ -1413,6 +1413,28 @@ dev = [
     { name = "psycopg", extras = ["binary", "pool"], specifier = ">=3.2" },
     { name = "pytest", specifier = ">=8.3" },
     { name = "pytest-asyncio", specifier = ">=0.24" },
+    { name = "souk-provider-sdk", editable = "AgentSouk/souk-provider-sdk" },
+]
+
+[[package]]
+name = "souk-provider-sdk"
+version = "0.1.0"
+source = { editable = "AgentSouk/souk-provider-sdk" }
+dependencies = [
+    { name = "cryptography" },
+    { name = "pyjwt", extra = ["crypto"] },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "cryptography", specifier = ">=42.0" },
+    { name = "pyjwt", extras = ["crypto"], specifier = ">=2.9" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pytest", specifier = ">=8.0" },
+    { name = "pytest-asyncio", specifier = ">=0.24" },
 ]
 
 [[package]]
@@ -1423,6 +1445,7 @@ dependencies = [
     { name = "fastapi" },
     { name = "mcp" },
     { name = "souk" },
+    { name = "souk-provider-sdk" },
     { name = "sse-starlette" },
     { name = "uvicorn", extra = ["standard"] },
 ]
@@ -1448,6 +1471,7 @@ requires-dist = [
     { name = "mcp", specifier = ">=2.0" },
     { name = "souk", editable = "AgentSouk/souk" },
     { name = "souk", extras = ["postgres"], marker = "extra == 'postgres'", editable = "AgentSouk/souk" },
+    { name = "souk-provider-sdk", editable = "AgentSouk/souk-provider-sdk" },
     { name = "sse-starlette", specifier = ">=2.1" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32" },
 ]

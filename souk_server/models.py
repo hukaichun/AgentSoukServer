@@ -54,20 +54,27 @@ class RegisterBatchRequest(BaseModel):
 
 
 class AgentRosterEntry(BaseModel):
+    """One roster row on the wire.
+
+    An agent *is* `(provider_key, name)` now — souk mints no id for anyone
+    to hold — so the pair is what a caller addresses it by. `fingerprint`
+    is the same identity in 16 hex, which is what this gateway puts in a
+    URL; it is derived, never authoritative, and `provider_key` is the
+    thing to compare.
+    """
+
     model_config = ConfigDict(from_attributes=True)
 
-    agent_id: str
+    provider_key: str
+    fingerprint: str
     name: str
     description: str = ""
     skills: list[dict[str, Any]] = Field(default_factory=list)
     joined_at: datetime
     last_seen_at: datetime
     online: bool
-    # Whoever holds this key owns this agent — see AgentRosterEntry's
-    # module docstring / repo.register_agents. provider_name is the
-    # optional storefront label for that key (souk.schema's providers table),
-    # None if that public_key never set one.
-    public_key: str
+    # The optional storefront label for that key (souk.schema's providers
+    # table), None if this provider never set one.
     provider_name: str | None = None
 
 
@@ -76,24 +83,24 @@ class RosterResponse(BaseModel):
 
 
 class RegisterBatchResponse(RosterResponse):
-    # Bearer token the worker socket authenticates with — the `hello`
-    # frame's `token`, or the handshake's Authorization header (see
-    # souk_server.ws_provider and souk.identity) — valid for
-    # souk.identity.SESSION_TOKEN_TTL_SECONDS, re-issued on every
-    # /agents/register call (souk_agent_sdk re-registers on each
-    # run_forever() (re)connect, so an expired token is naturally
-    # refreshed rather than needing its own renewal endpoint).
-    session_token: str
-    # {name: agent_id} for this batch — lets the caller (souk_agent_sdk)
-    # learn the souk-assigned ids for the agents it just registered, since
-    # `name` alone is no longer a unique routing key (see souk/schema.py).
-    agent_ids: dict[str, str]
+    """What a provider gets back for proving who it is.
+
+    No session token: souk stopped issuing one when work stopped being
+    claimed, and this gateway's socket is authenticated by a signature
+    from the same key instead (see ws_provider.connect_signing_payload) —
+    so there is nothing bearer-shaped to leak or to expire under a
+    long-lived connection.
+
+    No ids either, for the reason core gives: a provider that held ids
+    souk minted could be cut off from its own work by a database it never
+    saw replaced. It already knows its key and the names it chose, and
+    that pair is the agent.
+    """
 
 
 class CreateThreadRequest(BaseModel):
-    # agent_id comes from the URL path (POST /threads/id/{agent_id} or
-    # POST /threads/{name}, mirroring /agui's own id-vs-name routes) —
-    # this body is just the optional extras.
+    # The agent comes from the URL path (POST /threads/{provider}/{name})
+    # — this body is just the optional extras.
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
