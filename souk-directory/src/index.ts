@@ -12,7 +12,15 @@ import {
 let allAgents: AgentRosterEntry[] = [];
 
 function renderAgentCard(agent: AgentRosterEntry, soukUrl: string): string {
-  const href = linkWithSouk(`agent.html?id=${encodeURIComponent(agent.agent_id)}`, soukUrl);
+  // An agent is addressed by (provider, name) — the fingerprint goes in
+  // the URL because it is short, the name because it is the other half of
+  // the pair. A name alone would be ambiguous: two stalls in the same souk
+  // may each keep a "translator", which is exactly why the by-name routes
+  // were removed.
+  const href = linkWithSouk(
+    `agent.html?provider=${encodeURIComponent(agent.fingerprint)}&name=${encodeURIComponent(agent.name)}`,
+    soukUrl
+  );
   const statusClass = agent.online ? "online" : "offline";
   const statusLabel = agent.online ? "online" : "offline";
   return `
@@ -22,7 +30,7 @@ function renderAgentCard(agent: AgentRosterEntry, soukUrl: string): string {
         <span class="status-chip ${statusClass}"><span class="dot"></span>${statusLabel}</span>
       </div>
       <div class="card-meta">
-        agent_id ${escapeHtml(agent.agent_id)} · joined ${new Date(agent.joined_at).toLocaleDateString()}
+        joined ${new Date(agent.joined_at).toLocaleDateString()}
       </div>
       <div class="card-desc">${escapeHtml(agent.description || "(no description)")}</div>
     </a>
@@ -33,7 +41,15 @@ function render(agents: AgentRosterEntry[]): void {
   const container = document.getElementById("agents")!;
   const soukUrl = getSoukUrl();
   if (agents.length === 0) {
-    container.innerHTML = `<p class="empty-state">No agents match.</p>`;
+    // Two different nothings, and telling a newcomer the wrong one is
+    // worse than saying nothing: an empty souk reported as "no agents
+    // match" reads as a failed search, so the reader hunts for a filter
+    // they never typed. The roster being empty is a fact about the
+    // market; matching nothing is a fact about the query.
+    container.innerHTML =
+      allAgents.length === 0
+        ? `<p class="empty-state">This souk has no agents listed yet.</p>`
+        : `<p class="empty-state">No agents match.</p>`;
     return;
   }
   container.innerHTML = groupByProvider(agents)
@@ -46,8 +62,8 @@ function render(agents: AgentRosterEntry[]): void {
         <section class="stall">
           <div class="stall-header">
             <span class="stall-name">${title}</span>
-            <span class="stall-key" title="${escapeHtml(group.publicKey)}">${escapeHtml(
-        shortKey(group.publicKey)
+            <span class="stall-key" title="${escapeHtml(group.providerKey)}">${escapeHtml(
+        shortKey(group.providerKey)
       )}</span>
             <span class="stall-count">${group.agents.length} agent${group.agents.length === 1 ? "" : "s"} · ${onlineCount} online</span>
           </div>
@@ -75,14 +91,27 @@ function applyFilter(): void {
 async function load(soukUrl: string): Promise<void> {
   const container = document.getElementById("agents")!;
   container.innerHTML = `<p class="empty-state">Loading…</p>`;
+  // Fetching and rendering are caught separately because they fail for
+  // unrelated reasons and only one of them is the network's fault. Wrapping
+  // both said "Couldn't reach <souk>" for anything thrown while drawing —
+  // which is how a roster this page simply could not read presented as an
+  // unreachable server, sending the reader to check the wrong thing.
   try {
     allAgents = await fetchAgents(soukUrl);
-    applyFilter();
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     container.innerHTML = `<p class="empty-state">Couldn't reach ${escapeHtml(soukUrl)}: ${escapeHtml(
       message
     )}</p>`;
+    return;
+  }
+  try {
+    applyFilter();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    container.innerHTML = `<p class="empty-state">Reached ${escapeHtml(
+      soukUrl
+    )}, but couldn't read its roster: ${escapeHtml(message)}</p>`;
   }
 }
 
