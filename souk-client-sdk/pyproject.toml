@@ -3,6 +3,13 @@ name = "souk-client-sdk"
 version = "0.1.0"
 description = "Caller-side SDK: a thin AG-UI client for talking to agents through a souk"
 requires-python = ">=3.12"
+# Apache-2.0, not the repo's AGPL-3.0. This is what a *caller* imports,
+# and it contains no souk code at all — its dependencies are httpx,
+# websockets, pydantic and litellm. AGPL here would protect nothing and
+# deter everyone.
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+
 dependencies = [
     "httpx>=0.27",
     "httpx-sse>=0.4",

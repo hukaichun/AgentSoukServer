@@ -15,6 +15,12 @@ COPY AgentSouk/souk /app/AgentSouk/souk
 # `ws_provider.SocketProvider` subclasses its `SoukConnection`.
 COPY AgentSouk/souk-provider-sdk /app/AgentSouk/souk-provider-sdk
 COPY pyproject.toml uv.lock .python-version /app/
+# Dev-group only, and only for `tests/test_kyok_shipped_signer.py` — but
+# `uv sync --group dev` below resolves the whole group, so a path source
+# without a COPY fails the *build*, not a test. (Which it did: the rule in
+# CLAUDE.md exists because both images were once missing
+# souk-provider-sdk, and this is the same mistake with a different line.)
+COPY souk-agent-sdk /app/souk-agent-sdk
 COPY souk_server /app/souk_server
 
 RUN uv sync --group dev

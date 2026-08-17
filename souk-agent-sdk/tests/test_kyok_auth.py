@@ -60,7 +60,7 @@ def test_signature_verifies_against_souk_side_reconstruction():
     timestamp = signed.headers["X-Souk-Kyok-Timestamp"]
     signature = bytes.fromhex(signed.headers["X-Souk-Kyok-Signature"])
     body_hash = hashlib.sha256(body).hexdigest()
-    payload = f"kyoktoken123:{timestamp}:{body_hash}".encode()
+    payload = f"souk-kyok-call:kyoktoken123:{timestamp}:{body_hash}".encode()
 
     public_key.verify(signature, payload)  # raises InvalidSignature on failure
 
@@ -90,5 +90,5 @@ def test_bearer_prefix_is_stripped_before_signing():
 
     # Signed against the bare token, not "Bearer bare-token" — this is
     # the payload souk itself reconstructs and expects to verify.
-    correct_payload = f"bare-token:{timestamp}:{body_hash}".encode()
+    correct_payload = f"souk-kyok-call:bare-token:{timestamp}:{body_hash}".encode()
     public_key.verify(signature, correct_payload)

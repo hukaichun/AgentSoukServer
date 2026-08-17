@@ -3,6 +3,15 @@ name = "souk-agent-sdk"
 version = "0.1.0"
 description = "Agent-side SDK: registers a batch of AG-UI-shaped agents with a souk and serves runs over its WebSocket relay"
 requires-python = ">=3.12"
+# Apache-2.0, not the repo's AGPL-3.0. This is a library a provider
+# author imports into their own agent, and AGPL there would oblige them
+# to publish that agent — which would stop anyone building a proprietary
+# agent against this souk, and is not what the gateway's licence is for.
+# Matches souk core upstream, and composes into the AGPL gateway (that
+# direction works; the reverse does not).
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+
 dependencies = [
     # What a provider *is* — identity, the port, the loop. This package
     # is only the socket around it.

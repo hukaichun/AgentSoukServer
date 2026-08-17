@@ -30,7 +30,7 @@ def _kyok_headers(bearer: str, private_key, body: bytes) -> dict:
     """
     timestamp = str(int(time.time()))
     body_hash = hashlib.sha256(body).hexdigest()
-    payload = f"{bearer}:{timestamp}:{body_hash}".encode()
+    payload = f"souk-kyok-call:{bearer}:{timestamp}:{body_hash}".encode()
     signature = private_key.sign(payload).hex()
     return {
         "Authorization": f"Bearer {bearer}",
@@ -153,7 +153,7 @@ async def test_chat_completions_stale_timestamp_401s(client, souk, register):
         body = b"{}"
         body_hash = hashlib.sha256(body).hexdigest()
         stale_timestamp = str(int(time.time()) - 3600)
-        payload = f"{token}:{stale_timestamp}:{body_hash}".encode()
+        payload = f"souk-kyok-call:{token}:{stale_timestamp}:{body_hash}".encode()
         signature = served.identity._key.sign(payload).hex()
         resp = await client.post(
             "/kyok/v1/chat/completions",

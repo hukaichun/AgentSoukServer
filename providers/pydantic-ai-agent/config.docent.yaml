@@ -59,6 +59,7 @@ agents:
     # Off on purpose: the MCP tools above replace it. Turning both on
     # would give the model two ways to ask the same question, which is
     # how a guide starts contradicting itself.
+    thread_history_limit: 20
     souk_tools: false
 
     sub_agents: []

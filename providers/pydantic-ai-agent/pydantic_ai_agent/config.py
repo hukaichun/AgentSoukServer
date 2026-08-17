@@ -62,6 +62,16 @@ class AgentConfig(BaseModel):
     # provider is itself registered on via its already-public HTTP API —
     # see that module's docstring for why this isn't a real MCP server.
     souk_tools: bool = False
+    # How many of the thread's own recent messages to fetch from souk
+    # before running, or None to use only what the caller sent.
+    #
+    # Opt-in because souk deliberately does not decide this: a provider is
+    # handed exactly what the caller sent for this run, and how much
+    # context an agent wants is the agent's business — windows differ,
+    # costs differ, some agents would rather summarise. What it *fixes* is
+    # an agent reached over A2A, where `message/send` carries one message
+    # and a tenth turn is indistinguishable from a first. See history.py.
+    thread_history_limit: int | None = None
     # Opt-in: Keep Your Own Key (see docs/keep-your-own-key.md). When a
     # caller's run carries forwardedProps.kyok (it's running its own KYOK
     # bridge), this agent routes that run's LLM calls through souk's

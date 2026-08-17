@@ -351,10 +351,33 @@ still buys over the query string: `sessionId` no longer appears in any
 URL, so it stops leaking into access logs — the mistake the old
 `/kyok/poll?sessionId=…` was making against this document's own rule.
 
+"Not a credential" is what this document said, and for a while it was
+also not true in the direction that mattered. souk was handing the id to
+every provider, inside the KYOK token — which is signed, not sealed, and
+any holder can base64-decode it. So a provider could read the caller's
+session out of its own token, open this socket under it, and be served
+*another* provider's completion: its prompt to read, and its answer to
+write, which is injected tool input for whatever agent acts on the answer.
+Two runs of one caller sharing a bridge session was the whole setup.
+
+Fixed in core — the token carries `souk.kyok.session_routing_key(id)`, a
+SHA-256, and `KyokAdapter.poll` derives the key from what the bridge
+presents. **This socket did not change**, by design: the bridge is the
+side that holds the preimage, so it keeps passing whatever `hello` said.
+The guard is
+`tests/test_ws_kyok.py::test_a_provider_cannot_reach_the_bridge_session_with_what_its_token_carries`,
+which tries every string a provider can obtain and asserts none of them is
+served; it goes red if the core fix is reverted.
+
+What has *not* changed: knowing the id is still the entire proof, and two
+sockets on one session still coexist and race. The bridge has no
+credential of its own — deliberately deferred, see
+`AgentSouk/docs/keep-your-own-key.md`.
+
 | direction | frame | carries |
 |---|---|---|
 | ↓ | `{"type": "completionRequest", "requestId", "payload"}` | what `poll` returned, pushed instead of polled |
-| ↑ | `{"type": "chunk", "requestId", "data"}` | one chunk of the bridge's LLM response (was a line of the `respond` NDJSON stream) |
+| ↑ | `{"type": "chunk", "requestId", "data"}` | one chunk of the bridge's LLM response, handed to `KyokAdapter.respond` as-is |
 | ↑ | `{"type": "done", "requestId"}` | end of that response (was the `_DONE` sentinel / EOF) |
 | ↑ | `{"type": "error", "requestId", "message"}` | bridge-side failure, so the waiting completion can fail fast instead of timing out |
 | ↓ | `{"type": "error", "requestId"?, "message"}` | server-side rejection of a frame (unknown type, or a `requestId` not in flight on this connection) — answered, not a teardown, same as the provider socket |
