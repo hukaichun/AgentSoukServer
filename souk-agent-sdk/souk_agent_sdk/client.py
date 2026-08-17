@@ -15,6 +15,9 @@ only channel capacity has, and why nothing here counts anything.
 Nothing bearer-shaped is involved. The socket is opened with a signature
 from the provider's own key over `souk-provider-connect:…`, so there is
 no token to leak, and none to expire underneath a long-lived connection.
+It is still a self-signed assertion, which means a captured one is
+replayable inside the freshness window — replaced by a mutual
+challenge-response in AgentSoukServer#10.
 """
 
 from __future__ import annotations
@@ -25,20 +28,19 @@ import json
 import logging
 import ssl
 import time
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 import websockets
 from souk_provider_sdk import (
+    AgentHandle,
     DeliveredRun,
     HandleProvider,
     ProviderIdentity,
     ProviderRuntime,
 )
-
-from souk_agent_sdk.handle import AgentHandle
-from souk_agent_sdk.identity import load_or_create_identity
 
 logger = logging.getLogger("souk_agent_sdk")
 
@@ -78,17 +80,12 @@ class SoukProvider:
         self.reconnect_delay = reconnect_delay
         self.ca_cert_path = ca_cert_path
         self.provider_name = provider_name
-        # The key is loaded here rather than through
-        # `ProviderIdentity.load_or_create` because this transport has to
-        # sign something upstream does not define: the connect payload
-        # below. `ProviderIdentity` signs registrations, deletions and
-        # delegation hops — every payload souk itself verifies — and
-        # exposes no general `sign`, which is right for a package that
-        # names no transport and awkward for one that is a transport.
-        # Constructing it from a key we already hold costs nothing and
-        # reaches into nothing private. See AgentSouk#43.
-        self._private_key = load_or_create_identity(identity_key_path)
-        self.identity = ProviderIdentity(self._private_key)
+        # `load_or_create` does not make the directory, and a provider's
+        # key path is very often one it owns alone (`/data/…` on a fresh
+        # volume, `./keys/…` in a checkout) — so this is the one thing
+        # done before handing the path over.
+        Path(identity_key_path).parent.mkdir(parents=True, exist_ok=True)
+        self.identity = ProviderIdentity.load_or_create(identity_key_path)
         self.agents = {agent.name: agent for agent in agents}
         self._outbound: asyncio.Queue = asyncio.Queue()
         # The provider's own loop, which knows nothing about any of this.
@@ -165,9 +162,9 @@ class SoukProvider:
 
         names = sorted(self.agents)
         timestamp = int(time.time())
-        signature = self._private_key.sign(
+        signature = self.identity.sign(
             connect_signing_payload(self.public_key, names, timestamp)
-        ).hex()
+        )
 
         async with websockets.connect(self._ws_url, ssl=ssl_context) as ws:
             await ws.send(
