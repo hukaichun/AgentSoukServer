@@ -29,15 +29,24 @@ import {
   streamSse,
 } from "./app.js";
 import { placeStalls } from "./layout.js";
+import {
+  Sheets,
+  StallBox,
+  drawGround,
+  drawStall,
+  drawWalker,
+  loadSheets,
+} from "./scene.js";
 
 marked.setOptions({ breaks: true, gfm: true });
 
-const COLS = 4;
-const ROWS = 3;
-const CELL_W = 250;
-const CELL_H = 206;
-const STALL_W = 200;
-const STALL_H = 150;
+const SCALE = 2;
+const COLS = 3;
+const ROWS = 2;
+const CELL_W = 320;
+const CELL_H = 300;
+const STALL_W = 192;
+const STALL_H = 128;
 
 interface Stall {
   providerKey: string;
@@ -62,9 +71,13 @@ let threadId: string | null = null;
 // One walker per delegated call, keyed by the A2A task id — the same key
 // the chat log uses, and the only thing on the wire that distinguishes two
 // calls issued in the same model turn.
-const walkers = new Map<string, SVGGElement>();
+interface Walk { ax: number; ay: number; bx: number; by: number; t0: number }
+const walkers = new Map<string, Walk>();
+// Edges of the finished tree, kept as provider-key pairs so the draw loop
+// can look up wherever those stalls are standing now.
+let routeEdges: { from: string; to: string }[] = [];
 
-const svg = () => document.getElementById("map") as unknown as SVGSVGElement;
+const canvas = () => document.getElementById("map") as HTMLCanvasElement;
 const side = () => document.getElementById("side")!;
 const note = (msg: string) => {
   document.getElementById("map-note")!.textContent = msg;
@@ -91,123 +104,153 @@ function stallByAgentName(name: string): Stall | undefined {
   return hits.length === 1 ? hits[0] : undefined;
 }
 
-function renderMap(): void {
-  const el = svg();
+// ---- the scene
+
+let sheets: Sheets | null = null;
+let frame = 0;
+
+// Positions every stall from its fingerprint. Pure placement — nothing is
+// drawn here, so the draw loop can run at whatever rate it likes without
+// re-deciding where the market is.
+function layout(): void {
   const placed = placeStalls(
     stalls.map((s) => ({ fingerprint: s.fingerprint, stall: s })),
     COLS,
     ROWS
   );
-  const originX = (1000 - COLS * CELL_W) / 2 + (CELL_W - STALL_W) / 2;
-  const originY = (620 - ROWS * CELL_H) / 2 + (CELL_H - STALL_H) / 2;
-
   for (const p of placed) {
-    p.item.stall.x = originX + p.col * CELL_W;
-    p.item.stall.y = originY + p.row * CELL_H;
+    p.item.stall.x = p.col * CELL_W + (CELL_W - STALL_W) / 2;
+    p.item.stall.y = p.row * CELL_H + (CELL_H - STALL_H) / 2;
+  }
+}
+
+// Hit-testing rather than DOM nodes: on a canvas the stall is a rectangle
+// and the keeper is a point, so "who did I click" is arithmetic.
+function agentAt(px: number, py: number): AgentRosterEntry | null {
+  for (const s of stalls) {
+    if (px < s.x - 8 || px > s.x + STALL_W + 8) continue;
+    if (py < s.y - 40 || py > s.y + STALL_H + 16) continue;
+    const step = STALL_W / (s.agents.length + 1);
+    let best: AgentRosterEntry | null = null;
+    let bestD = Infinity;
+    s.agents.forEach((a, i) => {
+      const d = Math.abs(s.x + step * (i + 1) - px);
+      if (d < bestD) {
+        bestD = d;
+        best = a;
+      }
+    });
+    return best;
+  }
+  return null;
+}
+
+function stallBox(s: Stall): StallBox {
+  const step = STALL_W / (s.agents.length + 1);
+  return {
+    x: s.x,
+    y: s.y,
+    w: STALL_W,
+    h: STALL_H,
+    sign: s.name || "unnamed provider",
+    tone: parseInt(s.fingerprint.slice(0, 2), 16) % 3,
+    open: s.agents.some((a) => a.online),
+    keepers: s.agents.map((a, i) => ({
+      name: a.name,
+      online: a.online,
+      x: s.x + step * (i + 1),
+      y: s.y + STALL_H - 20,
+    })),
+  };
+}
+
+// Everything is redrawn every frame. At this size that is far cheaper than
+// tracking what changed, and it means the walkers, the stalls and the
+// finished route can never disagree about where anything is.
+function draw(): void {
+  const c = canvas();
+  const g = c.getContext("2d")!;
+  if (!sheets) return;
+  g.imageSmoothingEnabled = false;
+  drawGround(g, sheets, c.width, c.height, SCALE);
+
+  // The finished shape first, so it lies under the stalls rather than
+  // across their signs.
+  for (const e of routeEdges) {
+    const from = findStall(e.from);
+    const to = findStall(e.to);
+    if (!from || !to) continue;
+    const a = stallCentre(from);
+    const b = stallCentre(to);
+    g.save();
+    g.strokeStyle = "rgba(214, 168, 74, 0.85)";
+    g.lineWidth = 3;
+    g.setLineDash([7, 6]);
+    g.beginPath();
+    g.moveTo(a.x, a.y + STALL_H / 2);
+    g.lineTo(b.x, b.y + STALL_H / 2);
+    g.stroke();
+    g.restore();
   }
 
-  el.innerHTML =
-    `<g id="edges"></g>` +
-    stalls
-      .map((s) => {
-        const title = s.name ? escapeHtml(s.name) : "unnamed provider";
-        const agents = s.agents
-          .map(
-            (a, i) => `
-        <g class="person ${a.online ? "" : "away"}"
-           data-provider="${escapeHtml(a.fingerprint)}" data-name="${escapeHtml(a.name)}"
-           transform="translate(${14}, ${52 + i * 26})">
-          <circle class="person-dot" cx="6" cy="-4" r="4"></circle>
-          <text class="person-name" x="18" y="0">${escapeHtml(a.name)}</text>
-        </g>`
-          )
-          .join("");
-        return `
-      <g class="stall-g" data-key="${escapeHtml(s.providerKey)}" transform="translate(${s.x}, ${s.y})">
-        <rect class="stall-box" width="${STALL_W}" height="${STALL_H}" rx="6"></rect>
-        <text class="stall-sign" x="14" y="24">${title}</text>
-        <text class="stall-fp" x="14" y="40">${escapeHtml(s.fingerprint)}</text>
-        ${agents}
-      </g>`;
-      })
-      .join("") +
-    `<g id="walkers"></g>`;
+  for (const s of [...stalls].sort((a, b) => a.y - b.y)) drawStall(g, sheets, stallBox(s), SCALE);
 
-  el.querySelectorAll<SVGGElement>(".person").forEach((g) => {
-    g.addEventListener("click", () => {
-      const fp = g.dataset.provider!;
-      const name = g.dataset.name!;
-      const agent = stalls.flatMap((s) => s.agents).find(
-        (a) => a.fingerprint === fp && a.name === name
-      );
-      if (agent) openChat(agent);
-    });
-  });
+  const now = performance.now();
+  for (const w of walkers.values()) {
+    const t = Math.min(1, (now - w.t0) / 1400);
+    const eased = t * t * (3 - 2 * t);
+    const x = w.ax + (w.bx - w.ax) * eased;
+    const y = w.ay + (w.by - w.ay) * eased;
+    drawWalker(g, sheets, x, y, w.bx >= w.ax ? 1 : -1, Math.floor(frame / 7), SCALE);
+  }
+  frame++;
+  requestAnimationFrame(draw);
 }
 
 // ---- walkers: motion while the run is still in flight
 
 function walkerFor(taskId: string, from: Stall, to: Stall): void {
   if (walkers.has(taskId)) return;
-  // The rule the strip arrived at first: work that never left the stall is
-  // not a journey. Two people behind one counter passing something between
-  // them should not draw a walk across the market.
+  // Work that never left the stall is not a journey. Two people behind one
+  // counter passing something between them should not send anybody across
+  // the market, and drawing it would be the map's version of the route
+  // strip's invented edge.
   if (from.providerKey === to.providerKey) return;
-
-  const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
-  g.setAttribute("class", "walker");
   const a = stallCentre(from);
   const b = stallCentre(to);
-  g.setAttribute("transform", `translate(${a.x}, ${a.y})`);
-  g.innerHTML = `<circle r="6"></circle>`;
-  document.getElementById("walkers")!.appendChild(g);
-  walkers.set(taskId, g);
-  // Next frame, so the browser has the start position before the
-  // transition to the end one.
-  requestAnimationFrame(() => {
-    g.setAttribute("transform", `translate(${b.x}, ${b.y})`);
+  walkers.set(taskId, {
+    ax: a.x,
+    ay: a.y + STALL_H / 2,
+    bx: b.x,
+    by: b.y + STALL_H / 2,
+    t0: performance.now(),
   });
 }
 
-function retireWalker(taskId: string, home: Stall | undefined): void {
-  const g = walkers.get(taskId);
-  if (!g) return;
-  walkers.delete(taskId);
-  if (home) {
-    const a = stallCentre(home);
-    g.setAttribute("transform", `translate(${a.x}, ${a.y})`);
-    setTimeout(() => g.remove(), 900);
-  } else {
-    g.remove();
-  }
+function retireWalker(taskId: string, _home: Stall | undefined): void {
+  const w = walkers.get(taskId);
+  if (!w) return;
+  // Walk back the way they came, then go.
+  walkers.set(taskId, { ax: w.bx, ay: w.by, bx: w.ax, by: w.ay, t0: performance.now() });
+  setTimeout(() => walkers.delete(taskId), 1500);
 }
 
 // ---- the finished shape, drawn from the tree rather than guessed live
 
-function drawTree(root: ThreadTreeNode): void {
-  const edges = document.getElementById("edges")!;
-  const lines: string[] = [];
+function collectEdges(root: ThreadTreeNode): void {
+  const out: { from: string; to: string }[] = [];
   const walk = (node: ThreadTreeNode) => {
-    const from = findStall(node.provider_key);
     for (const child of node.children) {
-      const to = findStall(child.provider_key);
-      // A hop within one stall is real but has no distance to draw. It is
-      // marked on the stall rather than as a line, so the map never shows
-      // a journey that did not happen.
-      if (from && to && from.providerKey !== to.providerKey) {
-        const a = stallCentre(from);
-        const b = stallCentre(to);
-        lines.push(`<line class="edge" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"></line>`);
-      } else if (to) {
-        lines.push(
-          `<circle class="edge-inplace" cx="${stallCentre(to).x}" cy="${stallCentre(to).y}" r="16"></circle>`
-        );
+      // Same-stall hops are real but have no distance, so they get no line.
+      // The map says nothing rather than drawing a journey nobody took.
+      if (child.provider_key !== node.provider_key) {
+        out.push({ from: node.provider_key, to: child.provider_key });
       }
       walk(child);
     }
   };
   walk(root);
-  edges.innerHTML = lines.join("");
+  routeEdges = out;
 }
 
 function describeShape(root: ThreadTreeNode): string {
@@ -272,7 +315,7 @@ async function send(soukUrl: string, text: string): Promise<void> {
   if (!current) return;
   const agent = current;
   logEntry("you", "user").textContent = text;
-  document.getElementById("edges")!.innerHTML = "";
+  routeEdges = [];
   note("");
 
   let reply: HTMLElement | null = null;
@@ -338,7 +381,7 @@ async function send(soukUrl: string, text: string): Promise<void> {
     const resp = await fetch(`${soukUrl}/threads/${encodeURIComponent(threadId)}/tree`);
     if (!resp.ok) return;
     const root: ThreadTreeNode = await resp.json();
-    drawTree(root);
+    collectEdges(root);
     note(describeShape(root));
   } catch {
     // The reply already arrived; the picture is a bonus, not the answer.
@@ -388,13 +431,25 @@ async function load(soukUrl: string): Promise<void> {
     }));
     if (stalls.length === 0) {
       note("This souk has no stalls yet.");
-      svg().innerHTML = "";
       return;
     }
     if (stalls.length > COLS * ROWS) {
       note(`${stalls.length} stalls, ${COLS * ROWS} squares — the grid is too small for this market.`);
     }
-    renderMap();
+    layout();
+    if (!sheets) {
+      sheets = await loadSheets();
+      const c = canvas();
+      c.addEventListener("click", (e) => {
+        const r = c.getBoundingClientRect();
+        const a = agentAt(
+          ((e.clientX - r.left) / r.width) * c.width,
+          ((e.clientY - r.top) / r.height) * c.height
+        );
+        if (a) openChat(a);
+      });
+      requestAnimationFrame(draw);
+    }
   } catch (err) {
     note(`Couldn't reach ${soukUrl}: ${err instanceof Error ? err.message : String(err)}`);
   }
