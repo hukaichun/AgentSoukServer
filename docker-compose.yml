@@ -22,13 +22,11 @@ services:
   # running server a DML-only role instead. Local dev reuses the same
   # `souk` Postgres user for both here, for simplicity only.
   #
-  # Runs from /app against souk's alembic.ini by path — the schema still
-  # belongs to core, but this uses the environment the image already
-  # built. Pointing working_dir at /app/AgentSouk/souk instead (which the
-  # upstream compose did, since the library owns its tables) makes `uv
-  # run` sync a *second*, unbuilt environment at container start: it
-  # needs the network every time the stack comes up, and it failed here
-  # on a PyPI timeout with the image sitting right there, fully built.
+  # `python -m souk.migrate`: the chain ships inside the souk package now
+  # (upstream's packaged-migrations change), so there is no alembic.ini
+  # to point at and no second environment to sync — the built image's own
+  # `uv run` finds `souk:alembic` wherever the package is. Reads
+  # SOUK_DATABASE_URL / SOUK_DB_SCHEMA from the environment below.
   souk-migrate:
     # Same image tag as `souk` below (which shares this same build config)
     # so Compose builds it once, not twice, under two different names.
@@ -37,7 +35,7 @@ services:
       context: .
       dockerfile: Dockerfile
     working_dir: /app
-    command: ["uv", "run", "alembic", "-c", "AgentSouk/souk/alembic.ini", "upgrade", "head"]
+    command: ["uv", "run", "python", "-m", "souk.migrate"]
     depends_on:
       paradedb:
         condition: service_healthy

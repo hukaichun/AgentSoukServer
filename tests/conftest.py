@@ -33,8 +33,8 @@ constraint is exactly what injecting settings removed.
 Tests aren't wrapped in a rolled-back transaction: souk.repo's functions
 call session.commit() internally throughout (e.g. register_agents,
 create_run), so a single outer transaction can't cleanly contain a whole
-test. The schema is applied once per session via Alembic (the same
-`alembic upgrade head` a real deployment runs), and rows are cleared
+test. The schema is applied once per session via `souk.migrate()` (the
+same packaged chain a real deployment runs), and rows are cleared
 between tests.
 """
 
@@ -48,8 +48,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from alembic import command
-from alembic.config import Config
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.engine import make_url
@@ -57,15 +55,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from souk.config import CoreSettings
 from souk.core import Souk
+from souk.migrate import migrate as souk_migrate
 from souk.identity import provider_fingerprint
 from souk.models import AgentRef
 from souk_provider_sdk import InProcessLink, ProviderIdentity, ProviderRuntime
 from souk_server.handshake import HANDSHAKE_VERSION, new_nonce
 from souk_server.server import create_app
-
-ALEMBIC_INI = (
-    Path(__file__).resolve().parent.parent / "AgentSouk" / "souk" / "alembic.ini"
-)
 
 TEST_SIGNING_SECRET = "test-signing-secret"
 
@@ -124,11 +119,10 @@ def _schema(settings: CoreSettings) -> None:
     if url.get_backend_name() == "sqlite" and url.database:
         for suffix in ("", "-wal", "-shm"):
             Path(url.database + suffix).unlink(missing_ok=True)
-    # alembic/env.py reads SOUK_DATABASE_URL from the environment (it
-    # deliberately doesn't import souk.config), so migrations still go
-    # through the environment even though the app itself no longer does.
-    os.environ["SOUK_DATABASE_URL"] = settings.database_url
-    command.upgrade(Config(str(ALEMBIC_INI)), "head")
+    # Through the chain packaged inside souk — the one way a souk database
+    # gets built, per upstream's packaged-migrations change; no path to an
+    # alembic.ini outside the package, no env-var relay.
+    souk_migrate(settings.database_url)
 
 
 @pytest.fixture(autouse=True)
