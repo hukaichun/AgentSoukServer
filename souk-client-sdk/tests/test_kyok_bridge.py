@@ -215,6 +215,47 @@ async def test_serving_is_the_whole_lifecycle_in_one_block():
         assert not bridge.attached.is_set()
 
 
+async def test_serving_deregisters_an_ephemeral_identity_on_exit():
+    """An auto-minted key can never come back, so its offering is roster
+    garbage the moment the block ends — serving() deletes it on the way
+    out. A persisted identity keeps its registration, same as an agent
+    provider between connections."""
+    from souk_llm_provider_sdk import ProviderIdentity
+
+    async def _drive(bridge: KyokBridge, gateway: StubGateway) -> int:
+        calls = 0
+
+        async def no_register():
+            pass
+
+        async def counting_deregister():
+            nonlocal calls
+            calls += 1
+
+        bridge.register = no_register
+        bridge.deregister = counting_deregister
+        async with asyncio.timeout(RECEIVE_TIMEOUT):
+            async with bridge.serving():
+                pass
+        return calls
+
+    async with StubGateway() as gateway:
+        ephemeral = KyokBridge(
+            f"http://127.0.0.1:{gateway.port}", model="m", api_key="k", reconnect_delay=0.05
+        )
+        assert await _drive(ephemeral, gateway) == 1
+
+    async with StubGateway() as gateway:
+        persisted = KyokBridge(
+            f"http://127.0.0.1:{gateway.port}",
+            model="m",
+            api_key="k",
+            reconnect_delay=0.05,
+            identity=ProviderIdentity.generate(),
+        )
+        assert await _drive(persisted, gateway) == 0
+
+
 async def test_a_refusal_from_the_handler_travels_as_a_structured_error_frame():
     """The #63 envelope, end to end on this side: a handler raising
     CompletionRefused answers with its payload on the error frame, not

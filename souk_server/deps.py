@@ -24,8 +24,11 @@ from souk.core import Souk
 from souk.errors import AgentNotFound
 from souk.models import AgentRef
 from souk.errors import (
+    AgentInUse,
     AgentNotFound,
     InvalidRegistration,
+    LlmOfferingInUse,
+    LlmProviderNotFound,
     ProviderFingerprintTaken,
     InvalidRunInput,
     KyokRejected,
@@ -57,10 +60,15 @@ async def get_session(souk: Souk = Depends(get_souk)) -> AsyncIterator[AsyncSess
 # writing it twice and letting the two drift.
 _STATUS = {
     AgentNotFound: 404,
+    LlmProviderNotFound: 404,
     ThreadNotFound: 404,
     RunNotFound: 404,
     ThreadOwnershipMismatch: 409,
     ProviderFingerprintTaken: 409,
+    # Deletion refused while the thing is serving or has live runs — a
+    # conflict with current state, not a bad request.
+    AgentInUse: 409,
+    LlmOfferingInUse: 409,
     InvalidRegistration: 401,
     InvalidActorChain: 401,
     InvalidRunInput: 400,
