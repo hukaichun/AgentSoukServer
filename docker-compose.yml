@@ -257,9 +257,45 @@ services:
     ports:
       - "8080:8080"
 
+  # A binary agent standing in for one dropped inside a pod: it dials out to
+  # souk, registers, and answers read-only questions about the container it
+  # lives in — no inbound port, no LLM key of its own, no way to change
+  # anything it inspects (docs/server-mode.md's frame protocol, no SDK). In
+  # a real cluster you would put one of these in each pod; here it inspects
+  # a repo directory mounted read-only at /app, which stands in for the
+  # pod's app dir, so "what was modified after the pod started" has real
+  # files with real mtimes to report. Needs no LLM: with none configured it
+  # returns the raw read-only report, which is the mode the wire is verified
+  # in. Give it a KYOK-opted-in run (metadata.kyok) and it will have a model
+  # interpret those facts, paid for with the caller's key.
+  pod-probe:
+    profiles: ["probe"]
+    build:
+      context: ./providers/pod-probe-agent
+      dockerfile: Dockerfile
+    depends_on:
+      - souk
+    volumes:
+      - probe_identity:/data
+      # The subtree the probe treats as the pod's app dir. Read-only, and
+      # the agent could not write it even if it were not — it has no write
+      # path at all.
+      - ./providers:/app:ro
+    environment:
+      SOUK_HTTP_URL: http://souk:8000
+      SOUK_IDENTITY_KEY_PATH: /data/probe_identity.key
+      PROBE_AGENT_NAME: pod-probe-demo
+      PROBE_PROVIDER_NAME: pod probe
+      PROBE_ROOT: /app
+      # The souk this probe pins — refuses to hand its proof to anything
+      # else answering that URL. Public half of the `souk` service's
+      # SOUK_IDENTITY_PRIVATE_KEY.
+      SOUK_PUBLIC_KEY: ${SOUK_PUBLIC_KEY:-6ecc7c33af8471e478777041e0fdf9662ba6f76c3044365ce16a7b09c476e506}
+
 volumes:
   paradedb_data:
   docent_identity:
   zahra_identity:
   yusuf_identity:
   teahouse_identity:
+  probe_identity:
