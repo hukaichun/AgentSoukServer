@@ -47,7 +47,7 @@ from openai.types.chat import ChatCompletionChunk
 
 from souk.errors import LlmProviderNotFound
 from souk.ids import new_id
-from souk_llm_provider_sdk import CONNECTED_LLM_PROVIDER_ATTRS
+from souk_llm_provider_sdk import CONNECTED_LLM_PROVIDER_ATTRS, CompletionRefused
 from souk_server.handshake import HANDSHAKE_VERSION
 from souk_server.ws_common import (
     POLICY_VIOLATION,
@@ -71,6 +71,10 @@ router = APIRouter()
 # socket has not noticed, and the agent's HTTP call must fail rather than
 # hang on it.
 CHUNK_GAP_TIMEOUT_SECONDS = 120.0
+
+# What this socket accepts after the handshake — read by the dispatch and
+# published in docs/wire-vectors.json, asserted equal in tests.
+INBOUND_FRAME_TYPES = frozenset({"chunk", "done", "error"})
 
 # Sentinel closing one completion's answer queue.
 _DONE = object()
@@ -252,7 +256,7 @@ async def kyok_socket(websocket: WebSocket) -> None:
                 continue
             ftype = frame.get("type")
             request_id = frame.get("requestId")
-            if ftype not in ("chunk", "done", "error"):
+            if ftype not in INBOUND_FRAME_TYPES:
                 outbound.put_nowait(
                     {"type": "error", "message": f"unknown frame type {ftype!r}"}
                 )
@@ -277,9 +281,18 @@ async def kyok_socket(websocket: WebSocket) -> None:
             elif ftype == "done":
                 accepted = link.feed(request_id, _DONE)
             else:  # error: the provider failing fast beats the gap timeout
+                # A `refusal` dict rides the envelope core relays intact
+                # (`CompletionRelay` reads it duck-typed off the
+                # exception) — the provider's structured answer reaches
+                # the calling agent instead of flattening to prose. The
+                # vocabulary inside is the two roles' own; nothing here
+                # interprets it.
+                refusal = frame.get("refusal")
                 accepted = link.feed(
                     request_id,
-                    RuntimeError(
+                    CompletionRefused(refusal)
+                    if isinstance(refusal, dict)
+                    else RuntimeError(
                         frame.get("message") or "LLM provider reported an error"
                     ),
                 )

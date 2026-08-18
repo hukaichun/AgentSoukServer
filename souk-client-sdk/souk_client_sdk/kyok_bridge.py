@@ -49,7 +49,13 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 import litellm
 import websockets
-from souk_llm_provider_sdk import ProviderIdentity, sign_llm_registration
+from souk_llm_provider_sdk import (
+    CompletionHandler,
+    CompletionRefused,
+    DeliveredCompletion,
+    ProviderIdentity,
+    sign_llm_registration,
+)
 
 logger = logging.getLogger("souk_client_sdk.kyok_bridge")
 
@@ -70,10 +76,17 @@ def provider_proof_payload(provider_nonce: str, souk_nonce: str, hello_raw: str)
 
 class KyokBridge:
     """One KYOK LLM provider serving one model offering with the caller's
-    own key. Typical use: `await bridge.register()`, pass
-    `metadata=bridge.run_metadata()` to `SoukClient.run()`, and run
-    `serve_forever()` as a background task alongside consuming that run's
-    event stream — cancel it once the run finishes.
+    own key. Typical use is one block:
+
+    ```python
+    async with bridge.serving():
+        async for event in client.run(agent, msg,
+                                      metadata=bridge.run_metadata(ctx)):
+            ...
+    ```
+
+    (`register()` + `serve_forever()` remain callable separately for a
+    long-lived bridge that outlives any single run.)
 
     `offering` is the model name callers address —
     `(identity.public_key, offering)` is the offering exactly as
@@ -92,6 +105,7 @@ class KyokBridge:
         offering: str = "kyok",
         identity: ProviderIdentity | None = None,
         reconnect_delay: float = 2.0,
+        handler: CompletionHandler | None = None,
     ) -> None:
         self.souk_http_url = souk_http_url.rstrip("/")
         self.model = model
@@ -103,7 +117,18 @@ class KyokBridge:
         # provider_key across restarts.
         self.identity = identity or ProviderIdentity.generate()
         self.reconnect_delay = reconnect_delay
-        self.registered = False
+        # The interposition point the library guarantees (see the
+        # souk-llm-provider-sdk README and AgentSouk#26's resolution):
+        # every completion passes through this before any money moves.
+        # None means the default litellm call with this bridge's own key;
+        # a caller enforcing policy — a spend ceiling, a model allow-list,
+        # refusing a delegation chain it doesn't recognise — wraps or
+        # replaces it, and may raise `CompletionRefused` to answer with a
+        # structured refusal that reaches the calling agent intact.
+        self.handler = handler
+        # Set while a connection is attached (welcome received), cleared
+        # when it drops. `serving()` waits on it; polling code may read it.
+        self.attached = asyncio.Event()
 
     @property
     def _ws_url(self) -> str:
@@ -113,8 +138,12 @@ class KyokBridge:
 
     async def register(self) -> None:
         """Register this bridge's offering with souk, signed by its own
-        key — the prerequisite the socket's attach enforces. Idempotent;
-        re-registering refreshes the record."""
+        key — the prerequisite the socket's attach enforces. Idempotent
+        (the upsert refreshes the record), and `serve_forever` re-runs it
+        before every connection, so a souk whose database was reset gets
+        the registration back on the next reconnect instead of refusing
+        the attach forever — the same self-healing the agent SDK has
+        always had (AgentSoukServer#16)."""
         signature, timestamp = sign_llm_registration(self.identity, [self.offering])
         async with httpx.AsyncClient() as client:
             resp = await client.post(
@@ -127,7 +156,6 @@ class KyokBridge:
                 },
             )
             resp.raise_for_status()
-        self.registered = True
 
     def run_metadata(self, context: Any = None) -> dict[str, Any]:
         """The `metadata` a caller passes to opt a run into this bridge:
@@ -146,16 +174,16 @@ class KyokBridge:
 
     async def serve_forever(self) -> None:
         """Holds the `/ws/kyok` socket and serves every completion souk
-        pushes down it — calls the real LLM via litellm using this
-        bridge's own api_key, and streams the response back as frames.
-        Reconnects on a drop. Runs until cancelled; intended to be wrapped
-        in `asyncio.create_task` alongside the run it's serving, not
-        awaited to completion (a KYOK bridge has no natural end of its own
-        — the run it's serving does).
+        pushes down it — through `handler` if one was given, else calling
+        the real LLM via litellm with this bridge's own api_key — and
+        streams the response back as frames. Registers before every
+        connection and reconnects on a drop. Runs until cancelled;
+        `serving()` below wraps the whole lifecycle when the bridge lives
+        alongside the run it serves.
         """
-        assert self.registered, "call register() before serve_forever()"
         while True:
             try:
+                await self.register()
                 await self._serve_connection()
             except asyncio.CancelledError:
                 raise
@@ -164,6 +192,42 @@ class KyokBridge:
                     "kyok bridge connection lost; reconnecting in %.1fs", self.reconnect_delay
                 )
             await asyncio.sleep(self.reconnect_delay)
+
+    @contextlib.asynccontextmanager
+    async def serving(self):
+        """The whole lifecycle as one block: registered, attached, torn
+        down — so \"run a KYOK-backed run\" stops being four manual steps
+        with three ways to sequence them wrong.
+
+        ```python
+        async with bridge.serving():
+            async for event in client.run(agent, msg,
+                                          metadata=bridge.run_metadata(ctx)):
+                ...
+        ```
+
+        Yields once the first attach is confirmed (souk's welcome), so a
+        run started inside the block can't race the socket and eat a 503
+        on its first completion. On exit the serve task is cancelled and
+        awaited; completions still in flight die with it, which is the
+        crash-behavior this bridge has always documented.
+        """
+        task = asyncio.create_task(self.serve_forever())
+        try:
+            waiter = asyncio.create_task(self.attached.wait())
+            done, _ = await asyncio.wait(
+                {task, waiter}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if task in done:
+                # serve_forever only ends by raising; surface that instead
+                # of yielding a bridge that isn't there.
+                waiter.cancel()
+                raise RuntimeError("kyok bridge failed before attaching") from task.exception()
+            yield self
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
     async def _handshake(self, ws) -> None:
         nonce = secrets.token_hex(NONCE_BYTES)
@@ -197,6 +261,7 @@ class KyokBridge:
     async def _serve_connection(self) -> None:
         async with websockets.connect(self._ws_url) as ws:
             await self._handshake(ws)
+            self.attached.set()
 
             # Single writer: concurrent completions queue frames here
             # rather than interleaving sends on the socket directly.
@@ -209,7 +274,7 @@ class KyokBridge:
                     kind = frame.get("type")
                     if kind == "completionRequest":
                         task = asyncio.create_task(
-                            self._serve_one(outbound, frame["requestId"], frame["payload"])
+                            self._serve_one(outbound, frame["requestId"], frame)
                         )
                         in_flight.add(task)
                         task.add_done_callback(in_flight.discard)
@@ -218,6 +283,7 @@ class KyokBridge:
                     else:
                         logger.warning("unexpected frame from souk, ignoring: %s", frame)
             finally:
+                self.attached.clear()
                 writer.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await writer
@@ -232,21 +298,24 @@ class KyokBridge:
         while True:
             await ws.send(json.dumps(await outbound.get()))
 
-    async def _serve_one(self, outbound: asyncio.Queue, request_id: str, body: dict[str, Any]) -> None:
-        """One completion: stream the real LLM's chunks back as `chunk`
-        frames, then `done` — or one `error` frame if the call fails
-        outright, so the waiting provider fails fast instead of timing
-        out."""
+    async def _serve_one(self, outbound: asyncio.Queue, request_id: str, frame: dict[str, Any]) -> None:
+        """One completion: through the handler (the interposition point),
+        streaming its chunks back as `chunk` frames, then `done` — or one
+        `error` frame if the call fails, so the waiting provider fails
+        fast instead of timing out. A `CompletionRefused` raised by the
+        handler puts its structured payload on the error frame, and souk
+        relays it to the calling agent intact."""
+        delivered = DeliveredCompletion(
+            run_id=frame.get("runId", ""),
+            provider_key=frame.get("providerKey", ""),
+            agent_name=frame.get("agentName", ""),
+            body=frame.get("payload") or {},
+            llm_name=frame.get("llmName", ""),
+            context=frame.get("context"),
+            actor_chain=frame.get("actorChain"),
+        )
         try:
-            stream = await litellm.acompletion(
-                model=self.model,
-                api_key=self.api_key,
-                api_base=self.api_base,
-                messages=body.get("messages", []),
-                tools=body.get("tools") or None,
-                temperature=body.get("temperature"),
-                stream=True,
-            )
+            stream = self.handler(delivered) if self.handler else self._call_llm(delivered)
             async for chunk in stream:
                 outbound.put_nowait(
                     {"type": "chunk", "requestId": request_id, "data": _to_chunk_dict(chunk)}
@@ -254,9 +323,36 @@ class KyokBridge:
             outbound.put_nowait({"type": "done", "requestId": request_id})
         except asyncio.CancelledError:
             raise
+        except CompletionRefused as e:
+            logger.info("kyok bridge refused request_id=%s: %s", request_id, e.refusal)
+            outbound.put_nowait(
+                {
+                    "type": "error",
+                    "requestId": request_id,
+                    "message": "refused by the LLM provider",
+                    "refusal": e.refusal,
+                }
+            )
         except Exception as e:
             logger.exception("kyok bridge: LLM call failed for request_id=%s", request_id)
             outbound.put_nowait({"type": "error", "requestId": request_id, "message": str(e)})
+
+    async def _call_llm(self, delivered: DeliveredCompletion):
+        """The default handler: the real LLM via litellm, on this
+        bridge's own key. Async generator, so a wrapping handler can
+        iterate it after enforcing its own policy."""
+        body = delivered.body
+        stream = await litellm.acompletion(
+            model=self.model,
+            api_key=self.api_key,
+            api_base=self.api_base,
+            messages=body.get("messages", []),
+            tools=body.get("tools") or None,
+            temperature=body.get("temperature"),
+            stream=True,
+        )
+        async for chunk in stream:
+            yield chunk
 
 
 def _to_chunk_dict(chunk: Any) -> dict:

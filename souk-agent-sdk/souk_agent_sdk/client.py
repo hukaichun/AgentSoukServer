@@ -464,13 +464,21 @@ class SoukProvider(SoukLink):
         try:
             run_input = RunAgentInput.model_validate(frame.get("input") or {})
         except ValidationError as e:
-            logger.warning(
-                "declining run %s: its input is not a valid AG-UI RunAgentInput: %s",
-                frame.get("runId"),
-                e,
-            )
+            reason = f"input does not validate as RunAgentInput: {e}"
+            logger.warning("refusing run %s: %s", frame.get("runId"), reason)
+            # `reason` makes this a *permanent* refusal, not a capacity
+            # decline: re-offering the same bytes can never succeed, so
+            # souk fails the run with this string recorded verbatim
+            # instead of re-offering it forever while the caller watches
+            # a queued run sit silent. Same rule `SoukLink.deliver`
+            # states in-process.
             self._outbound.put_nowait(
-                {"type": "ack", "runId": frame.get("runId"), "accepted": False}
+                {
+                    "type": "ack",
+                    "runId": frame.get("runId"),
+                    "accepted": False,
+                    "reason": reason,
+                }
             )
             return
         run = DeliveredRun(

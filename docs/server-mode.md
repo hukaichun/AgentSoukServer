@@ -23,7 +23,7 @@ a persistent WebSocket each, replacing gRPC entirely.
 | Callers | AG-UI (`/agui/*`, `/threads/*`), A2A (`/a2a/*`), registry (`/agents*`), health | HTTP + SSE | exists, unchanged |
 | Callers | MCP (the docent) | streamable HTTP at `/mcp`, same listener | built; see "MCP: the docent" below |
 | Providers | work relay | `WS /ws/provider` | built |
-| LLM providers (KYOK) | registration (`/llm-providers/register`), completion relay | HTTP + `WS /ws/kyok` | built |
+| LLM providers (KYOK) | registration + roster (`/llm-providers*`), completion relay | HTTP + `WS /ws/kyok` | built |
 | Provider's model client | `POST /kyok/v1/chat/completions` | HTTP (OpenAI-compatible by definition) | exists, unchanged |
 
 gRPC is **removed**, not demoted to an option: `grpc_server.py`,
@@ -215,7 +215,7 @@ stays reserved for server-side failure the client didn't cause.
 | direction | frame | carries |
 |---|---|---|
 | ↓ | `{"type": "run", "runId", "threadId", "agentName", "input"}` | an **offer**, with its RunAgentInput. `agentName` rides along because the provider routes by it and RunAgentInput does not name it |
-| ↑ | `{"type": "ack", "runId", "accepted"}` | whether this provider took it. `accepted: false` is how a full one says so |
+| ↑ | `{"type": "ack", "runId", "accepted", "reason"?}` | whether this provider took it. A bare `accepted: false` is how a full one says so — transient, souk re-offers later. `reason` makes the decline *permanent* (an input that does not parse): souk fails the run with the provider's words recorded verbatim in `failureReason` and stops re-offering. souk invents no reason vocabulary; the string is the provider's own |
 | ↑ | `{"type": "event", "runId", "event"}` | one AG-UI event; authorized against `Run.claimed_by` |
 | ↑ | `{"type": "finish", "runId"}` | that run's stream ended |
 | ↓ | `{"type": "cancel", "runId"}` | a request, not an order — outcome decided when the stream ends |
@@ -385,7 +385,7 @@ the reference LLM provider and builds that metadata via
 | ↓ | `{"type": "completionRequest", "requestId", "runId", "providerKey", "agentName", "llmName", "context", "actorChain", "payload"}` | core's `CompletionRequest`, camelCased: the run, the *proven* calling agent, which of this provider's models was addressed, the caller's opaque context, the delegation chain, and the OpenAI-shaped body |
 | ↑ | `{"type": "chunk", "requestId", "data"}` | one OpenAI `chat.completion.chunk`; validated on souk's side, an invalid one fails the completion |
 | ↑ | `{"type": "done", "requestId"}` | end of that response |
-| ↑ | `{"type": "error", "requestId", "message"}` | provider-side failure or refusal, so the waiting completion fails fast instead of timing out — policy (throttling, billing, refusing a chain it does not recognise) is the LLM provider's, and this frame is how it says no |
+| ↑ | `{"type": "error", "requestId", "message", "refusal"?}` | provider-side failure or refusal, so the waiting completion fails fast instead of timing out — policy (throttling, billing, refusing a chain it does not recognise) is the LLM provider's, and this frame is how it says no. `refusal` is a structured payload relayed to the calling agent *intact* (in-stream as the `{"error": ...}` value, or as `error` on the non-streaming 502 body) — the envelope souk guarantees; the vocabulary inside is the two roles' own |
 | ↓ | `{"type": "error", "requestId"?, "message"}` | server-side rejection of a frame (unknown type, or a `requestId` not in flight on this connection) — answered, not a teardown, same as the provider socket |
 
 `requestId` multiplexing means one socket serves concurrent completions.

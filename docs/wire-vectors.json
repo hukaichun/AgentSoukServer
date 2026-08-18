@@ -1,0 +1,46 @@
+{
+  "comment": "Authoritative byte-level vectors for the payloads this gateway authors: the /ws/provider and /ws/kyok handshake. The gateway's, souk-agent-sdk's and souk-client-sdk's test suites all consume this file, so the three restatements of the handshake cannot drift from each other; an external implementation in any language replays it: build each payload from `inputs`, assert the exact `payload_utf8` bytes, and check `signature_hex` verifies (deterministic Ed25519 — reproducing it is equivalent) under the published key for that side. The signing-payload families souk core authors (souk-register, souk-register-llm, souk-delete-agent, souk-kyok-call) are published upstream in AgentSouk/docs/contract-vectors.json under the same provider test key. Both test keys are for vectors only — never accept either in a real deployment.",
+  "handshake_version": 1,
+  "provider_test_key": {
+    "algorithm": "Ed25519",
+    "comment": "The same test key upstream's contract-vectors.json publishes, so one keypair drives both files.",
+    "private_key_hex": "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+    "public_key_hex": "29e5833a915a6429a4e3a7948475c338ef436eb82be89c92f059704403db9d55"
+  },
+  "souk_test_key": {
+    "algorithm": "Ed25519",
+    "comment": "The souk side of the mutual handshake signs too — that is the point of it.",
+    "private_key_hex": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+    "public_key_hex": "d404bc44565aedbb899150e5b0b3b32b9441bf0cb7884c33130da8dbc27dd2cf"
+  },
+  "vectors": [
+    {
+      "kind": "souk-challenge",
+      "signed_by": "souk_test_key",
+      "inputs": {
+        "provider_nonce": "70726f7669646572-nonce-0001",
+        "souk_nonce": "736f756b-nonce-0002"
+      },
+      "payload_utf8": "souk-auth:souk:70726f7669646572-nonce-0001:736f756b-nonce-0002",
+      "signature_hex": "c2925dc31610eb14c136cadf2eabc8913ce039520526213198a90bf977341d8cb6ce7cda3409a5467adcfbeed38b6de2df4c06e6ed2fd04028ac4b9f6c737509"
+    },
+    {
+      "kind": "provider-proof",
+      "signed_by": "provider_test_key",
+      "inputs": {
+        "provider_nonce": "70726f7669646572-nonce-0001",
+        "souk_nonce": "736f756b-nonce-0002",
+        "hello_raw": "{\"type\": \"hello\", \"version\": 1, \"publicKey\": \"29e5833a915a6429a4e3a7948475c338ef436eb82be89c92f059704403db9d55\", \"agentNames\": [\"translator\"], \"nonce\": \"70726f7669646572-nonce-0001\"}",
+        "hello_sha256_hex": "65ba13c33723b1358a50ce532a3549b55ae77d3e85e31d0b97877d6863fe95e0",
+        "note": "the digest is over the exact hello text as it went on the wire, never a re-serialization; the same payload shape serves /ws/kyok, whose hello carries modelNames instead of agentNames"
+      },
+      "payload_utf8": "souk-auth:provider:70726f7669646572-nonce-0001:736f756b-nonce-0002:65ba13c33723b1358a50ce532a3549b55ae77d3e85e31d0b97877d6863fe95e0",
+      "signature_hex": "81e0cd5193fc510f915bb82baae1517936ebd15699fb58dda2e31791eabe9ef410778003444030c3ea84d96090139035d57ec9871e8a387917012676572ddf0b"
+    }
+  ],
+  "frames": {
+    "comment": "The frame vocabulary each socket accepts inbound after the handshake. The gateway's dispatch is asserted against these sets, so a type added in code without a row here fails a test. Full field semantics live in docs/server-mode.md.",
+    "provider_socket_inbound": ["ack", "event", "finish", "query"],
+    "kyok_socket_inbound": ["chunk", "done", "error"]
+  }
+}

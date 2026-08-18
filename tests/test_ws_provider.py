@@ -410,6 +410,46 @@ async def test_the_transport_keeps_no_state_per_run(souk, register):
             await _drain(souk, *run_ids)
 
 
+async def test_a_reasoned_decline_fails_the_run_with_the_reason_recorded(souk, register):
+    """The #18 wire half meeting AgentSouk#65's port: an ack that says no
+    *with a reason* is a permanent refusal. souk fails the run, records
+    the provider's words verbatim in failureReason, and does not offer it
+    again — the run that used to sit `queued` forever while the reason
+    lived in a log on somebody else's machine now says what happened,
+    where the caller looks."""
+    served = await register("greeter")
+    async with _provider_client(souk) as client:
+        async with _connect(client) as ws:
+            socket = await _handshake(ws, served.identity, ["greeter"])
+            handle = await souk.start_run(served.ref(), {"messages": []})
+
+            first = await socket.recv()
+            assert first["type"] == "run"
+            await socket.send(
+                {
+                    "type": "ack",
+                    "runId": first["runId"],
+                    "accepted": False,
+                    "reason": "input does not validate as RunAgentInput: probe",
+                }
+            )
+            # Permanently refused: failed now, not re-offered on reconnect.
+            async with asyncio.timeout(2):
+                while (await souk.get_run(handle.run_id)).status != "failed":
+                    await asyncio.sleep(0.01)
+            await socket.expect_nothing()
+
+        stored = await souk.get_run(handle.run_id)
+        assert stored.metadata["failureReason"] == (
+            "input does not validate as RunAgentInput: probe"
+        )
+        assert souk.broker.get(handle.run_id) is None
+
+        async with _connect(client) as ws:
+            socket = await _handshake(ws, served.identity, ["greeter"])
+            await socket.expect_nothing()
+
+
 async def test_a_declined_offer_costs_the_run_nothing(souk, register):
     """Saying no is how a full provider says so, and the run stays souk's.
 

@@ -185,13 +185,29 @@ async def test_registration_over_http_then_attach(souk):
         assert resp.json() == {"models": ["gpt-test"]}
 
         ref = LlmRef(provider_key=identity.public_key, name="gpt-test")
+
+        async def roster_row() -> dict:
+            resp = await client.get("/llm-providers")
+            assert resp.status_code == 200
+            (row,) = resp.json()["offerings"]
+            return row
+
+        # Registered but not attached: discoverable, and honestly offline —
+        # the pre-flight glance a KYOK caller binds on.
+        row = await roster_row()
+        assert (row["provider_key"], row["name"]) == (identity.public_key, "gpt-test")
+        assert row["metadata"] == {"family": "test"}
+        assert row["online"] is False
+
         async with aconnect_ws("http://test/ws/kyok", client) as ws:
             await _LlmSocket(ws, identity).connect(["gpt-test"])
             assert souk.kyok_relay.serving(ref) is not None
+            assert (await roster_row())["online"] is True
         # And detached the moment the socket is gone.
         async with asyncio.timeout(RECEIVE_TIMEOUT):
             while souk.kyok_relay.serving(ref) is not None:
                 await asyncio.sleep(0.01)
+        assert (await roster_row())["online"] is False
 
 
 # --- round trips -------------------------------------------------------------
@@ -321,6 +337,61 @@ async def test_an_error_frame_fails_the_completion_fast(souk, register):
         }
     finally:
         souk.broker.forget(run_id)
+
+
+async def test_a_structured_refusal_reaches_the_agent_intact(souk, register):
+    """The #63 envelope through this gateway, both response shapes: an
+    error frame carrying a `refusal` dict arrives as the agent's error
+    payload — data, not prose — in-stream for a streaming call, and on
+    the 502 body for a non-streaming one. The vocabulary inside is the
+    two roles' own; nothing on this path interprets it."""
+    refusal = {"kind": "throttled", "retryAfter": 30}
+    llm_identity = await _register_llm(souk, ["gpt-test"])
+    llm = LlmRef(provider_key=llm_identity.public_key, name="gpt-test")
+
+    for run_id, stream in (("run_refused_stream", True), ("run_refused_plain", False)):
+        served, token = await _live(register, souk, run_id, llm)
+        try:
+            body = json.dumps({"messages": [], "stream": stream}).encode()
+            async with _client(souk) as client:
+                async with aconnect_ws("http://test/ws/kyok", client) as ws:
+                    socket = _LlmSocket(ws, llm_identity)
+                    await socket.connect(["gpt-test"])
+
+                    async def agent_call():
+                        if stream:
+                            async with client.stream(
+                                "POST",
+                                "/kyok/v1/chat/completions",
+                                content=body,
+                                headers=_kyok_headers(token, served.identity._key, body),
+                            ) as resp:
+                                return [line async for line in resp.aiter_lines() if line]
+                        return await client.post(
+                            "/kyok/v1/chat/completions",
+                            content=body,
+                            headers=_kyok_headers(token, served.identity._key, body),
+                        )
+
+                    async def llm_refuses():
+                        request = await socket.recv()
+                        await socket.send(
+                            {
+                                "type": "error",
+                                "requestId": request["requestId"],
+                                "message": "refused by the LLM provider",
+                                "refusal": refusal,
+                            }
+                        )
+
+                    answer, _ = await asyncio.gather(agent_call(), llm_refuses())
+            if stream:
+                assert json.loads(answer[0].removeprefix("data: ")) == {"error": refusal}
+            else:
+                assert answer.status_code == 502
+                assert answer.json()["error"] == refusal
+        finally:
+            souk.broker.forget(run_id)
 
 
 async def test_one_socket_multiplexes_concurrent_completions(souk, register):

@@ -13,8 +13,10 @@ from souk.identity import provider_fingerprint
 from souk_server.deps import get_souk
 from souk_server.models import (
     AgentRosterEntry,
+    LlmOfferingEntry,
     LlmRegisterRequest,
     LlmRegisterResponse,
+    LlmRosterResponse,
     RegisterBatchRequest,
     RegisterBatchResponse,
     RosterResponse,
@@ -50,6 +52,22 @@ async def register_llm_providers(
         metadata=body.metadata or None,
     )
     return LlmRegisterResponse(models=sorted(registered))
+
+
+@router.get("/llm-providers")
+async def list_llm_providers(souk: Souk = Depends(get_souk)) -> LlmRosterResponse:
+    """The offering roster, `GET /agents`' mirror — what a KYOK caller
+    reads to discover an offering and to glance at its liveness before
+    binding a run to it."""
+    return LlmRosterResponse(
+        offerings=[
+            LlmOfferingEntry(
+                **summary.model_dump(),
+                fingerprint=provider_fingerprint(summary.provider_key),
+            )
+            for summary in await souk.list_llm_providers()
+        ]
+    )
 
 
 @router.get("/agents")

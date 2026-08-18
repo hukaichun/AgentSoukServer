@@ -347,9 +347,13 @@ async def test_a_run_for_an_unknown_agent_is_declined_without_taking_the_socket_
                     "runId": "r_alien",
                     "threadId": "t1",
                     "agentName": "not_ours",
-                    "input": {},
+                    "input": _input("r_alien"),
                 }
             )
+            # A bare decline, no reason: "not ours" is deliberately NOT a
+            # permanent refusal — another provider hosting the name could
+            # still take the run, and a reasoned ack would make souk fail
+            # it for everybody.
             assert (await gateway.next_frame()) == {
                 "type": "ack",
                 "runId": "r_alien",

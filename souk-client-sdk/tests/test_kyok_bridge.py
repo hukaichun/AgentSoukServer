@@ -72,10 +72,32 @@ def test_run_metadata_names_the_offering_and_carries_the_context():
     assert "context" not in bridge.run_metadata()["kyok"]
 
 
-async def test_serve_forever_requires_register_first():
-    bridge = KyokBridge("http://souk.local", model="test-model", api_key="key")
-    with pytest.raises(AssertionError):
-        await bridge.serve_forever()
+async def test_every_connection_re_registers_first(monkeypatch):
+    """The #16 fix: registration is part of each connection cycle, not a
+    one-shot precondition — a souk whose database was reset gets the
+    offering back on the next reconnect instead of refusing the attach
+    forever."""
+    calls = 0
+
+    async def counting_register(self):
+        nonlocal calls
+        calls += 1
+
+    monkeypatch.setattr(KyokBridge, "register", counting_register)
+    async with StubGateway() as gateway:
+        bridge, task = await _connected_bridge(gateway, stub_register=False)
+        try:
+            assert calls == 1
+            # The connection drops; the reconnect cycle registers again.
+            gateway.connected.clear()
+            await gateway._conn.close()
+            async with asyncio.timeout(RECEIVE_TIMEOUT + bridge.reconnect_delay):
+                await gateway.connected.wait()
+            assert calls == 2
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
 
 # --- the socket ------------------------------------------------------------
@@ -122,9 +144,22 @@ class StubGateway:
             return await self.frames.get()
 
 
-async def _connected_bridge(gateway: StubGateway, **kwargs: Any):
-    bridge = KyokBridge(f"http://127.0.0.1:{gateway.port}", model="test-model", api_key="key", **kwargs)
-    bridge.registered = True  # the stub enforces no roster; register() needs an HTTP souk
+async def _connected_bridge(gateway: StubGateway, *, stub_register: bool = True, **kwargs: Any):
+    bridge = KyokBridge(
+        f"http://127.0.0.1:{gateway.port}",
+        model="test-model",
+        api_key="key",
+        reconnect_delay=0.05,
+        **kwargs,
+    )
+    # The stub is ws-only; registration needs an HTTP souk. A test that
+    # cares about register() patches it itself and passes stub_register=False.
+    if stub_register:
+
+        async def no_register():
+            pass
+
+        bridge.register = no_register
     task = asyncio.create_task(bridge.serve_forever())
     async with asyncio.timeout(RECEIVE_TIMEOUT):
         await gateway.connected.wait()
@@ -158,6 +193,67 @@ def test_the_registration_payload_matches_the_sdk_statement():
     local restatement — one line, and it is what keeps this side from
     drifting when core's changes."""
     assert llm_registration_payload(["m"], 123) == b"souk-register-llm:m:123"
+
+
+async def test_serving_is_the_whole_lifecycle_in_one_block():
+    """#19: registered, attached before the body runs, torn down on exit."""
+    async with StubGateway() as gateway:
+        bridge = KyokBridge(
+            f"http://127.0.0.1:{gateway.port}", model="m", api_key="k", reconnect_delay=0.05
+        )
+
+        async def no_register():
+            pass
+
+        bridge.register = no_register
+        async with asyncio.timeout(RECEIVE_TIMEOUT):
+            async with bridge.serving():
+                # The block only opens attached — no race against the
+                # socket for a run started here.
+                assert bridge.attached.is_set()
+        # And nothing is left serving after the block.
+        assert not bridge.attached.is_set()
+
+
+async def test_a_refusal_from_the_handler_travels_as_a_structured_error_frame():
+    """The #63 envelope, end to end on this side: a handler raising
+    CompletionRefused answers with its payload on the error frame, not
+    prose — and the handler saw the whole DeliveredCompletion, which is
+    the material its policy runs on."""
+    from souk_llm_provider_sdk import CompletionRefused
+
+    seen: dict = {}
+
+    async def refusing_handler(delivered):
+        seen["delivered"] = delivered
+        raise CompletionRefused({"kind": "throttled", "retryAfter": 30})
+        yield  # pragma: no cover - makes this an async generator
+
+    async with StubGateway() as gateway:
+        _bridge, task = await _connected_bridge(gateway, handler=refusing_handler)
+        try:
+            await gateway.push(
+                {
+                    "type": "completionRequest",
+                    "requestId": "req_1",
+                    "runId": "run_9",
+                    "providerKey": "ab" * 32,
+                    "agentName": "greeter",
+                    "llmName": "kyok",
+                    "context": {"voucher": "v1"},
+                    "payload": {"messages": []},
+                }
+            )
+            frame = await gateway.next_frame()
+            assert frame["type"] == "error"
+            assert frame["refusal"] == {"kind": "throttled", "retryAfter": 30}
+            assert seen["delivered"].run_id == "run_9"
+            assert seen["delivered"].agent_name == "greeter"
+            assert seen["delivered"].context == {"voucher": "v1"}
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
 
 async def test_a_completion_request_streams_back_as_chunks_then_done(monkeypatch):
