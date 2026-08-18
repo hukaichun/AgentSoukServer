@@ -1618,7 +1618,6 @@ postgres = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "alembic" },
     { name = "httpx" },
     { name = "httpx-ws" },
     { name = "psycopg", extra = ["binary", "pool"] },
@@ -1642,7 +1641,6 @@ provides-extras = ["postgres"]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "alembic", specifier = ">=1.13" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "httpx-ws", specifier = ">=0.9.0" },
     { name = "psycopg", extras = ["binary", "pool"], specifier = ">=3.2" },

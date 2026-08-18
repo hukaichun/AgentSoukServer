@@ -149,11 +149,26 @@ export async function fetchAgents(soukUrl: string): Promise<AgentRosterEntry[]> 
 // (CRLF vs LF, multi-line `data:` fields, comment lines, `id:`/`retry:`)
 // that it isn't worth re-deriving by hand a second time.
 // Calls `onEvent` with the parsed JSON payload of each event as it arrives.
+//
+// Read with an explicit reader loop, not `for await (… of stream)`:
+// async iteration of ReadableStream is a late addition to the spec that
+// WebKit has not implemented, so the for-await form worked in
+// Chromium/Gecko and threw `undefined is not a function` on every
+// Safari/iOS browser — which killed the whole conversation page there,
+// while roster/index (plain resp.json()) kept working. Nothing caught it
+// because tsconfig's lib said "DOM.AsyncIterable", which is exactly the
+// promise WebKit doesn't keep; that lib entry is gone now, so
+// reintroducing for-await over a ReadableStream fails `npm run
+// typecheck` instead of failing in the user's hand. `getReader()` is
+// original-spec and universal.
 export async function streamSse(response: Response, onEvent: (event: any) => void): Promise<void> {
-  const stream = response
+  const reader = response
     .body!.pipeThrough(new TextDecoderStream())
-    .pipeThrough(new EventSourceParserStream());
-  for await (const event of stream) {
+    .pipeThrough(new EventSourceParserStream())
+    .getReader();
+  while (true) {
+    const { done, value: event } = await reader.read();
+    if (done) return;
     try {
       onEvent(JSON.parse(event.data));
     } catch (err) {
