@@ -39,16 +39,17 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
+from types import SimpleNamespace
+
 import httpx
 import websockets
-from ag_ui.core import RunAgentInput
-from pydantic import ValidationError
 from souk_provider_sdk import (
     AgentHandle,
     DeliveredRun,
     HandleProvider,
     ProviderIdentity,
     ProviderRuntime,
+    Refusal,
     SoukLink,
     verify_signature,
 )
@@ -457,58 +458,47 @@ class SoukProvider(SoukLink):
                     await writer
 
     async def _offer(self, frame: dict[str, Any]) -> None:
-        # The SDK types `run_input` as `RunAgentInput`, and validating at
-        # the wire is what keeps that claim true: past this point the
-        # runtime and every agent behind it may lean on the model instead
-        # of re-checking a dict.
-        try:
-            run_input = RunAgentInput.model_validate(frame.get("input") or {})
-        except ValidationError as e:
-            reason = f"input does not validate as RunAgentInput: {e}"
-            logger.warning("refusing run %s: %s", frame.get("runId"), reason)
-            # `reason` makes this a *permanent* refusal, not a capacity
-            # decline: re-offering the same bytes can never succeed, so
-            # souk fails the run with this string recorded verbatim
-            # instead of re-offering it forever while the caller watches
-            # a queued run sit silent. Same rule `SoukLink.deliver`
-            # states in-process.
-            self._outbound.put_nowait(
-                {
-                    "type": "ack",
-                    "runId": frame.get("runId"),
-                    "accepted": False,
-                    "reason": reason,
-                }
-            )
-            return
-        run = DeliveredRun(
-            run_id=frame["runId"],
-            agent_name=frame.get("agentName", ""),
-            run_input=run_input,
-            thread_id=frame.get("threadId"),
-        )
+        run_id = frame.get("runId", "")
+        agent_name = frame.get("agentName", "")
         # A name this provider does not host is declined here rather than
         # passed on. The runtime cannot answer it — `deliver` is a capacity
         # question and knows nothing about names — so accepting would start
         # a run that raises KeyError on its first step, report a bare
         # stream end, and have souk record it as *failed*. Declining leaves
         # it queued for a provider that does host the name, which is the
-        # difference between "not me" and "broken".
+        # difference between "not me" and "broken" — and why this stays a
+        # bare decline while a validation failure below carries a reason.
         #
         # souk should never send one: it offers a run only to a provider
         # attached for that agent. This is the answer for when it does.
-        if run.agent_name not in self.agents:
+        if agent_name not in self.agents:
             logger.warning(
-                "declining run %s: this provider does not serve %r",
-                run.run_id,
-                run.agent_name,
+                "declining run %s: this provider does not serve %r", run_id, agent_name
             )
-            self._outbound.put_nowait({"type": "ack", "runId": run.run_id, "accepted": False})
+            self._outbound.put_nowait({"type": "ack", "runId": run_id, "accepted": False})
             return
-        accepted = await self.runtime.deliver(run)
-        self._outbound.put_nowait(
-            {"type": "ack", "runId": run.run_id, "accepted": accepted}
+        # Through the inherited `SoukLink.deliver`, not a restatement of
+        # it: the base owns the claimed-run → `DeliveredRun` translation
+        # and the validation rule (input that fails `RunAgentInput` is a
+        # permanent `Refusal`, not a transient decline). This side only
+        # reshapes the frame into the attribute shape the port reads —
+        # so when upstream's rule changes, this transport follows without
+        # anyone remembering to mirror it. AgentSouk#74 is the ask for
+        # the day the reshaping itself comes from upstream too.
+        outcome = await self.deliver(
+            SimpleNamespace(
+                run_id=run_id,
+                agent=SimpleNamespace(name=agent_name),
+                run_input=frame.get("input") or {},
+                thread_id=frame.get("threadId"),
+            )
         )
+        if isinstance(outcome, Refusal):
+            logger.warning("refusing run %s: %s", run_id, outcome.reason)
+            ack = {"type": "ack", "runId": run_id, "accepted": False, "reason": outcome.reason}
+        else:
+            ack = {"type": "ack", "runId": run_id, "accepted": bool(outcome)}
+        self._outbound.put_nowait(ack)
 
     async def _write_loop(self, ws) -> None:
         while True:
