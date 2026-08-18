@@ -143,6 +143,19 @@ test drives); tampering with a live connection's other fields was already
 outside the threat model here — an intercepting proxy is trusted by
 construction (AgentSoukServer#10). Traded knowingly.
 
+**Who verifies moved, deliberately.** The proof is checked by core's
+`attach` now, not by this gateway: souk mints the challenge
+(`Souk.issue_connect_challenge` — single-use, freshness-bounded), the
+socket relays it as the challenge frame's nonce and passes the returned
+signature into `attach_provider`/`attach_llm_provider`, and core refuses
+an attach whose proof does not answer a live challenge. Attaching is
+where runs change hands, so it is where the proof belongs — and the
+in-process links are challenged the same way, closing the era when this
+transport was the only authenticated road in. The dev stack and the test
+suite run `SOUK_REQUIRE_CONNECT_PROOF=true`; the permissive default is
+upstream's migration switch for deployments whose transports still
+authenticate at their own edge, which this gateway no longer is.
+
 Why each piece is there:
 
 - **Both nonces in both signatures.** Each side contributes freshness, so

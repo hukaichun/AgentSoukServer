@@ -35,18 +35,12 @@ from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, WebSocket
 
-from souk.errors import AgentNotFound
-from souk.identity import verify_signature
+from souk.errors import AgentNotFound, InvalidRegistration
 from souk.models import AgentRef
 from pydantic import ValidationError
 from souk_provider_sdk import CONNECTED_PROVIDER_ATTRS, DeliveredRun, Refusal
 from souk_provider_sdk.contract import LINK_QUERY_METHODS
-from souk_server.handshake import (
-    HANDSHAKE_VERSION,
-    new_nonce,
-    provider_connect_payload,
-    souk_connect_payload,
-)
+from souk_server.handshake import HANDSHAKE_VERSION, souk_connect_payload
 from souk_server.ws_common import (
     POLICY_VIOLATION,
     close_frame,
@@ -346,35 +340,31 @@ def _hello_error(hello: dict[str, Any]) -> str | None:
     return None
 
 
-async def prove_and_verify(
-    websocket: WebSocket, souk: "Souk", hello: dict[str, Any], names: list[str]
-) -> bool:
-    """Frames two and three: souk answers the provider's nonce, then checks
-    the provider's answer to its own. True if the provider proved itself.
+async def collect_connect_proof(
+    websocket: WebSocket, souk: "Souk", hello: dict[str, Any]
+) -> tuple[str, str] | None:
+    """Frames two and three: souk answers the provider's nonce, then
+    collects the provider's answer to its own. Returns `(challenge,
+    proof)` for attach to verify, or None after closing the socket.
 
-    The signed bytes are upstream's connect family (handshake v2): souk
-    signs `souk-connect-souk:{nonce_s}:{nonce_p}`, the provider signs
-    `souk-connect-provider:{nonce_s}:{nonce_p}:{sorted names}` — `names`
-    being whichever roster this socket attaches for, which is why the
-    caller passes them rather than this function re-reading the hello.
-
-    Closes the socket itself on every failure — there is exactly one way
-    past this function, which is what keeps a half-authenticated
-    connection from existing.
+    The gateway stopped being the verifier here — that moved into core's
+    attach, which is where runs change hands and therefore where the
+    proof belongs (upstream's attach-proof change; in-process links are
+    challenged the same way now, so this transport is no longer the only
+    authenticated road in). What stays this side's: relaying the
+    challenge core minted (`issue_connect_challenge` — single-use,
+    freshness-bounded, so a recorded proof answers a question nobody is
+    asking), and souk's own signature over `souk-connect-souk:...`, which
+    core cannot send because core has no wire.
 
     souk signs first, and that ordering is the point of the exchange
     rather than an accident of it: a provider must be able to walk away
     from a souk it does not recognise *before* it has produced anything
-    worth stealing. Signing second would mean handing a credential to
-    whatever answered the URL and only then asking who it was.
-
-    A souk with no identity configured cannot sign, and says so by sending
-    a challenge with `soukPublicKey: null` rather than by failing. That is
-    an honest report of today's deployment, and it is the provider's to
-    act on — one that pinned a key refuses; one that pinned nothing is no
-    worse off than it was before this existed.
+    worth stealing. A souk with no identity configured cannot sign, and
+    says so by sending `soukPublicKey: null` rather than by failing —
+    honest, and the provider's pin is what turns it into a refusal.
     """
-    souk_nonce = new_nonce()
+    souk_nonce = souk.issue_connect_challenge()
     provider_nonce = hello["nonce"]
     souk_public_key = souk.identity_public_key
     challenge: dict[str, Any] = {
@@ -398,19 +388,12 @@ async def prove_and_verify(
     proof = await receive_frame(websocket)
     if proof is None or proof.get("type") != "proof":
         await websocket.close(code=POLICY_VIOLATION, reason="expected a proof frame")
-        return False
+        return None
     signature = proof.get("signature")
     if not isinstance(signature, str):
         await websocket.close(code=POLICY_VIOLATION, reason="proof needs a signature")
-        return False
-    if not verify_signature(
-        hello["publicKey"],
-        signature,
-        provider_connect_payload(souk_nonce, provider_nonce, names),
-    ):
-        await websocket.close(code=POLICY_VIOLATION, reason="proof does not verify")
-        return False
-    return True
+        return None
+    return souk_nonce, signature
 
 
 @router.websocket("/ws/provider")
@@ -428,8 +411,10 @@ async def provider_socket(websocket: WebSocket) -> None:
         await websocket.close(code=POLICY_VIOLATION, reason=problem)
         return
 
-    if not await prove_and_verify(websocket, souk, hello, hello["agentNames"]):
+    exchange = await collect_connect_proof(websocket, souk, hello)
+    if exchange is None:
         return
+    challenge, proof = exchange
 
     public_key = hello["publicKey"]
     agent_names = hello["agentNames"]
@@ -449,11 +434,17 @@ async def provider_socket(websocket: WebSocket) -> None:
     # attach still closes without ever sending this.
     outbound.put_nowait({"type": "welcome"})
     try:
-        # Registration is the prerequisite, and core enforces it: a name
-        # this key never registered is refused here rather than being
-        # served by nobody later.
-        await souk.attach_provider(provider, agent_names)
-    except (AgentNotFound, ValueError) as e:
+        # Registration and the connect proof are both core's to enforce:
+        # a name this key never registered, or a proof that does not
+        # answer the live challenge, is refused here rather than served.
+        await souk.attach_provider(
+            provider,
+            agent_names,
+            challenge=challenge,
+            provider_nonce=hello["nonce"],
+            proof=proof,
+        )
+    except (AgentNotFound, InvalidRegistration, ValueError) as e:
         await websocket.close(code=POLICY_VIOLATION, reason=str(e))
         return
 
