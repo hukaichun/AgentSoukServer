@@ -330,6 +330,36 @@ async def test_a_cancel_interrupts_the_run_and_finish_still_goes_out(tmp_path):
             assert (await gateway.next_frame()) == {"type": "finish", "runId": "r1"}
 
 
+async def test_invalid_input_is_refused_with_the_reason_on_the_ack(tmp_path):
+    """The permanent-refusal path, now inherited: `_offer` routes the
+    frame through `SoukLink.deliver`, whose rule — input failing
+    `RunAgentInput` validation is a `Refusal`, not a transient decline —
+    reaches the wire as `accepted: false` plus the reason souk records
+    verbatim. This test goes red if the client ever grows its own copy of
+    the rule again and the two drift."""
+    async with StubGateway() as gateway:
+        provider = _provider(
+            gateway,
+            [AgentHandle(name="echo", run_stream=_echo_run_stream)],
+            identity_key_path=str(tmp_path / "k.key"),
+        )
+        async with _connected(gateway, provider):
+            await gateway.push(
+                {
+                    "type": "run",
+                    "runId": "r_bad",
+                    "threadId": "t1",
+                    "agentName": "echo",
+                    "input": {"runId": "r_bad"},  # no threadId/state/... — not a RunAgentInput
+                }
+            )
+            ack = await gateway.next_frame()
+            assert ack["type"] == "ack"
+            assert ack["runId"] == "r_bad"
+            assert ack["accepted"] is False
+            assert "RunAgentInput" in ack["reason"]
+
+
 async def test_a_run_for_an_unknown_agent_is_declined_without_taking_the_socket_down(tmp_path):
     """Declining is a real answer now, so an agent this provider does not
     host produces `accepted: false` rather than silence. souk keeps the
