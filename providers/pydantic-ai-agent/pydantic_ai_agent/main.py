@@ -117,13 +117,15 @@ def make_run_stream(
     # long-lived souk would want an LRU here.
     sub_threads: dict[str, dict[str, str]] = {}
 
-    async def run_stream(run_input: dict[str, Any]) -> AsyncIterator[dict[str, Any]]:
+    async def run_stream(run_input) -> AsyncIterator[dict[str, Any]]:
         # `combined` is where the AG-UI adapter's own events AND any
         # sub-agent CUSTOM progress events (pushed by tools via AgentDeps)
         # both land, so they interleave in real time rather than the
         # progress only surfacing after the fact.
-        # run_input is a real AG-UI RunAgentInput JSON dict from souk (see
-        # souk.agui.build_run_agent_input) — camelCase wire keys.
+        # The SDK hands a typed `ag_ui.core.RunAgentInput`; this provider
+        # works on the camelCase wire dict (history merging, the AG-UI
+        # adapter's own parser), so dump it back once at the edge.
+        run_input = run_input.model_dump(by_alias=True)
         combined: asyncio.Queue = asyncio.Queue()
         # Before anything reads `run_input`: what the caller sent may be
         # one message on a long conversation, and only souk knows which.

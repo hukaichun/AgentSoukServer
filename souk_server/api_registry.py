@@ -11,7 +11,14 @@ from fastapi import APIRouter, Depends
 from souk.core import Souk
 from souk.identity import provider_fingerprint
 from souk_server.deps import get_souk
-from souk_server.models import AgentRosterEntry, RegisterBatchRequest, RegisterBatchResponse, RosterResponse
+from souk_server.models import (
+    AgentRosterEntry,
+    LlmRegisterRequest,
+    LlmRegisterResponse,
+    RegisterBatchRequest,
+    RegisterBatchResponse,
+    RosterResponse,
+)
 
 router = APIRouter()
 
@@ -29,6 +36,20 @@ async def register_agents(
     )
 
     return RegisterBatchResponse(agents=await _roster(souk))
+
+
+@router.post("/llm-providers/register", status_code=201)
+async def register_llm_providers(
+    body: LlmRegisterRequest, souk: Souk = Depends(get_souk)
+) -> LlmRegisterResponse:
+    registered = await souk.register_llm_providers(
+        body.public_key,
+        body.signature,
+        body.timestamp,
+        body.models,
+        metadata=body.metadata or None,
+    )
+    return LlmRegisterResponse(models=sorted(registered))
 
 
 @router.get("/agents")

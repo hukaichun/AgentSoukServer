@@ -29,11 +29,14 @@ from souk_agent_sdk import AgentHandle, SoukProvider
 logger = logging.getLogger("agent_template")
 
 
-async def run_stream(run_input: dict[str, Any]) -> AsyncIterator[dict[str, Any]]:
+async def run_stream(run_input) -> AsyncIterator[dict[str, Any]]:
     """Echoes the last user message back. This is the whole agent — real
     ones would call an LLM here instead, but the AG-UI event shape souk
     expects is the same either way.
     """
+    # The SDK hands a typed `ag_ui.core.RunAgentInput` now; this template
+    # works on the camelCase wire dict, so dump it back once at the edge.
+    run_input = run_input.model_dump(by_alias=True)
     thread_id = run_input["threadId"]
     run_id = run_input["runId"]
     yield {"type": "RUN_STARTED", "threadId": thread_id, "runId": run_id}

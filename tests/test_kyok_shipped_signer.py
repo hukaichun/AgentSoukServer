@@ -24,22 +24,15 @@ from souk_agent_sdk.kyok_auth import KyokSigningAuth
 from souk_server.server import create_app
 
 
-async def test_the_signer_a_provider_ships_is_accepted_by_this_gateway(souk, register, monkeypatch):
+async def test_the_signer_a_provider_ships_is_accepted_by_this_gateway(souk, register):
     """No hand-written headers anywhere in this test. The token comes from
     core, the signature from the SDK, and the verification from the gateway —
     three separate statements of the same payload, meeting for the first
     time."""
-    # Nothing here stands up a bridge, so the call runs to the claim
-    # timeout on its way to the 502 this asserts. Shortened, because the
-    # wait is scenery — the authorization decision has already been made
-    # by the time anything starts waiting.
-    import souk.protocols.kyok as kyok_protocol
-
-    monkeypatch.setattr(kyok_protocol, "CLAIM_TIMEOUT_SECONDS", 0.05)
     served = await register("greeter")
     run_id = "run_shipped_signer"
     souk.enqueue_run(run_id, served.ref(), "thread_1", {}, "ag-ui")
-    token = issue_kyok_token(run_id, "sess_shipped", served.ref(), "test-signing-secret")
+    token = issue_kyok_token(run_id, served.ref(), "test-signing-secret")
     try:
         transport = httpx.ASGITransport(app=create_app(souk))
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -50,9 +43,9 @@ async def test_the_signer_a_provider_ships_is_accepted_by_this_gateway(souk, reg
                 auth=KyokSigningAuth(served.identity._key),
             )
 
-        # 502 is the *pass*: authorization succeeded and the call went on to
-        # wait for a bridge that this test never stands up. A signature the
+        # 503 is the *pass*: authorization succeeded, and the call moved on
+        # to resolving a KYOK binding this test never made. A signature the
         # gateway rejected would be 401, which is the failure being guarded.
-        assert resp.status_code == 502, resp.text
+        assert resp.status_code == 503, resp.text
     finally:
         souk.broker.forget(run_id)

@@ -151,10 +151,12 @@ class SoukClient:
         `agent` is an `Agent` from `resolve` or `roster`. It is not a name:
         see this module's docstring for why the SDK asks for an address.
 
-        `metadata` is stored on the run/thread as-is and, notably, is
-        where a Keep Your Own Key caller passes
-        `{"kyok": {"sessionId": ...}}` — see KyokBridge and
-        docs/keep-your-own-key.md in the souk repo.
+        `metadata` is stored on the run/thread as-is (minus
+        `kyok.context`, which souk strips before anything persists) and,
+        notably, is where a Keep Your Own Key caller opts the run into an
+        LLM offering: `{"kyok": {"llmProvider": {"providerKey": ...,
+        "name": ...}, "context": ...}}` — `KyokBridge.run_metadata()`
+        builds it; see docs/keep-your-own-key.md in the souk repo.
 
         `resume` is AG-UI's own interrupt/resume mechanism
         (`ag_ui.core.ResumeEntry`: `{"interruptId": ..., "status":

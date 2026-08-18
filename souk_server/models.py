@@ -98,6 +98,30 @@ class RegisterBatchResponse(RosterResponse):
     """
 
 
+class LlmRegisterRequest(BaseModel):
+    """Registration for the KYOK side's party: an LLM provider declaring
+    model offerings. Same Ed25519 machinery as agent registration, under
+    its own payload prefix (`souk-register-llm`) so neither signature can
+    be replayed as the other.
+
+    Names are freer than agent names on purpose — a model offering is
+    addressed inside frames and metadata, never in a URL path, and real
+    model names carry dots ("gpt-4.1").
+    """
+
+    models: list[str] = Field(min_length=1)
+    # Free-form description of the offerings (pricing hints, model family,
+    # whatever the provider wants a directory to show). Stored verbatim.
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    public_key: str
+    signature: str
+    timestamp: int
+
+
+class LlmRegisterResponse(BaseModel):
+    models: list[str]
+
+
 class CreateThreadRequest(BaseModel):
     # The agent comes from the URL path (POST /threads/{provider}/{name})
     # — this body is just the optional extras.

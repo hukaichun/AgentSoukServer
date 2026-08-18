@@ -5,7 +5,7 @@ CORS, or terminates TLS — every such decision belongs to whoever hosts souk,
 not to souk itself, which is why `create_app` hands back a plain ASGI app and
 `main` is a thin wrapper that happens to serve it. One listener carries
 everything (docs/server-mode.md): callers over HTTP+SSE, providers over
-WS /ws/provider, KYOK bridges over WS /ws/kyok.
+WS /ws/provider, LLM providers over WS /ws/kyok.
 """
 
 import asyncio

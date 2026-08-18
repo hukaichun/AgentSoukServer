@@ -332,7 +332,7 @@ def _hello_error(hello: dict[str, Any]) -> str | None:
     return None
 
 
-async def _prove_and_verify(
+async def prove_and_verify(
     websocket: WebSocket, souk: "Souk", hello: dict[str, Any], hello_raw: str
 ) -> bool:
     """Frames two and three: souk answers the provider's nonce, then checks
@@ -408,7 +408,7 @@ async def provider_socket(websocket: WebSocket) -> None:
         await websocket.close(code=POLICY_VIOLATION, reason=problem)
         return
 
-    if not await _prove_and_verify(websocket, souk, hello, hello_raw):
+    if not await prove_and_verify(websocket, souk, hello, hello_raw):
         return
 
     public_key = hello["publicKey"]

@@ -105,4 +105,4 @@ async def resolve_ref(souk: Souk, provider: str, name: str) -> AgentRef:
     found = await souk.resolve_agent(provider, name)
     if found is None:
         raise AgentNotFound(f"no agent '{name}' under provider '{provider}'")
-    return AgentRef(provider_key=found["provider_key"], name=found["name"])
+    return AgentRef(provider_key=found.provider_key, name=found.name)

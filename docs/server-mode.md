@@ -23,7 +23,7 @@ a persistent WebSocket each, replacing gRPC entirely.
 | Callers | AG-UI (`/agui/*`, `/threads/*`), A2A (`/a2a/*`), registry (`/agents*`), health | HTTP + SSE | exists, unchanged |
 | Callers | MCP (the docent) | streamable HTTP at `/mcp`, same listener | built; see "MCP: the docent" below |
 | Providers | work relay | `WS /ws/provider` | built |
-| KYOK bridge | completion relay | `WS /ws/kyok` | built |
+| LLM providers (KYOK) | registration (`/llm-providers/register`), completion relay | HTTP + `WS /ws/kyok` | built |
 | Provider's model client | `POST /kyok/v1/chat/completions` | HTTP (OpenAI-compatible by definition) | exists, unchanged |
 
 gRPC is **removed**, not demoted to an option: `grpc_server.py`,
@@ -336,132 +336,97 @@ name is never reused.
 
 ## KYOK relay: `WS /ws/kyok`
 
-Replaces the `GET /kyok/poll` + `POST /kyok/respond/{id}` pair. The
-provider-facing `POST /kyok/v1/chat/completions` endpoint is untouched —
-an OpenAI-compatible URL is the whole point of that side.
+The socket an **LLM provider** connects out on — the party upstream's
+KYOK redesign made first-class (`AgentSouk/docs/keep-your-own-key.md`).
+The agent-provider-facing `POST /kyok/v1/chat/completions` endpoint is
+untouched — an OpenAI-compatible URL is the whole point of that side.
 
-The socket opens with `{"type": "hello", "sessionId": "<session id>"}`.
-`sessionId` is a **routing key, not a credential** — the same
-caller-minted, souk-opaque string `poll` took (souk neither mints nor
-verifies it; see souk/kyok.py). souk has no caller identity to bind a
-bridge credential to, deliberately: *who* may present a session is the
-deployment's business, enforced at the edge (pure ASGI middleware, before
-accept — the header track exists for exactly this). What the socket
-still buys over the query string: `sessionId` no longer appears in any
-URL, so it stops leaking into access logs — the mistake the old
-`/kyok/poll?sessionId=…` was making against this document's own rule.
+This section previously described a different wire: an anonymous
+"bridge" that rendezvoused with souk over a caller-minted `sessionId`,
+with a paragraph of apology for everything a routing key that is secretly
+a credential cannot do (who may open a session, whether two sockets are
+the same party, what a token may safely carry). Upstream's answer was not
+a better session id but an identity: the party answering completions
+registers Ed25519 offerings like any provider and attaches like any
+provider, and every one of those questions became answerable. The
+`session_routing_key` fix this document used to describe — souk hashing
+the session id before putting it in the token — is gone along with the
+session id itself: a KYOK token now carries `{runId, providerKey,
+agentName, exp}` and nothing caller-side at all.
 
-"Not a credential" is what this document said, and for a while it was
-also not true in the direction that mattered. souk was handing the id to
-every provider, inside the KYOK token — which is signed, not sealed, and
-any holder can base64-decode it. So a provider could read the caller's
-session out of its own token, open this socket under it, and be served
-*another* provider's completion: its prompt to read, and its answer to
-write, which is injected tool input for whatever agent acts on the answer.
-Two runs of one caller sharing a bridge session was the whole setup.
+The arrival is the agent provider's, rule for rule:
 
-Fixed in core — the token carries `souk.kyok.session_routing_key(id)`, a
-SHA-256, and `KyokAdapter.poll` derives the key from what the bridge
-presents. **This socket did not change**, by design: the bridge is the
-side that holds the preimage, so it keeps passing whatever `hello` said.
-The guard is
-`tests/test_ws_kyok.py::test_a_provider_cannot_reach_the_bridge_session_with_what_its_token_carries`,
-which tries every string a provider can obtain and asserts none of them is
-served; it goes red if the core fix is reverted.
+1. **register** — `POST /llm-providers/register` with
+   `{models, metadata?, public_key, signature, timestamp}`, the signature
+   over upstream's `souk-register-llm` payload
+   (`souk_llm_provider_sdk.sign_llm_registration` builds it). Names are
+   deliberately not exclusive across identities: two providers both
+   offering `gpt4` is normal, and an offering is `(provider_key, name)`
+   exactly as an agent is.
+2. **attach** — this socket, opened with the same four-frame mutual
+   challenge-response as `/ws/provider` (same `handshake.py` payloads,
+   same version), the hello carrying `modelNames` where the provider
+   socket says `agentNames`. Core refuses an attach for a name this key
+   never registered; a socket that drops takes its offerings offline in
+   the same instant, and a re-attach mid-run just works because a run's
+   binding names the offering, not the connection.
 
-What has *not* changed: knowing the id is still the entire proof, and two
-sockets on one session still coexist and race. The bridge has no
-credential of its own — deliberately deferred, see
-`AgentSouk/docs/keep-your-own-key.md`.
+A caller opts a run in with
+`metadata: {"kyok": {"llmProvider": {"providerKey", "name"}, "context"}}`
+— no extra connection, no SDK required. souk binds the run at start,
+strips `context` from everything it persists, and resolves
+binding → attached link per completion call; not attached is a fast 503,
+the same shape as an offline agent (`souk-client-sdk`'s `KyokBridge` is
+the reference LLM provider and builds that metadata via
+`run_metadata()`).
 
 | direction | frame | carries |
 |---|---|---|
-| ↓ | `{"type": "completionRequest", "requestId", "payload"}` | what `poll` returned, pushed instead of polled |
-| ↑ | `{"type": "chunk", "requestId", "data"}` | one chunk of the bridge's LLM response, handed to `KyokAdapter.respond` as-is |
-| ↑ | `{"type": "done", "requestId"}` | end of that response (was the `_DONE` sentinel / EOF) |
-| ↑ | `{"type": "error", "requestId", "message"}` | bridge-side failure, so the waiting completion can fail fast instead of timing out |
+| ↓ | `{"type": "completionRequest", "requestId", "runId", "providerKey", "agentName", "llmName", "context", "actorChain", "payload"}` | core's `CompletionRequest`, camelCased: the run, the *proven* calling agent, which of this provider's models was addressed, the caller's opaque context, the delegation chain, and the OpenAI-shaped body |
+| ↑ | `{"type": "chunk", "requestId", "data"}` | one OpenAI `chat.completion.chunk`; validated on souk's side, an invalid one fails the completion |
+| ↑ | `{"type": "done", "requestId"}` | end of that response |
+| ↑ | `{"type": "error", "requestId", "message"}` | provider-side failure or refusal, so the waiting completion fails fast instead of timing out — policy (throttling, billing, refusing a chain it does not recognise) is the LLM provider's, and this frame is how it says no |
 | ↓ | `{"type": "error", "requestId"?, "message"}` | server-side rejection of a frame (unknown type, or a `requestId` not in flight on this connection) — answered, not a teardown, same as the provider socket |
 
-`requestId` multiplexing means one bridge socket serves concurrent
-completions — strictly better than `poll_one`'s one-per-cycle handover.
+`requestId` multiplexing means one socket serves concurrent completions.
+A gap of `CHUNK_GAP_TIMEOUT_SECONDS` (120s) between frames of one answer
+fails that completion — not a per-completion deadline, a
+provider-is-gone detector for the case the socket has not noticed.
 
-Connection semantics, decided with the implementation:
+Connection semantics, carried over or sharpened:
 
-- **Sockets sharing a `sessionId` coexist**, each completion request
-  going to whichever polls first — the race the HTTP poll already had.
-  Pretending to enforce one-bridge-per-session would be ritual, not
-  security: without a real bridge credential, "the bridge" *is* whoever
-  presents the sessionId. Tightening this waits on a caller-identity
-  primitive, which souk deliberately doesn't own.
 - **An answer is accepted only on the connection its request was
-  delivered to** (see the security note below).
+  delivered to.** This survived the redesign because it was the security
+  fix worth keeping, and it now holds against a *stronger* intruder than
+  the old socket ever faced: a second connection with the same identity,
+  attached for the same offering — every credential check passes — is
+  still refused an in-flight requestId it was not delivered.
+  `tests/test_ws_kyok.py` drives exactly that. Membership in the
+  connection's in-flight table, not anything a frame carries, is what
+  authorizes an answer; a requestId is a multiplexing key within the
+  connection that received it, never a bearer capability on an open
+  route.
 - **A socket dropping mid-answer fails its in-flight completions
-  immediately** (`{"error": …}` to the waiting provider) — a truncated
-  answer must never pass as a complete one, and failing now beats the
-  claim timeout. Requests delivered but unanswered when a socket dies
-  are not re-queued; they fail the same way a crashed poll-era bridge
-  failed them.
+  immediately** — a truncated answer must never pass as a complete one.
+  Requests delivered but unanswered when a socket dies are not re-queued.
+- **Two sockets, one identity, one offering**: the later attach takes
+  over the offering for future completions (core's relay maps each
+  offering to one live link). In-flight answers stay bound to their own
+  socket, per the rule above.
 
 Provider and KYOK stay **two endpoints**, not one multiplexed socket:
-different identity (provider key vs. caller session), different
-lifetime (long-lived vs. per-session), different frames. Merging them
-buys one route at the cost of role-dispatch on every frame.
+one carries runs for agents, the other completions for model offerings —
+different roster, different frames, and one identity may hold both at
+once. Merging them buys one route at the cost of role-dispatch on every
+frame.
 
-### Why the socket is a security fix, not only a transport swap
-
-The HTTP KYOK surface leaks a check the socket closes structurally, so
-the migration is worth doing for that reason alone — not just port
-consolidation.
-
-**`POST /kyok/respond/{request_id}` has no authentication of its own.**
-It reads the request body and streams whatever arrives into the pending
-completion's queue (`KyokAdapter.respond` → `pending.response_queue`),
-guarded by nothing but the `request_id` being unguessable — a
-96-bit random `kyokreq_…` string (`souk.ids.new_id`). That is a
-capability-string model: hold the string, drive the completion. It is
-cryptographically hard to guess, but the string is not treated as a
-secret everywhere it travels — `respond` logs it (`kyok respond %s:
-dropping malformed line`), and, decisively, **nothing binds the
-responder to the session that was handed the request.** Whoever presents
-a valid `request_id` can supply the "LLM" answer for it, and that answer
-is content the provider's agent then acts on — if that agent holds a
-tool with side effects, injected completion output is injected tool
-input.
-
-The WebSocket removes the naked endpoint. After migration:
-
-- `chunk` / `done` / `error` frames are accepted **only for requests
-  delivered on that same connection** — the server knows exactly which
-  `requestId`s it pushed down each socket, and membership in that set,
-  not anything a frame carries, is what authorizes an answer. This is
-  the binding the capability string never had, and it is deliberately
-  connection-scoped state living in the serving layer: core has no
-  concept of a connection, and has nothing of its own to verify on the
-  bridge side (see the hello note above). `request_id` reverts to what
-  it should have been all along: a multiplexing key *within* the
-  connection that received it, not a bearer capability on an open route.
-- There is no `request_id` in a URL or a log line to leak, and no
-  unauthenticated route to replay it against.
-
-This does not change what a *legitimate* bridge is trusted to do — souk
-still does not validate the LLM output a bridge returns (see "Scope /
-limitations" in `keep-your-own-key.md`; a caller manipulating its own
-run's completions mostly harms itself, and a provider must treat KYOK
-output as untrusted input regardless). It closes the gap where someone
-who is *not* the bridge could answer at all.
-
-**Out of scope here, tracked upstream:** two KYOK hazards live in core
-(`souk/kyok.py`) and are unaffected by which transport this repo serves,
-so they are fixed in AgentSouk, not here:
-
-- unauthenticated `/kyok/poll` growing `KyokBridge`'s registries without
-  bound (`defaultdict` read-inserts) — [AgentSouk#25](https://github.com/hukaichun/AgentSouk/issues/25).
-- no per-run spend ceiling: a live run can drive unlimited completions of
-  any size and model against the caller's key. The structural defense is
-  that the bridge is the caller's own code and every request passes
-  through it before money moves — so the fix is a default ceiling in
-  `souk-client-sdk`'s bridge (per-run request/token caps, model
-  allow-list), not a souk-side rule souk can't price. Tracked upstream.
+What souk still deliberately does not do: validate the LLM output a
+provider returns (a provider must treat KYOK output as untrusted input
+regardless — see "Scope / limitations" in `keep-your-own-key.md`), or
+impose a spend ceiling. The ceiling belongs to the LLM provider, which
+is now an identified party with the material to enforce one — the run
+id, the proven calling agent, the caller's context and the delegation
+chain arrive on every `completionRequest` frame (AgentSouk#26).
 
 ## MCP: the docent
 

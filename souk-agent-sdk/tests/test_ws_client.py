@@ -104,9 +104,24 @@ def _provider(gateway: StubGateway, handles: list[AgentHandle], **kwargs: Any) -
     return SoukProvider(f"http://127.0.0.1:{gateway.port}", handles, **kwargs)
 
 
-async def _echo_run_stream(run_input: dict) -> Any:
-    yield {"type": "RUN_STARTED", "runId": run_input["runId"]}
-    yield {"type": "RUN_FINISHED", "runId": run_input["runId"]}
+def _input(run_id: str, thread_id: str = "t1") -> dict:
+    """A wire `input` the SDK will accept: it validates the frame into
+    `ag_ui.core.RunAgentInput` before offering the run, so a partial dict
+    is a decline now, not a lenient pass-through."""
+    return {
+        "threadId": thread_id,
+        "runId": run_id,
+        "state": None,
+        "messages": [],
+        "tools": [],
+        "context": [],
+        "forwardedProps": None,
+    }
+
+
+async def _echo_run_stream(run_input) -> Any:
+    yield {"type": "RUN_STARTED", "runId": run_input.run_id}
+    yield {"type": "RUN_FINISHED", "runId": run_input.run_id}
 
 
 @contextlib.asynccontextmanager
@@ -268,7 +283,7 @@ async def test_a_pushed_run_comes_back_as_an_ack_then_events_then_finish(tmp_pat
                     "runId": "r1",
                     "threadId": "t1",
                     "agentName": "echo",
-                    "input": {"runId": "r1", "threadId": "t1", "messages": []},
+                    "input": _input("r1"),
                 }
             )
             frames = [await gateway.next_frame() for _ in range(4)]
@@ -282,8 +297,8 @@ async def test_a_pushed_run_comes_back_as_an_ack_then_events_then_finish(tmp_pat
 async def test_a_cancel_interrupts_the_run_and_finish_still_goes_out(tmp_path):
     started = asyncio.Event()
 
-    async def stuck_run_stream(run_input: dict) -> Any:
-        yield {"type": "RUN_STARTED", "runId": run_input["runId"]}
+    async def stuck_run_stream(run_input) -> Any:
+        yield {"type": "RUN_STARTED", "runId": run_input.run_id}
         started.set()
         await asyncio.sleep(3600)  # a run that would never end on its own
 
@@ -300,7 +315,7 @@ async def test_a_cancel_interrupts_the_run_and_finish_still_goes_out(tmp_path):
                     "runId": "r1",
                     "threadId": "t1",
                     "agentName": "stuck",
-                    "input": {"runId": "r1"},
+                    "input": _input("r1"),
                 }
             )
             assert (await gateway.next_frame())["type"] == "ack"
@@ -346,7 +361,7 @@ async def test_a_run_for_an_unknown_agent_is_declined_without_taking_the_socket_
                     "runId": "r2",
                     "threadId": "t1",
                     "agentName": "echo",
-                    "input": {"runId": "r2"},
+                    "input": _input("r2"),
                 }
             )
             frames = [await gateway.next_frame() for _ in range(4)]
@@ -371,10 +386,10 @@ async def test_a_dropped_socket_does_not_end_the_run_and_its_frames_flush_on_the
     """
     release = asyncio.Event()
 
-    async def two_phase_run_stream(run_input: dict) -> Any:
-        yield {"type": "RUN_STARTED", "runId": run_input["runId"]}
+    async def two_phase_run_stream(run_input) -> Any:
+        yield {"type": "RUN_STARTED", "runId": run_input.run_id}
         await release.wait()
-        yield {"type": "RUN_FINISHED", "runId": run_input["runId"]}
+        yield {"type": "RUN_FINISHED", "runId": run_input.run_id}
 
     async with StubGateway() as gateway:
         provider = _provider(
@@ -392,7 +407,7 @@ async def test_a_dropped_socket_does_not_end_the_run_and_its_frames_flush_on_the
                 "runId": "r1",
                 "threadId": "t1",
                 "agentName": "twophase",
-                "input": {"runId": "r1"},
+                "input": _input("r1"),
             }
         )
         assert (await gateway.next_frame())["type"] == "ack"
@@ -561,7 +576,7 @@ async def test_an_answer_to_a_question_nobody_is_waiting_on_is_dropped(tmp_path)
                     "runId": "r1",
                     "threadId": "t1",
                     "agentName": "echo",
-                    "input": {"runId": "r1"},
+                    "input": _input("r1"),
                 }
             )
             assert (await gateway.next_frame())["type"] == "ack"

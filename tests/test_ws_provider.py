@@ -388,9 +388,18 @@ async def test_the_transport_keeps_no_state_per_run(souk, register):
                 offered[frame["runId"]] = frame
             assert set(offered) == run_ids
 
+            threads = {h.run_id: h.thread_id for h in handles}
             for run_id in run_ids:
                 await socket.send(
-                    {"type": "event", "runId": run_id, "event": {"type": "RUN_STARTED", "runId": run_id}}
+                    {
+                        "type": "event",
+                        "runId": run_id,
+                        "event": {
+                            "type": "RUN_STARTED",
+                            "runId": run_id,
+                            "threadId": threads[run_id],
+                        },
+                    }
                 )
             for run_id in run_ids:
                 async with asyncio.timeout(2):
@@ -473,7 +482,11 @@ async def test_a_dropped_socket_ends_nothing(souk, register, resume_with):
                 {
                     "type": "event",
                     "runId": handle.run_id,
-                    "event": {"type": "RUN_STARTED", "runId": handle.run_id},
+                    "event": {
+                        "type": "RUN_STARTED",
+                        "runId": handle.run_id,
+                        "threadId": handle.thread_id,
+                    },
                 }
             )
             async with asyncio.timeout(2):
@@ -491,7 +504,11 @@ async def test_a_dropped_socket_ends_nothing(souk, register, resume_with):
                     {
                         "type": "event",
                         "runId": handle.run_id,
-                        "event": {"type": "RUN_FINISHED", "runId": handle.run_id},
+                        "event": {
+                            "type": "RUN_FINISHED",
+                            "runId": handle.run_id,
+                            "threadId": handle.thread_id,
+                        },
                     }
                 )
                 async with asyncio.timeout(2):

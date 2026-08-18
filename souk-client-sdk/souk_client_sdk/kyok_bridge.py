@@ -6,35 +6,26 @@ ordinary caller either way. See docs/keep-your-own-key.md in the souk
 repo for the design, and the gateway repo's docs/server-mode.md for the
 wire protocol this speaks.
 
-**Experimental** — see tests/test_kyok_bridge.py for this module's
-coverage (souk-client-sdk's only tests today). This bridge still holds
-no state that survives a crash: if this process dies mid-run, souk fails
-the completions it was holding and the run's provider sees errors, with
-no retry/resume path on either end. Matches the same "experimental,
-in-memory, single-process" status as its souk-side counterpart.
+**This is an LLM provider now.** Upstream retired the anonymous
+session-keyed bridge — the one actor in the system with no identity, and
+the root of that design's failures — and made the answering party a
+first-class provider kind. So this bridge holds an Ed25519 keypair
+(`souk_llm_provider_sdk.ProviderIdentity`), registers a model offering
+under it (`register()`, payload prefix `souk-register-llm`), and opens
+`/ws/kyok` with the same four-frame mutual challenge-response an agent
+provider uses. The caller then opts a run in by naming the offering —
+`run_metadata()` builds exactly that — instead of minting a session id.
 
-The transport is one WebSocket to the gateway's `/ws/kyok`, held for the
-run's whole duration: souk pushes each `completionRequest` down it, and
-this bridge streams the real LLM's chunks back as frames on the same
-socket, multiplexed by requestId — concurrent completions just interleave.
-The `sessionId` sent in `hello` is minted here, locally — souk neither
-issues nor verifies one, it takes whichever first appears and routes by
-it. **So knowing it is the entire proof**, which is why `open()` mints 128
-bits of `secrets` rather than anything guessable or derived.
+The transport after the handshake is what it always was: one WebSocket,
+completion requests pushed down it, the real LLM's chunks streamed back
+as frames multiplexed by requestId. An answer is only accepted on the
+socket its request was delivered to, so a reconnect starts fresh:
+completions in flight on a dead socket are failed by souk immediately
+rather than retried here.
 
-It is sent here and nowhere else, and that is the fix rather than the
-design: souk used to put this id verbatim inside the KYOK token it gave
-every provider, and a token is signed rather than sealed. Any provider
-could decode its own, open this socket under the caller's session, and be
-handed another provider's completion — a prompt to read and an answer to
-write, which is injected tool input for whatever acts on it. Core now puts
-`session_routing_key(id)`, a SHA-256, in the token instead, and derives
-the same key from whatever a bridge presents. This side is unchanged
-because this side is the one holding the preimage.
-
-An answer is only accepted on the socket its request was delivered to, so
-a reconnect starts fresh: completions in flight on a dead socket are
-failed by souk immediately rather than retried here.
+**Experimental**, same status as before: no state survives a crash; if
+this process dies mid-run the run's provider sees errors, with no
+retry/resume path on either end.
 
 Uses litellm (https://github.com/BerriAI/litellm) to actually call the
 real LLM, so this bridge isn't tied to one provider — model strings are
@@ -48,26 +39,47 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import secrets
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
+import httpx
 import litellm
 import websockets
+from souk_llm_provider_sdk import ProviderIdentity, sign_llm_registration
 
 logger = logging.getLogger("souk_client_sdk.kyok_bridge")
 
 WELCOME_TIMEOUT_SECONDS = 10.0
 
+# The gateway's handshake, restated: this package must not import the
+# gateway, and a mismatch fails loudly on the first connection. Keep in
+# lockstep with souk_server/handshake.py — same rule souk-agent-sdk
+# follows for the same four frames.
+HANDSHAKE_VERSION = 1
+NONCE_BYTES = 32
+
+
+def provider_proof_payload(provider_nonce: str, souk_nonce: str, hello_raw: str) -> bytes:
+    hello_digest = hashlib.sha256(hello_raw.encode()).hexdigest()
+    return f"souk-auth:provider:{provider_nonce}:{souk_nonce}:{hello_digest}".encode()
+
 
 class KyokBridge:
-    """One bridge serves one run's worth of KYOK completions. Typical
-    use: call `open()` to get a session_id, pass it as
-    `metadata={"kyok": {"sessionId": session_id}}` to `SoukClient.run()`,
-    and run `serve_forever()` as a background task alongside consuming
-    that run's event stream — cancel it once the run finishes.
+    """One KYOK LLM provider serving one model offering with the caller's
+    own key. Typical use: `await bridge.register()`, pass
+    `metadata=bridge.run_metadata()` to `SoukClient.run()`, and run
+    `serve_forever()` as a background task alongside consuming that run's
+    event stream — cancel it once the run finishes.
+
+    `offering` is the model name callers address —
+    `(identity.public_key, offering)` is the offering exactly as
+    `(provider_key, name)` is an agent. `model`/`api_key`/`api_base` are
+    what this bridge actually calls with, litellm-side, and souk never
+    sees them.
     """
 
     def __init__(
@@ -77,14 +89,21 @@ class KyokBridge:
         api_key: str,
         *,
         api_base: str | None = None,
+        offering: str = "kyok",
+        identity: ProviderIdentity | None = None,
         reconnect_delay: float = 2.0,
     ) -> None:
         self.souk_http_url = souk_http_url.rstrip("/")
         self.model = model
         self.api_key = api_key
         self.api_base = api_base
+        self.offering = offering
+        # Ephemeral by default: a personal bridge's identity only needs to
+        # outlive its runs. Pass a persisted one to keep a stable
+        # provider_key across restarts.
+        self.identity = identity or ProviderIdentity.generate()
         self.reconnect_delay = reconnect_delay
-        self.session_id: str | None = None
+        self.registered = False
 
     @property
     def _ws_url(self) -> str:
@@ -92,16 +111,38 @@ class KyokBridge:
         ws_scheme = "wss" if scheme == "https" else "ws"
         return urlunsplit((ws_scheme, netloc, path.rstrip("/") + "/ws/kyok", "", ""))
 
-    async def open(self) -> str:
-        """Mints this bridge's session_id locally — souk never hands one
-        out up front: it accepts whichever session_id first shows up and
-        whichever run's forwardedProps.kyok names it, so nothing needs
-        reserving ahead of the run existing. Call this before starting the
-        run so serve_forever() is already connected by the time a provider
-        might need it.
-        """
-        self.session_id = secrets.token_hex(16)
-        return self.session_id
+    async def register(self) -> None:
+        """Register this bridge's offering with souk, signed by its own
+        key — the prerequisite the socket's attach enforces. Idempotent;
+        re-registering refreshes the record."""
+        signature, timestamp = sign_llm_registration(self.identity, [self.offering])
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{self.souk_http_url}/llm-providers/register",
+                json={
+                    "models": [self.offering],
+                    "public_key": self.identity.public_key,
+                    "signature": signature,
+                    "timestamp": timestamp,
+                },
+            )
+            resp.raise_for_status()
+        self.registered = True
+
+    def run_metadata(self, context: Any = None) -> dict[str, Any]:
+        """The `metadata` a caller passes to opt a run into this bridge:
+        names the offering, and carries `context` — opaque to souk,
+        stripped before anything persists, delivered back to this bridge
+        on every completion the run (and its delegation tree) makes."""
+        kyok: dict[str, Any] = {
+            "llmProvider": {
+                "providerKey": self.identity.public_key,
+                "name": self.offering,
+            }
+        }
+        if context is not None:
+            kyok["context"] = context
+        return {"kyok": kyok}
 
     async def serve_forever(self) -> None:
         """Holds the `/ws/kyok` socket and serves every completion souk
@@ -112,7 +153,7 @@ class KyokBridge:
         awaited to completion (a KYOK bridge has no natural end of its own
         — the run it's serving does).
         """
-        assert self.session_id is not None, "call open() before serve_forever()"
+        assert self.registered, "call register() before serve_forever()"
         while True:
             try:
                 await self._serve_connection()
@@ -124,12 +165,38 @@ class KyokBridge:
                 )
             await asyncio.sleep(self.reconnect_delay)
 
+    async def _handshake(self, ws) -> None:
+        nonce = secrets.token_hex(NONCE_BYTES)
+        hello_raw = json.dumps(
+            {
+                "type": "hello",
+                "version": HANDSHAKE_VERSION,
+                "publicKey": self.identity.public_key,
+                "modelNames": [self.offering],
+                "nonce": nonce,
+            }
+        )
+        await ws.send(hello_raw)
+        challenge = json.loads(await asyncio.wait_for(ws.recv(), WELCOME_TIMEOUT_SECONDS))
+        if challenge.get("type") != "challenge":
+            raise RuntimeError(f"expected challenge, got {challenge!r}")
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "proof",
+                    "signature": self.identity.sign(
+                        provider_proof_payload(nonce, challenge["nonce"], hello_raw)
+                    ),
+                }
+            )
+        )
+        welcome = json.loads(await asyncio.wait_for(ws.recv(), WELCOME_TIMEOUT_SECONDS))
+        if welcome.get("type") != "welcome":
+            raise RuntimeError(f"expected welcome, got {welcome!r}")
+
     async def _serve_connection(self) -> None:
         async with websockets.connect(self._ws_url) as ws:
-            await ws.send(json.dumps({"type": "hello", "sessionId": self.session_id}))
-            welcome = json.loads(await asyncio.wait_for(ws.recv(), WELCOME_TIMEOUT_SECONDS))
-            if welcome.get("type") != "welcome":
-                raise RuntimeError(f"expected welcome, got {welcome!r}")
+            await self._handshake(ws)
 
             # Single writer: concurrent completions queue frames here
             # rather than interleaving sends on the socket directly.
