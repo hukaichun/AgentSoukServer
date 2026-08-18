@@ -83,6 +83,15 @@ services:
       # the ws proof through to core, so the strict mode costs nothing
       # and catches an attach road that forgot to.
       SOUK_REQUIRE_CONNECT_PROOF: "true"
+    # /readyz, because it reports what a provider about to register
+    # actually needs (database reachable, dispatch running) — /healthz
+    # only proves the process answers. python urllib rather than curl:
+    # the image is python-slim and ships no curl/wget.
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/readyz', timeout=2)"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
 
   # The stall at the gate: the guide that knows who else is here. An
   # ordinary provider — own key, own row in the roster, work claimed over
@@ -99,7 +108,14 @@ services:
       context: .
       dockerfile: providers/pydantic-ai-agent/Dockerfile
     depends_on:
-      - souk
+      # service_healthy, not just created: the SDK's reconnect loop
+      # absorbs a not-yet-listening souk anyway, but each failed attempt
+      # printed a full httpx.ConnectError traceback one line above the
+      # eventual "201 Created" — a page of red that reads as a real
+      # failure to anyone watching the logs. Same standard the `souk`
+      # service already applies to souk-migrate.
+      souk:
+        condition: service_healthy
     volumes:
       - ./providers/pydantic-ai-agent/config.docent.yaml:/app/config.yaml:ro
       # Without this the docent mints a fresh Ed25519 identity on every
@@ -146,7 +162,14 @@ services:
       context: .
       dockerfile: providers/pydantic-ai-agent/Dockerfile
     depends_on:
-      - souk
+      # service_healthy, not just created: the SDK's reconnect loop
+      # absorbs a not-yet-listening souk anyway, but each failed attempt
+      # printed a full httpx.ConnectError traceback one line above the
+      # eventual "201 Created" — a page of red that reads as a real
+      # failure to anyone watching the logs. Same standard the `souk`
+      # service already applies to souk-migrate.
+      souk:
+        condition: service_healthy
     volumes:
       - ./providers/pydantic-ai-agent/config.zahra.yaml:/app/config.yaml:ro
       - zahra_identity:/data
@@ -167,7 +190,14 @@ services:
       context: .
       dockerfile: providers/pydantic-ai-agent/Dockerfile
     depends_on:
-      - souk
+      # service_healthy, not just created: the SDK's reconnect loop
+      # absorbs a not-yet-listening souk anyway, but each failed attempt
+      # printed a full httpx.ConnectError traceback one line above the
+      # eventual "201 Created" — a page of red that reads as a real
+      # failure to anyone watching the logs. Same standard the `souk`
+      # service already applies to souk-migrate.
+      souk:
+        condition: service_healthy
     volumes:
       - ./providers/pydantic-ai-agent/config.yusuf.yaml:/app/config.yaml:ro
       - yusuf_identity:/data
@@ -188,7 +218,14 @@ services:
       context: .
       dockerfile: providers/pydantic-ai-agent/Dockerfile
     depends_on:
-      - souk
+      # service_healthy, not just created: the SDK's reconnect loop
+      # absorbs a not-yet-listening souk anyway, but each failed attempt
+      # printed a full httpx.ConnectError traceback one line above the
+      # eventual "201 Created" — a page of red that reads as a real
+      # failure to anyone watching the logs. Same standard the `souk`
+      # service already applies to souk-migrate.
+      souk:
+        condition: service_healthy
     volumes:
       - ./providers/pydantic-ai-agent/config.teahouse.yaml:/app/config.yaml:ro
       - teahouse_identity:/data
