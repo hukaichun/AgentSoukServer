@@ -1,11 +1,10 @@
-# Agent Souk Server 🕌🔌
+# Agent Souk Server
 
-> **The reference [Agent Souk](https://github.com/hukaichun/AgentSouk) gateway — every network decision, in one place.**  
-> One HTTP surface serving humans (**AG-UI** SSE), agents (**A2A v1.0** JSON-RPC), and the outbound relay that lets providers behind NAT serve agents **without public IPs, open ports, or tunnels.**
+**The reference [Agent Souk](https://github.com/hukaichun/AgentSouk) gateway — every network decision, in one place.** One HTTP surface serving humans (AG-UI SSE), agents (A2A v1.0 JSON-RPC), and the outbound relay that lets providers behind NAT serve agents without public IPs, open ports, or tunnels.
 
 ---
 
-## 🧭 Two Repositories, One Boundary
+## Two repositories, one boundary
 
 This repo is the *serving* half of Agent Souk. The split is a hard line, recorded in [AgentSouk#27](https://github.com/hukaichun/AgentSouk/issues/27):
 
@@ -13,7 +12,7 @@ This repo is the *serving* half of Agent Souk. The split is a hard line, recorde
 |---|---|---|
 | **Owns** | The domain: agents, threads, runs, identity, persistence, protocol *translation* | The network: ports, transports, TLS, CORS, endpoints, wire framing, admin surface — **both ends of every wire** |
 | **Ships** | `souk` (network-free core) | The gateway process assembled from core, plus the client SDKs that speak its wire ([`souk-agent-sdk/`](souk-agent-sdk), [`souk-client-sdk/`](souk-client-sdk)) |
-| **May it bind a socket?** | ❌ Never — enforced by packaging and test | ✅ That is its entire job |
+| **May it bind a socket?** | Never — enforced by packaging and test | Yes — that is its entire job |
 
 Two consequences worth knowing before touching anything:
 
@@ -22,7 +21,7 @@ Two consequences worth knowing before touching anything:
 
 ---
 
-## ⚡ Quick Start
+## Quick start
 
 The submodule is required — without it there is no `souk` to resolve:
 
@@ -48,7 +47,7 @@ curl http://localhost:8000/healthz && curl http://localhost:8000/readyz
 
 ---
 
-## 🏛️ What This Process Is
+## What this process is
 
 ```mermaid
 graph TD
@@ -70,7 +69,7 @@ graph TD
 
 ---
 
-## ⚙️ Configuration
+## Configuration
 
 Everything is `SOUK_*` environment variables — [.env.example](.env.example) documents them (nothing auto-loads it; it's for `export` / compose). The split mirrors the repo boundary:
 
@@ -81,7 +80,7 @@ Everything is `SOUK_*` environment variables — [.env.example](.env.example) do
 
 ---
 
-## 🔐 TLS Is Required Off Localhost
+## TLS is required off localhost
 
 Not hardening advice — a specific threat: registration and KYOK requests are replay-protected only by a **60-second freshness window**, and session tokens are **bearer credentials**. On a plaintext path, anyone in the middle reads a token outright or replays a captured signed request inside that window. TLS turns "bounded to 60s" into "not visible at all". The server logs a warning when it binds HTTP without it.
 
@@ -92,7 +91,7 @@ Two supported terminations — pick one, but off-localhost you need one:
 
 ---
 
-## 🐳 Docker
+## Docker
 
 ```bash
 docker compose up --build
@@ -112,7 +111,7 @@ Building the image requires the submodule checked out (`git clone --recurse-subm
 
 ---
 
-## 🧪 Tests
+## Tests
 
 SQLite by default; the same suite runs against Postgres, and both must pass — dialect bugs only ever appear on one side:
 
@@ -130,17 +129,17 @@ uv run python -c "from souk.config import CoreSettings; from souk.core import So
 
 ---
 
-## 🗺️ Roadmap
+## Roadmap
 
 From [`docs/server-mode.md`](docs/server-mode.md); the transport work is done:
 
-1. ✅ **`WS /ws/provider`** — the worker relay (claim / event / finish / cancel) over one socket, probed end-to-end including reconnect-mid-run and cancel ([tests/test_ws_provider.py](tests/test_ws_provider.py)).
-2. ✅ **`WS /ws/kyok`** — replaced the poll/respond pair; answers are only accepted on the connection each request was delivered to (a security fix, not just a transport swap — see the design note).
-3. ✅ **gRPC stripped** — listener, stubs, deps, `:50051` all gone; the wire semantics live on in the ws frames, `proto/souk.proto` remains upstream as their record.
-4. ✅ **MCP docent** (`/mcp`) — discovery, not invocation: who is in the souk, what each stall offers, and the A2A endpoint to go talk to them ([souk_server/mcp_docent.py](souk_server/mcp_docent.py)). Read-only; calling an agent stays A2A's job.
-5. 🧩 **Examples** — a browser provider (frame-protocol conformance, no SDK), an end-to-end `demo` compose profile, and a managed-gateway embedding sample (edge auth + admin router over the `Souk` facade).
+1. **`WS /ws/provider`** — landed. The worker relay (claim / event / finish / cancel) over one socket, probed end-to-end including reconnect-mid-run and cancel ([tests/test_ws_provider.py](tests/test_ws_provider.py)).
+2. **`WS /ws/kyok`** — landed. Replaced the poll/respond pair; answers are only accepted on the connection each request was delivered to (a security fix, not just a transport swap — see the design note).
+3. **gRPC stripped** — landed. Listener, stubs, deps, `:50051` all gone; the wire semantics live on in the ws frames, `proto/souk.proto` remains upstream as their record.
+4. **MCP docent** (`/mcp`) — landed. Discovery, not invocation: who is in the souk, what each stall offers, and the A2A endpoint to go talk to them ([souk_server/mcp_docent.py](souk_server/mcp_docent.py)). Read-only; calling an agent stays A2A's job.
+5. **Examples** — remaining. A browser provider (frame-protocol conformance, no SDK), an end-to-end `demo` compose profile, and a managed-gateway embedding sample (edge auth + admin router over the `Souk` facade).
 
-## ⚖️ License
+## License
 
 **The gateway is [AGPL-3.0](LICENSE); the SDKs, the template and the
 reference providers are [Apache-2.0](souk-agent-sdk/LICENSE).** What you
