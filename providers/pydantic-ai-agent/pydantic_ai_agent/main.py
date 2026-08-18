@@ -14,6 +14,8 @@ from typing import Any
 
 import httpx
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from pydantic import ValidationError
+from souk_provider_sdk import KyokForwardedProps
 from pydantic_ai import Agent
 from pydantic_ai.mcp import MCPToolset
 from pydantic_ai.models.openai import OpenAIChatModel
@@ -78,12 +80,22 @@ def resolve_kyok_model(
     that module's docstring and souk.api_llm_bridge.chat_completions for
     the other half of this check.
     """
-    kyok = (run_input.get("forwardedProps") or {}).get("kyok") if isinstance(run_input.get("forwardedProps"), dict) else None
-    if not kyok:
+    # Validated with the SDK's twin of souk's model, not a hand-read of
+    # the dict — upstream put these twins where a provider can reach them
+    # precisely because a restated shape once got a nullability wrong and
+    # dropped verified identities silently.
+    forwarded = run_input.get("forwardedProps")
+    raw = forwarded.get("kyok") if isinstance(forwarded, dict) else None
+    if raw is None:
+        return None
+    try:
+        kyok = KyokForwardedProps.model_validate(raw)
+    except ValidationError:
+        logger.warning("run carries a kyok entry that does not validate; running on own model")
         return None
     http_client = httpx.AsyncClient(auth=KyokSigningAuth(signing_key))
     provider = OpenAIProvider(
-        base_url=f"{souk_http_url.rstrip('/')}/kyok/v1", api_key=kyok["token"], http_client=http_client
+        base_url=f"{souk_http_url.rstrip('/')}/kyok/v1", api_key=kyok.token, http_client=http_client
     )
     return OpenAIChatModel("kyok", provider=provider)
 
