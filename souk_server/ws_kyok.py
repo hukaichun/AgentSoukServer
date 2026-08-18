@@ -45,7 +45,7 @@ from typing import TYPE_CHECKING, Any
 from fastapi import APIRouter, WebSocket
 from openai.types.chat import ChatCompletionChunk
 
-from souk.errors import LlmProviderNotFound
+from souk.errors import InvalidRegistration, LlmProviderNotFound
 from souk.ids import new_id
 from souk_llm_provider_sdk import (
     CONNECTED_LLM_PROVIDER_ATTRS,
@@ -59,7 +59,7 @@ from souk_server.ws_common import (
     receive_hello,
     write_loop,
 )
-from souk_server.ws_provider import prove_and_verify
+from souk_server.ws_provider import collect_connect_proof
 
 if TYPE_CHECKING:
     from souk.core import Souk
@@ -223,8 +223,10 @@ async def kyok_socket(websocket: WebSocket) -> None:
         await websocket.close(code=POLICY_VIOLATION, reason=problem)
         return
 
-    if not await prove_and_verify(websocket, souk, hello, hello["modelNames"]):
+    exchange = await collect_connect_proof(websocket, souk, hello)
+    if exchange is None:
         return
+    challenge, proof = exchange
 
     public_key = hello["publicKey"]
     model_names = hello["modelNames"]
@@ -238,10 +240,17 @@ async def kyok_socket(websocket: WebSocket) -> None:
     # attach still closes without ever sending this.
     outbound.put_nowait({"type": "welcome"})
     try:
-        # Registration is the prerequisite and core enforces it — a model
-        # name this key never registered is refused here.
-        await souk.attach_llm_provider(link, model_names)
-    except (LlmProviderNotFound, ValueError) as e:
+        # Registration and the connect proof are both core's to enforce —
+        # a model name this key never registered, or a proof that does
+        # not answer the live challenge, is refused here.
+        await souk.attach_llm_provider(
+            link,
+            model_names,
+            challenge=challenge,
+            provider_nonce=hello["nonce"],
+            proof=proof,
+        )
+    except (LlmProviderNotFound, InvalidRegistration, ValueError) as e:
         await websocket.close(code=POLICY_VIOLATION, reason=str(e))
         return
 

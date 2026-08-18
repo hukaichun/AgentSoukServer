@@ -100,6 +100,13 @@ def settings() -> CoreSettings:
         database_url=DATABASE_URL,
         token_signing_secret=TEST_SIGNING_SECRET,
         identity_private_key=TEST_SOUK_IDENTITY,
+        # Strict from day one in this suite: every attach — both sockets,
+        # and the in-process links the fixtures use — must answer a live
+        # challenge. The permissive default is upstream's migration switch
+        # for transports that still authenticate at their own edge; this
+        # gateway no longer is one, so its tests must not pass under a
+        # leniency it doesn't need.
+        require_connect_proof=True,
     )
 
 
