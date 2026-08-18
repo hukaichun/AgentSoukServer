@@ -103,10 +103,14 @@ far side, decides.
 ### Opening a socket: a mutual challenge-response
 
 Four frames, two round trips, and **each side signs bytes the other
-chose**. The payloads live in `souk_server/handshake.py`, which is the
-spec both halves are written against; the SDK states them separately
-rather than importing them, because a provider must not need the gateway
-installed to be a provider.
+chose**. Handshake **v2**: the signed payloads are upstream's link-open
+family (`souk_provider_sdk.identity`, vectored in
+AgentSouk/docs/contract-vectors.json), and `souk_server/handshake.py`
+re-exports them beside the version number. Three packages used to restate
+these bytes because none could import another; the SDK was the home all
+three could already import, and upstream publishing the family there is
+what dissolved the triplication — the SDKs now call
+`ProviderIdentity.sign_connect` and restate nothing.
 
 ```
 provider → hello      { version, publicKey, agentNames,
@@ -117,37 +121,37 @@ souk     → welcome    { }
 ```
 
 ```
-sig_s = souk.sign(     b"souk-auth:souk:"     + nonce_p + b":" + nonce_s )
-sig_p = identity.sign( b"souk-auth:provider:" + nonce_p + b":" + nonce_s
-                       + b":" + sha256(hello_raw) )
+sig_s = souk.sign(     b"souk-connect-souk:"     + nonce_s + b":" + nonce_p )
+sig_p = identity.sign( b"souk-connect-provider:" + nonce_s + b":" + nonce_p
+                       + b":" + ",".join(sorted(names)) )
 ```
 
-**What this replaced.** A provider used to open a socket by signing a
-statement it composed itself —
-`souk-provider-connect:{key}:{names}:{timestamp}` — in which the verifier
-chose nothing: no nonce, no server identity, no binding to the connection,
-only a timestamp checked against a 60-second window. Anyone who observed
-that signature could replay it and attach as that provider. The old
-docstring reasoned carefully about the neighbouring case — that reusing
-the *registration* payload would let a captured registration be replayed
-as a connection, hence the differing prefixes — and stopped one step
-short. A prefix stops a signature being replayed as a different kind of
-thing; it does nothing about a connection signature replayed as a
-connection, which needs no change of use at all.
+**What v1 replaced.** A provider used to open a socket by signing a
+statement it composed itself — timestamp freshness, verifier chose
+nothing — so anyone who observed the signature could replay it and attach
+as that provider. The mutual challenge-response closed that, and v2 keeps
+its shape exactly.
+
+**What v2 changed, and gave up.** v1's proof signed `sha256(hello_raw)` —
+the exact bytes of the hello — binding every claim in it,
+`maxConcurrentRuns` included, at the price of a subtlety all three
+implementations had to carry: the digest must cover the bytes actually
+sent, never a re-serialization. The connect family binds the sorted names
+and nothing else. The names are the authorization-relevant claim (which
+agents or offerings this key attaches for, and the thing the smuggled-name
+test drives); tampering with a live connection's other fields was already
+outside the threat model here — an intercepting proxy is trusted by
+construction (AgentSoukServer#10). Traded knowingly.
 
 Why each piece is there:
 
 - **Both nonces in both signatures.** Each side contributes freshness, so
   a recorded exchange is worth nothing to whoever recorded it.
-- **`souk:` / `provider:` prefixes.** Neither signature can be presented
-  as the other. Without them the two payloads would differ only by a
-  trailing digest.
-- **`sha256(hello_raw)`.** Binds the claims: `agentNames` and
-  `maxConcurrentRuns` cannot be altered in flight. A digest rather than a
-  re-send, because `hello` goes out before `nonce_s` exists — and a
-  digest of *the bytes actually sent*, since key order and separators are
-  free choices in JSON and re-encoding the same values can produce
-  different bytes.
+- **`souk-connect-souk:` / `souk-connect-provider:` role tags.** Neither
+  signature can be presented as the other, and neither can be mistaken
+  for a registration or deletion.
+- **The sorted names.** Which roster entries this socket attaches for
+  cannot be altered in flight; sorted, so order is nobody's problem.
 - **souk signs first.** A provider must be able to walk away from a souk
   it does not recognise *before* producing anything worth stealing.
   Signing second would mean handing a credential to whatever answered the
@@ -214,7 +218,7 @@ stays reserved for server-side failure the client didn't cause.
 
 | direction | frame | carries |
 |---|---|---|
-| ↓ | `{"type": "run", "runId", "threadId", "agentName", "input"}` | an **offer**, with its RunAgentInput. `agentName` rides along because the provider routes by it and RunAgentInput does not name it |
+| ↓ | `{"type": "run", **DeliveredRun}` | an **offer**: the frame is upstream's declared envelope — `DeliveredRun.model_dump(by_alias=True)` (`runId`, `agentName`, `runInput`, `threadId`, `metadata`), rebuilt on the far side with `model_validate`. Canonical frame in AgentSouk/docs/contract-vectors.json's `wire` section; neither end hand-writes the mapping |
 | ↑ | `{"type": "ack", "runId", "accepted", "reason"?}` | whether this provider took it. A bare `accepted: false` is how a full one says so — transient, souk re-offers later. `reason` makes the decline *permanent* (an input that does not parse): souk fails the run with the provider's words recorded verbatim in `failureReason` and stops re-offering. souk invents no reason vocabulary; the string is the provider's own |
 | ↑ | `{"type": "event", "runId", "event"}` | one AG-UI event; authorized against `Run.claimed_by` |
 | ↑ | `{"type": "finish", "runId"}` | that run's stream ended |
@@ -382,7 +386,7 @@ the reference LLM provider and builds that metadata via
 
 | direction | frame | carries |
 |---|---|---|
-| ↓ | `{"type": "completionRequest", "requestId", "runId", "providerKey", "agentName", "llmName", "context", "actorChain", "payload"}` | core's `CompletionRequest`, camelCased: the run, the *proven* calling agent, which of this provider's models was addressed, the caller's opaque context, the delegation chain, and the OpenAI-shaped body |
+| ↓ | `{"type": "completionRequest", "requestId", **DeliveredCompletion}` | upstream's declared envelope — `DeliveredCompletion.model_dump(by_alias=True)` (`runId`, `providerKey`, `agentName`, `body`, `llmName`, `context`, `actorChain`): the run, the *proven* calling agent, which of this provider's models was addressed, the caller's opaque context, the delegation chain, and the OpenAI-shaped body. Canonical frame in AgentSouk/docs/contract-vectors.json |
 | ↑ | `{"type": "chunk", "requestId", "data"}` | one OpenAI `chat.completion.chunk`; validated on souk's side, an invalid one fails the completion |
 | ↑ | `{"type": "done", "requestId"}` | end of that response |
 | ↑ | `{"type": "error", "requestId", "message", "refusal"?}` | provider-side failure or refusal, so the waiting completion fails fast instead of timing out — policy (throttling, billing, refusing a chain it does not recognise) is the LLM provider's, and this frame is how it says no. `refusal` is a structured payload relayed to the calling agent *intact* (in-stream as the `{"error": ...}` value, or as `error` on the non-streaming 502 body) — the envelope souk guarantees; the vocabulary inside is the two roles' own |

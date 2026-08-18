@@ -60,7 +60,7 @@ from souk.core import Souk
 from souk.identity import provider_fingerprint
 from souk.models import AgentRef
 from souk_provider_sdk import InProcessLink, ProviderIdentity, ProviderRuntime
-from souk_server.handshake import HANDSHAKE_VERSION, new_nonce, provider_proof_payload
+from souk_server.handshake import HANDSHAKE_VERSION, new_nonce
 from souk_server.server import create_app
 
 ALEMBIC_INI = (
@@ -223,13 +223,12 @@ class Identity(ProviderIdentity):
             **extra,
         }
 
-    def proof(self, hello_raw: str, provider_nonce: str, souk_nonce: str) -> dict:
-        """Frame three, over the exact hello text that went on the wire."""
+    def proof(self, names: list[str], provider_nonce: str, souk_nonce: str) -> dict:
+        """Frame three — the SDK's `sign_connect`, which is the whole point
+        of v2: no local payload, no hello digest, the names bound in."""
         return {
             "type": "proof",
-            "signature": self.sign(
-                provider_proof_payload(provider_nonce, souk_nonce, hello_raw)
-            ),
+            "signature": self.sign_connect(souk_nonce, provider_nonce, names),
         }
 
 

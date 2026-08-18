@@ -39,16 +39,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hashlib
 import json
 import logging
-import secrets
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 import litellm
 import websockets
+from pydantic import ValidationError
 from souk_llm_provider_sdk import (
     CompletionHandler,
     CompletionRefused,
@@ -57,22 +56,16 @@ from souk_llm_provider_sdk import (
     sign_llm_deletion,
     sign_llm_registration,
 )
+from souk_provider_sdk import new_nonce
 
 logger = logging.getLogger("souk_client_sdk.kyok_bridge")
 
 WELCOME_TIMEOUT_SECONDS = 10.0
 
-# The gateway's handshake, restated: this package must not import the
-# gateway, and a mismatch fails loudly on the first connection. Keep in
-# lockstep with souk_server/handshake.py — same rule souk-agent-sdk
-# follows for the same four frames.
-HANDSHAKE_VERSION = 1
-NONCE_BYTES = 32
-
-
-def provider_proof_payload(provider_nonce: str, souk_nonce: str, hello_raw: str) -> bytes:
-    hello_digest = hashlib.sha256(hello_raw.encode()).hexdigest()
-    return f"souk-auth:provider:{provider_nonce}:{souk_nonce}:{hello_digest}".encode()
+# The frame choreography matches souk_server/handshake.py; the bytes
+# signed are souk_provider_sdk's link-open family (`sign_connect`), so
+# this package no longer restates any payload. v2 is that migration.
+HANDSHAKE_VERSION = 2
 
 
 class KyokBridge:
@@ -275,17 +268,18 @@ class KyokBridge:
                 await self.deregister()
 
     async def _handshake(self, ws) -> None:
-        nonce = secrets.token_hex(NONCE_BYTES)
-        hello_raw = json.dumps(
-            {
-                "type": "hello",
-                "version": HANDSHAKE_VERSION,
-                "publicKey": self.identity.public_key,
-                "modelNames": [self.offering],
-                "nonce": nonce,
-            }
+        nonce = new_nonce()
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "hello",
+                    "version": HANDSHAKE_VERSION,
+                    "publicKey": self.identity.public_key,
+                    "modelNames": [self.offering],
+                    "nonce": nonce,
+                }
+            )
         )
-        await ws.send(hello_raw)
         challenge = json.loads(await asyncio.wait_for(ws.recv(), WELCOME_TIMEOUT_SECONDS))
         if challenge.get("type") != "challenge":
             raise RuntimeError(f"expected challenge, got {challenge!r}")
@@ -293,8 +287,10 @@ class KyokBridge:
             json.dumps(
                 {
                     "type": "proof",
-                    "signature": self.identity.sign(
-                        provider_proof_payload(nonce, challenge["nonce"], hello_raw)
+                    # The SDK's statement of the link-open proof — no local
+                    # payload, no hello digest.
+                    "signature": self.identity.sign_connect(
+                        challenge["nonce"], nonce, [self.offering]
                     ),
                 }
             )
@@ -350,15 +346,17 @@ class KyokBridge:
         fast instead of timing out. A `CompletionRefused` raised by the
         handler puts its structured payload on the error frame, and souk
         relays it to the calling agent intact."""
-        delivered = DeliveredCompletion(
-            run_id=frame.get("runId", ""),
-            provider_key=frame.get("providerKey", ""),
-            agent_name=frame.get("agentName", ""),
-            body=frame.get("payload") or {},
-            llm_name=frame.get("llmName", ""),
-            context=frame.get("context"),
-            actor_chain=frame.get("actorChain"),
-        )
+        # The frame is the declared envelope (`DeliveredCompletion.
+        # model_dump(by_alias=True)` on souk's side) plus type/requestId;
+        # rebuilding is one validate, not a field mapping.
+        try:
+            delivered = DeliveredCompletion.model_validate(frame)
+        except ValidationError as e:
+            logger.warning("kyok bridge: malformed completionRequest %s: %s", request_id, e)
+            outbound.put_nowait(
+                {"type": "error", "requestId": request_id, "message": "malformed completionRequest"}
+            )
+            return
         try:
             stream = self.handler(delivered) if self.handler else self._call_llm(delivered)
             async for chunk in stream:

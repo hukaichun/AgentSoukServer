@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hashlib
 import json
 import logging
 import secrets
@@ -39,18 +38,18 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
-from types import SimpleNamespace
-
 import httpx
 import websockets
+from pydantic import ValidationError
 from souk_provider_sdk import (
     AgentHandle,
     DeliveredRun,
     HandleProvider,
     ProviderIdentity,
     ProviderRuntime,
-    Refusal,
     SoukLink,
+    new_nonce,
+    souk_connect_payload,
     verify_signature,
 )
 
@@ -61,35 +60,18 @@ logger = logging.getLogger("souk_agent_sdk")
 WELCOME_TIMEOUT_SECONDS = 10.0
 
 
-# The handshake this side speaks. Must match the gateway's
-# `souk_server.handshake` — the two are stated separately rather than
-# shared because this package must not import the gateway, and a mismatch
-# is loud: the handshake fails on the first connection, in tests, not
-# quietly later.
-HANDSHAKE_VERSION = 1
-NONCE_BYTES = 32
+# The handshake this side speaks. The frame choreography must match the
+# gateway's `souk_server.handshake`; the *bytes signed* come from
+# souk_provider_sdk's link-open family now (`provider_connect_payload` /
+# `souk_connect_payload`), so this package no longer restates any payload
+# — v2 is exactly that migration, and the digest-of-the-hello subtlety
+# went with it.
+HANDSHAKE_VERSION = 2
 
 # How long an agent waits for souk to answer a question. Generous: it is a
 # database read on the far side of a socket, and the failure it guards is
 # a lost frame, not a slow one.
 QUERY_TIMEOUT_SECONDS = 30.0
-
-
-def souk_challenge_payload(provider_nonce: str, souk_nonce: str) -> bytes:
-    """What souk signs, and this side verifies to know who answered."""
-    return f"souk-auth:souk:{provider_nonce}:{souk_nonce}".encode()
-
-
-def provider_proof_payload(provider_nonce: str, souk_nonce: str, hello_raw: str) -> bytes:
-    """What this side signs, over bytes souk partly chose.
-
-    `hello_raw` is the exact text sent, hashed rather than re-serialized:
-    key order and separators are free choices in JSON, so re-encoding the
-    same values can produce different bytes and a signature that fails for
-    a reason neither side can see.
-    """
-    hello_digest = hashlib.sha256(hello_raw.encode()).hexdigest()
-    return f"souk-auth:provider:{provider_nonce}:{souk_nonce}:{hello_digest}".encode()
 
 
 class SoukIdentityMismatch(Exception):
@@ -320,21 +302,20 @@ class SoukProvider(SoukLink):
         nobody, which is how a provider induced to connect to the wrong URL
         handed a working credential to whatever picked up.
         """
-        provider_nonce = secrets.token_hex(NONCE_BYTES)
-        hello_raw = json.dumps(
-            {
-                "type": "hello",
-                "version": HANDSHAKE_VERSION,
-                "publicKey": self.public_key,
-                "agentNames": sorted(self.agents),
-                "maxConcurrentRuns": self.runtime.max_concurrent_runs,
-                "nonce": provider_nonce,
-            }
+        provider_nonce = new_nonce()
+        names = sorted(self.agents)
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "hello",
+                    "version": HANDSHAKE_VERSION,
+                    "publicKey": self.public_key,
+                    "agentNames": names,
+                    "maxConcurrentRuns": self.runtime.max_concurrent_runs,
+                    "nonce": provider_nonce,
+                }
+            )
         )
-        # The exact text is kept, not the dict: the proof signs a digest of
-        # what went on the wire, and re-serializing could produce different
-        # bytes for the same values.
-        await ws.send(hello_raw)
 
         challenge = json.loads(await asyncio.wait_for(ws.recv(), WELCOME_TIMEOUT_SECONDS))
         if challenge.get("type") != "challenge":
@@ -348,8 +329,10 @@ class SoukProvider(SoukLink):
             json.dumps(
                 {
                     "type": "proof",
-                    "signature": self.identity.sign(
-                        provider_proof_payload(provider_nonce, souk_nonce, hello_raw)
+                    # The SDK's own statement of what a provider signs to
+                    # open a link — no local payload, no hello digest.
+                    "signature": self.identity.sign_connect(
+                        souk_nonce, provider_nonce, names
                     ),
                 }
             )
@@ -403,7 +386,7 @@ class SoukProvider(SoukLink):
             return
 
         if not isinstance(signature, str) or not verify_signature(
-            souk_key, signature, souk_challenge_payload(provider_nonce, souk_nonce)
+            souk_key, signature, souk_connect_payload(souk_nonce, provider_nonce)
         ):
             raise SoukIdentityMismatch(
                 f"{self.souk_http_url} presented public key {souk_key[:16]}… but did not "
@@ -477,28 +460,26 @@ class SoukProvider(SoukLink):
             )
             self._outbound.put_nowait({"type": "ack", "runId": run_id, "accepted": False})
             return
-        # Through the inherited `SoukLink.deliver`, not a restatement of
-        # it: the base owns the claimed-run → `DeliveredRun` translation
-        # and the validation rule (input that fails `RunAgentInput` is a
-        # permanent `Refusal`, not a transient decline). This side only
-        # reshapes the frame into the attribute shape the port reads —
-        # so when upstream's rule changes, this transport follows without
-        # anyone remembering to mirror it. AgentSouk#74 is the ask for
-        # the day the reshaping itself comes from upstream too.
-        outcome = await self.deliver(
-            SimpleNamespace(
-                run_id=run_id,
-                agent=SimpleNamespace(name=agent_name),
-                run_input=frame.get("input") or {},
-                thread_id=frame.get("threadId"),
+        # The frame *is* the declared envelope now — `DeliveredRun.
+        # model_dump(by_alias=True)` on souk's side, rebuilt here with
+        # `model_validate` (AgentSouk#74's answer). No field mapping on
+        # either end; a frame that does not validate is a permanent
+        # refusal, because the same bytes re-offered can never do better —
+        # the rule `DeliveredRun.from_claimed` states in-process, met at
+        # this transport's rebuild step.
+        try:
+            delivered = DeliveredRun.model_validate(frame)
+        except ValidationError as e:
+            reason = f"frame does not validate as a DeliveredRun: {e}"
+            logger.warning("refusing run %s: %s", run_id, reason)
+            self._outbound.put_nowait(
+                {"type": "ack", "runId": run_id, "accepted": False, "reason": reason}
             )
+            return
+        accepted = await self.offer(delivered)
+        self._outbound.put_nowait(
+            {"type": "ack", "runId": run_id, "accepted": bool(accepted)}
         )
-        if isinstance(outcome, Refusal):
-            logger.warning("refusing run %s: %s", run_id, outcome.reason)
-            ack = {"type": "ack", "runId": run_id, "accepted": False, "reason": outcome.reason}
-        else:
-            ack = {"type": "ack", "runId": run_id, "accepted": bool(outcome)}
-        self._outbound.put_nowait(ack)
 
     async def _write_loop(self, ws) -> None:
         while True:

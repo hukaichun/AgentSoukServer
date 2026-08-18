@@ -25,12 +25,13 @@ import pytest
 import websockets
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from souk_provider_sdk import souk_connect_payload
+
 from souk_agent_sdk.client import (
     AgentHandle,
     SoukIdentityMismatch,
     SoukProvider,
     SoukQueryFailed,
-    souk_challenge_payload,
 )
 
 RECEIVE_TIMEOUT = 2.0
@@ -69,8 +70,8 @@ class StubGateway:
 
     async def _handler(self, ws) -> None:
         self.hello = json.loads(await ws.recv())
-        self.souk_nonce = "s" * 64
-        payload = souk_challenge_payload(self.hello["nonce"], self.souk_nonce)
+        self.souk_nonce = "s" * 32
+        payload = souk_connect_payload(self.souk_nonce, self.hello["nonce"])
         await ws.send(
             json.dumps(
                 {
@@ -163,21 +164,21 @@ async def test_hello_carries_the_claims_and_a_nonce_but_no_signature(tmp_path):
         )
         async with _connected(gateway, provider):
             assert gateway.hello["type"] == "hello"
-            assert gateway.hello["version"] == 1
+            assert gateway.hello["version"] == 2
             assert gateway.hello["publicKey"] == provider.public_key
             assert gateway.hello["agentNames"] == ["echo"]
             assert gateway.hello["maxConcurrentRuns"] == 2
-            assert len(gateway.hello["nonce"]) == 64
+            assert len(gateway.hello["nonce"]) == 32
             assert "signature" not in gateway.hello
 
 
-async def test_the_proof_signs_both_nonces_and_the_hello_that_was_sent(tmp_path):
+async def test_the_proof_signs_both_nonces_and_the_names_that_were_claimed(tmp_path):
     """Verified by rebuilding the payload from the frames the stub
     actually received — so a provider that signed the right shape over the
-    wrong bytes fails here rather than passing."""
-    from souk_provider_sdk import verify_signature
-
-    from souk_agent_sdk.client import provider_proof_payload
+    wrong bytes fails here rather than passing. The payload is the SDK's
+    connect family (v2): both nonces plus the sorted names, no hello
+    digest."""
+    from souk_provider_sdk import provider_connect_payload, verify_signature
 
     async with StubGateway() as gateway:
         provider = _provider(
@@ -186,11 +187,12 @@ async def test_the_proof_signs_both_nonces_and_the_hello_that_was_sent(tmp_path)
             identity_key_path=str(tmp_path / "k.key"),
         )
         async with _connected(gateway, provider):
-            hello_raw = json.dumps(gateway.hello)
             assert verify_signature(
                 provider.public_key,
                 gateway.proof["signature"],
-                provider_proof_payload(gateway.hello["nonce"], gateway.souk_nonce, hello_raw),
+                provider_connect_payload(
+                    gateway.souk_nonce, gateway.hello["nonce"], gateway.hello["agentNames"]
+                ),
             )
 
 
@@ -283,7 +285,7 @@ async def test_a_pushed_run_comes_back_as_an_ack_then_events_then_finish(tmp_pat
                     "runId": "r1",
                     "threadId": "t1",
                     "agentName": "echo",
-                    "input": _input("r1"),
+                    "runInput": _input("r1"),
                 }
             )
             frames = [await gateway.next_frame() for _ in range(4)]
@@ -315,7 +317,7 @@ async def test_a_cancel_interrupts_the_run_and_finish_still_goes_out(tmp_path):
                     "runId": "r1",
                     "threadId": "t1",
                     "agentName": "stuck",
-                    "input": _input("r1"),
+                    "runInput": _input("r1"),
                 }
             )
             assert (await gateway.next_frame())["type"] == "ack"
@@ -350,14 +352,14 @@ async def test_invalid_input_is_refused_with_the_reason_on_the_ack(tmp_path):
                     "runId": "r_bad",
                     "threadId": "t1",
                     "agentName": "echo",
-                    "input": {"runId": "r_bad"},  # no threadId/state/... — not a RunAgentInput
+                    "runInput": {"runId": "r_bad"},  # no threadId/state/... — not a RunAgentInput
                 }
             )
             ack = await gateway.next_frame()
             assert ack["type"] == "ack"
             assert ack["runId"] == "r_bad"
             assert ack["accepted"] is False
-            assert "RunAgentInput" in ack["reason"]
+            assert "DeliveredRun" in ack["reason"]
 
 
 async def test_a_run_for_an_unknown_agent_is_declined_without_taking_the_socket_down(tmp_path):
@@ -377,7 +379,7 @@ async def test_a_run_for_an_unknown_agent_is_declined_without_taking_the_socket_
                     "runId": "r_alien",
                     "threadId": "t1",
                     "agentName": "not_ours",
-                    "input": _input("r_alien"),
+                    "runInput": _input("r_alien"),
                 }
             )
             # A bare decline, no reason: "not ours" is deliberately NOT a
@@ -395,7 +397,7 @@ async def test_a_run_for_an_unknown_agent_is_declined_without_taking_the_socket_
                     "runId": "r2",
                     "threadId": "t1",
                     "agentName": "echo",
-                    "input": _input("r2"),
+                    "runInput": _input("r2"),
                 }
             )
             frames = [await gateway.next_frame() for _ in range(4)]
@@ -441,7 +443,7 @@ async def test_a_dropped_socket_does_not_end_the_run_and_its_frames_flush_on_the
                 "runId": "r1",
                 "threadId": "t1",
                 "agentName": "twophase",
-                "input": _input("r1"),
+                "runInput": _input("r1"),
             }
         )
         assert (await gateway.next_frame())["type"] == "ack"
@@ -610,7 +612,7 @@ async def test_an_answer_to_a_question_nobody_is_waiting_on_is_dropped(tmp_path)
                     "runId": "r1",
                     "threadId": "t1",
                     "agentName": "echo",
-                    "input": _input("r1"),
+                    "runInput": _input("r1"),
                 }
             )
             assert (await gateway.next_frame())["type"] == "ack"
