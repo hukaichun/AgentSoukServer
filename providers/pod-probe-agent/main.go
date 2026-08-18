@@ -1,0 +1,174 @@
+// pod-probe-agent: a single static binary that comes alive inside a pod,
+// dials out to a souk, and answers read-only questions about the pod's
+// state. No inbound port, no LLM key of its own, no ability to change
+// anything it inspects. See README.md for the why.
+package main
+
+import (
+	"context"
+	"crypto/ed25519"
+	"encoding/hex"
+	"fmt"
+	"os"
+	"os/signal"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/coder/websocket"
+)
+
+func main() {
+	cfg := loadConfig()
+
+	id, err := loadOrCreateIdentity(cfg.identityPath)
+	if err != nil {
+		fatal("identity: %v", err)
+	}
+	logf("provider identity %s… serving agent %q against %s", id.PublicHex()[:16], cfg.agentName, cfg.soukHTTPURL)
+
+	var llm *LLMClient
+	if cfg.llmBaseURL != "" || cfg.soukKyokURL != "" {
+		llm = NewLLMClient(cfg.llmBaseURL, cfg.llmAPIKey, cfg.llmModel, cfg.soukKyokURL, id)
+	}
+	brain := NewBrain(cfg.probeRoot, llm)
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// Registration is idempotent and cheap; do it once up front, then let
+	// the connect loop reconnect for the life of the pod. A dropped socket
+	// ends nothing on souk's side — reconnecting with a fresh hello and
+	// carrying on is the whole recovery, and the reconnect delay keeps a
+	// souk that is briefly down from being hammered.
+	if err := register(ctx, cfg.soukHTTPURL, id, []string{cfg.agentName}, cfg.providerName); err != nil {
+		logf("initial registration failed (%v); will retry on connect", err)
+	}
+
+	backoff := time.Second
+	for ctx.Err() == nil {
+		if err := connectOnce(ctx, cfg, id, brain); err != nil {
+			logf("connection ended: %v; reconnecting in %s", err, backoff)
+			select {
+			case <-ctx.Done():
+			case <-time.After(backoff):
+			}
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
+			continue
+		}
+		backoff = time.Second
+	}
+	logf("shutting down")
+}
+
+func connectOnce(ctx context.Context, cfg config, id *Identity, brain *Brain) error {
+	// Re-register on each connect: a souk that restarted forgot this
+	// provider, and attach refuses a name core has no record of. Cheap, and
+	// it makes a reconnect after a souk restart just work.
+	_ = register(ctx, cfg.soukHTTPURL, id, []string{cfg.agentName}, cfg.providerName)
+
+	dialCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	ws, _, err := websocket.Dial(dialCtx, cfg.wsURL(), nil)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("dial: %w", err)
+	}
+	// Big enough for a full RunAgentInput with resent history; the default
+	// read limit is small and a real thread would trip it.
+	ws.SetReadLimit(8 << 20)
+	defer ws.CloseNow()
+
+	conn := &SoukConn{
+		id:         id,
+		soukPubKey: cfg.soukPubKey,
+		agentNames: []string{cfg.agentName},
+		maxRuns:    cfg.maxRuns,
+		ws:         ws,
+	}
+	if err := conn.handshake(ctx); err != nil {
+		return fmt.Errorf("handshake: %w", err)
+	}
+	logf("attached; serving runs")
+	return conn.serve(ctx, brain.Answer)
+}
+
+type config struct {
+	soukHTTPURL  string
+	soukKyokURL  string
+	soukPubKey   ed25519.PublicKey
+	identityPath string
+	agentName    string
+	providerName string
+	probeRoot    string
+	maxRuns      int
+	llmBaseURL   string
+	llmAPIKey    string
+	llmModel     string
+}
+
+func (c config) wsURL() string {
+	u := strings.TrimRight(c.soukHTTPURL, "/") + "/ws/provider"
+	if strings.HasPrefix(u, "https://") {
+		return "wss://" + strings.TrimPrefix(u, "https://")
+	}
+	return "ws://" + strings.TrimPrefix(u, "http://")
+}
+
+func loadConfig() config {
+	c := config{
+		soukHTTPURL:  env("SOUK_HTTP_URL", "http://souk:8000"),
+		identityPath: env("SOUK_IDENTITY_KEY_PATH", "/data/probe_identity.key"),
+		agentName:    env("PROBE_AGENT_NAME", defaultAgentName()),
+		providerName: env("PROBE_PROVIDER_NAME", "pod probe"),
+		probeRoot:    env("PROBE_ROOT", "/app"),
+		llmBaseURL:   env("LLM_BASE_URL", ""),
+		llmAPIKey:    env("LLM_API_KEY", ""),
+		llmModel:     env("LLM_MODEL_NAME", "gpt-4"),
+	}
+	c.soukKyokURL = env("SOUK_KYOK_URL", strings.TrimRight(c.soukHTTPURL, "/")+"/kyok/v1/chat/completions")
+
+	c.maxRuns = 1
+	if v := os.Getenv("PROBE_MAX_CONCURRENT_RUNS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			c.maxRuns = n
+		}
+	}
+
+	if pinned := os.Getenv("SOUK_PUBLIC_KEY"); pinned != "" {
+		key, err := hex.DecodeString(pinned)
+		if err != nil || len(key) != ed25519.PublicKeySize {
+			fatal("SOUK_PUBLIC_KEY is not a 32-byte hex ed25519 key")
+		}
+		c.soukPubKey = ed25519.PublicKey(key)
+	}
+	return c
+}
+
+// defaultAgentName uses the pod's hostname, which Kubernetes sets to the pod
+// name — so a probe in each pod shows up on the roster as that pod, and the
+// docent's map of who-is-online reads as a map of which pods are alive.
+func defaultAgentName() string {
+	if h, err := os.Hostname(); err == nil && h != "" {
+		return "probe-" + h
+	}
+	return "pod-probe"
+}
+
+func env(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func logf(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "[pod-probe] "+format+"\n", args...)
+}
+
+func fatal(format string, args ...any) {
+	logf(format, args...)
+	os.Exit(1)
+}
