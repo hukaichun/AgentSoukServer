@@ -1539,6 +1539,7 @@ dependencies = [
     { name = "litellm" },
     { name = "pydantic" },
     { name = "souk-llm-provider-sdk" },
+    { name = "souk-provider-sdk" },
     { name = "websockets" },
 ]
 
@@ -1555,6 +1556,7 @@ requires-dist = [
     { name = "litellm", specifier = ">=1.95" },
     { name = "pydantic", specifier = ">=2.9" },
     { name = "souk-llm-provider-sdk", editable = "../AgentSouk/souk-llm-provider-sdk" },
+    { name = "souk-provider-sdk", editable = "../AgentSouk/souk-provider-sdk" },
     { name = "websockets", specifier = ">=13" },
 ]
 

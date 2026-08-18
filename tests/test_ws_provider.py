@@ -36,7 +36,7 @@ from souk.config import CoreSettings
 from souk.core import Souk
 from souk.identity import verify_signature
 from souk_server import ws_provider
-from souk_server.handshake import souk_challenge_payload
+from souk_server.handshake import souk_connect_payload
 from souk_server.server import create_app
 
 from tests.conftest import DATABASE_URL
@@ -81,20 +81,15 @@ def _connect(client: httpx.AsyncClient, **kwargs):
 
 
 async def _handshake(ws, identity, names: list[str], **hello_extra) -> _Socket:
-    """All four frames, the way a real provider does them.
-
-    The hello is serialized once and that exact text is what the proof
-    signs a digest of — re-encoding the dict here would be the test
-    agreeing with itself while disagreeing with the wire.
-    """
+    """All four frames, the way a real provider does them — the proof is
+    the SDK's `sign_connect` over both nonces and the sorted names."""
     socket = _Socket(ws)
     hello = identity.hello(names, **hello_extra)
-    hello_raw = json.dumps(hello)
-    await ws.send_text(hello_raw)
+    await ws.send_text(json.dumps(hello))
 
     challenge = await socket.recv()
     assert challenge["type"] == "challenge", challenge
-    await socket.send(identity.proof(hello_raw, hello["nonce"], challenge["nonce"]))
+    await socket.send(identity.proof(names, hello["nonce"], challenge["nonce"]))
 
     assert (await socket.recv()) == {"type": "welcome"}
     return socket
@@ -151,7 +146,7 @@ async def test_souk_signs_the_provider_nonce_before_the_provider_signs_anything(
             assert verify_signature(
                 challenge["soukPublicKey"],
                 challenge["signature"],
-                souk_challenge_payload(hello["nonce"], challenge["nonce"]),
+                souk_connect_payload(challenge["nonce"], hello["nonce"]),
             )
 
 
@@ -169,12 +164,11 @@ async def test_a_captured_handshake_does_not_open_a_second_socket(souk, register
     async with _provider_client(souk) as client:
         async with _connect(client) as ws:
             socket = _Socket(ws)
-            hello_raw = json.dumps(served.identity.hello(["greeter"]))
+            hello = served.identity.hello(["greeter"])
+            hello_raw = json.dumps(hello)
             await ws.send_text(hello_raw)
             challenge = await socket.recv()
-            proof = served.identity.proof(
-                hello_raw, json.loads(hello_raw)["nonce"], challenge["nonce"]
-            )
+            proof = served.identity.proof(["greeter"], hello["nonce"], challenge["nonce"])
             await socket.send(proof)
             assert (await socket.recv()) == {"type": "welcome"}
 
@@ -191,14 +185,14 @@ async def test_a_captured_handshake_does_not_open_a_second_socket(souk, register
             assert excinfo.value.code == 1008
 
 
-async def test_the_proof_is_bound_to_the_claims_the_hello_made(souk, register):
-    """`sha256(hello)` is inside what the provider signs, so the claims
-    cannot be edited in flight. Here the hello on the wire asks for two
-    agents while the proof was computed over a hello asking for one —
-    which is what a middlebox adding an agent name would produce."""
+async def test_the_proof_is_bound_to_the_names_the_hello_claimed(souk, register):
+    """The sorted names are inside what the provider signs (v2's binding —
+    narrower than v1's whole-hello digest, and the authorization-relevant
+    part), so which agents this socket attaches for cannot be edited in
+    flight. Here the hello on the wire asks for two agents while the proof
+    covers one — what a middlebox adding an agent name would produce."""
     served = await register("greeter", "translator")
     honest = served.identity.hello(["greeter"])
-    honest_raw = json.dumps(honest)
     tampered_raw = json.dumps({**honest, "agentNames": ["greeter", "translator"]})
 
     async with _provider_client(souk) as client:
@@ -206,9 +200,9 @@ async def test_the_proof_is_bound_to_the_claims_the_hello_made(souk, register):
             socket = _Socket(ws)
             await ws.send_text(tampered_raw)
             challenge = await socket.recv()
-            # Signed over the hello that was *not* sent.
+            # Signed over the names that were *not* claimed on the wire.
             await socket.send(
-                served.identity.proof(honest_raw, honest["nonce"], challenge["nonce"])
+                served.identity.proof(["greeter"], honest["nonce"], challenge["nonce"])
             )
             with pytest.raises(WebSocketDisconnect) as excinfo:
                 await ws.receive_text(timeout=RECEIVE_TIMEOUT)
@@ -216,10 +210,11 @@ async def test_the_proof_is_bound_to_the_claims_the_hello_made(souk, register):
 
 
 async def test_a_souk_signature_cannot_be_presented_as_a_provider_proof(souk, register):
-    """What the `souk:`/`provider:` prefixes are for. Both sides sign the
-    same two nonces; without the prefixes the two payloads would differ
-    only by a trailing digest, and a souk that could be induced to sign
-    would be handing out material for the other direction."""
+    """What the role tags (`souk-connect-souk:` / `souk-connect-provider:`)
+    are for. Both sides sign the same two nonces; without the tags the two
+    payloads would differ only by a trailing name list, and a souk that
+    could be induced to sign would be handing out material for the other
+    direction."""
     served = await register("greeter")
     async with _provider_client(souk) as client:
         async with _connect(client) as ws:
@@ -333,11 +328,12 @@ async def test_a_name_this_key_never_registered_is_refused_at_the_door(souk, reg
         async with _connect(client) as ws:
             socket = _Socket(ws)
             hello = served.identity.hello(["greeter", "smuggled"])
-            hello_raw = json.dumps(hello)
-            await ws.send_text(hello_raw)
+            await ws.send_text(json.dumps(hello))
             challenge = await socket.recv()
             await socket.send(
-                served.identity.proof(hello_raw, hello["nonce"], challenge["nonce"])
+                served.identity.proof(
+                    ["greeter", "smuggled"], hello["nonce"], challenge["nonce"]
+                )
             )
             with pytest.raises(WebSocketDisconnect) as excinfo:
                 await ws.receive_text(timeout=RECEIVE_TIMEOUT)
@@ -384,7 +380,7 @@ async def test_the_transport_keeps_no_state_per_run(souk, register):
             for _ in range(3):
                 frame = await socket.take()
                 assert frame["agentName"] == "greeter"
-                assert frame["input"]["runId"] == frame["runId"]
+                assert frame["runInput"]["runId"] == frame["runId"]
                 offered[frame["runId"]] = frame
             assert set(offered) == run_ids
 

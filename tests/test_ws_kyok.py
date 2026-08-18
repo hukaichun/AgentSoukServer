@@ -104,19 +104,20 @@ class _LlmSocket:
 
     async def connect(self, model_names: list[str]) -> None:
         nonce = new_nonce()
-        hello_raw = json.dumps(
-            {
-                "type": "hello",
-                "version": HANDSHAKE_VERSION,
-                "publicKey": self.identity.public_key,
-                "modelNames": model_names,
-                "nonce": nonce,
-            }
+        await self._ws.send_text(
+            json.dumps(
+                {
+                    "type": "hello",
+                    "version": HANDSHAKE_VERSION,
+                    "publicKey": self.identity.public_key,
+                    "modelNames": model_names,
+                    "nonce": nonce,
+                }
+            )
         )
-        await self._ws.send_text(hello_raw)
         challenge = await self.recv()
         assert challenge["type"] == "challenge"
-        await self.send(self.identity.proof(hello_raw, nonce, challenge["nonce"]))
+        await self.send(self.identity.proof(model_names, nonce, challenge["nonce"]))
         assert (await self.recv()) == {"type": "welcome"}
 
     async def recv(self) -> dict:
@@ -298,7 +299,7 @@ async def test_full_round_trip_non_streaming(souk, register):
                 assert request["agentName"] == "greeter"
                 assert request["llmName"] == "gpt-test"
                 assert request["context"] == {"voucher": "v1"}
-                assert request["payload"]["messages"][0]["content"] == "hi"
+                assert request["body"]["messages"][0]["content"] == "hi"
                 await socket.answer(
                     request["requestId"],
                     [
@@ -478,7 +479,7 @@ async def test_one_socket_multiplexes_concurrent_completions(souk, register):
                     # Answer in reverse order of arrival: each answer lands
                     # on its own completion, keyed by requestId.
                     for request in (second, first):
-                        prompt = request["payload"]["messages"][0]["content"]
+                        prompt = request["body"]["messages"][0]["content"]
                         await socket.answer(
                             request["requestId"],
                             [_chunk(content=f"re: {prompt}", role="assistant", finish_reason="stop")],

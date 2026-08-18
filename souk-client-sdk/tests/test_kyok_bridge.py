@@ -173,10 +173,11 @@ async def test_the_handshake_carries_identity_and_offering_and_proves_the_key():
             assert gateway.hello["type"] == "hello"
             assert gateway.hello["publicKey"] == bridge.identity.public_key
             assert gateway.hello["modelNames"] == ["my-llm"]
-            # The proof signs the gateway's payload: both nonces and a
-            # digest of the hello exactly as it went on the wire.
-            digest = hashlib.sha256(gateway.hello_raw.encode()).hexdigest()
-            payload = f"souk-auth:provider:{gateway.hello['nonce']}:n_souk:{digest}".encode()
+            # The proof signs the SDK's connect family (v2): both nonces
+            # and the sorted offering names, no hello digest.
+            from souk_provider_sdk import provider_connect_payload
+
+            payload = provider_connect_payload("n_souk", gateway.hello["nonce"], ["my-llm"])
             from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
             Ed25519PublicKey.from_public_bytes(
@@ -282,7 +283,7 @@ async def test_a_refusal_from_the_handler_travels_as_a_structured_error_frame():
                     "agentName": "greeter",
                     "llmName": "kyok",
                     "context": {"voucher": "v1"},
-                    "payload": {"messages": []},
+                    "body": {"messages": []},
                 }
             )
             frame = await gateway.next_frame()
@@ -318,7 +319,16 @@ async def test_a_completion_request_streams_back_as_chunks_then_done(monkeypatch
                 "tools": [{"type": "function"}],
                 "temperature": 0.5,
             }
-            await gateway.push({"type": "completionRequest", "requestId": "req_1", "payload": body})
+            await gateway.push(
+                {
+                    "type": "completionRequest",
+                    "requestId": "req_1",
+                    "runId": "run-1",
+                    "providerKey": "ab" * 32,
+                    "agentName": "greeter",
+                    "body": body,
+                }
+            )
 
             frames = [await gateway.next_frame() for _ in range(3)]
             assert [f["type"] for f in frames] == ["chunk", "chunk", "done"]
@@ -349,7 +359,14 @@ async def test_an_llm_failure_becomes_one_error_frame(monkeypatch):
         _bridge, task = await _connected_bridge(gateway)
         try:
             await gateway.push(
-                {"type": "completionRequest", "requestId": "req_1", "payload": {"messages": []}}
+                {
+                    "type": "completionRequest",
+                    "requestId": "req_1",
+                    "runId": "run-1",
+                    "providerKey": "ab" * 32,
+                    "agentName": "greeter",
+                    "body": {"messages": []},
+                }
             )
             frame = await gateway.next_frame()
             assert frame == {"type": "error", "requestId": "req_1", "message": "upstream boom"}
@@ -383,14 +400,20 @@ async def test_concurrent_completions_multiplex_on_one_socket(monkeypatch):
                 {
                     "type": "completionRequest",
                     "requestId": "req_slow",
-                    "payload": {"messages": [{"role": "user", "content": "slow"}]},
+                    "runId": "run-1",
+                    "providerKey": "ab" * 32,
+                    "agentName": "greeter",
+                    "body": {"messages": [{"role": "user", "content": "slow"}]},
                 }
             )
             await gateway.push(
                 {
                     "type": "completionRequest",
                     "requestId": "req_fast",
-                    "payload": {"messages": [{"role": "user", "content": "fast"}]},
+                    "runId": "run-1",
+                    "providerKey": "ab" * 32,
+                    "agentName": "greeter",
+                    "body": {"messages": [{"role": "user", "content": "fast"}]},
                 }
             )
             # The fast one answers while the slow one is still held open.

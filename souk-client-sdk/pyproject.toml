@@ -25,6 +25,10 @@ dependencies = [
     # KYOK provider registers and connects with, and the llm-registration
     # payload it signs. Apache-2.0, like this package.
     "souk-llm-provider-sdk",
+    # Imported directly for the link-open family (`new_nonce`,
+    # `sign_connect`'s payload twin) — already in the tree via the line
+    # above, declared because we import it by name.
+    "souk-provider-sdk",
 ]
 
 [dependency-groups]

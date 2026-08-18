@@ -38,13 +38,14 @@ from fastapi import APIRouter, WebSocket
 from souk.errors import AgentNotFound
 from souk.identity import verify_signature
 from souk.models import AgentRef
-from souk_provider_sdk import CONNECTED_PROVIDER_ATTRS, Refusal
+from pydantic import ValidationError
+from souk_provider_sdk import CONNECTED_PROVIDER_ATTRS, DeliveredRun, Refusal
 from souk_provider_sdk.contract import LINK_QUERY_METHODS
 from souk_server.handshake import (
     HANDSHAKE_VERSION,
     new_nonce,
-    provider_proof_payload,
-    souk_challenge_payload,
+    provider_connect_payload,
+    souk_connect_payload,
 )
 from souk_server.ws_common import (
     POLICY_VIOLATION,
@@ -138,30 +139,28 @@ class SocketProvider:
     async def deliver(self, run: Any) -> bool | Refusal:
         """Write this run to the wire and wait for the answer.
 
-        This is the one place souk's field names appear, and it is a
-        deliberate, single place rather than a habit: `run` is souk's
-        `ClaimedRun`, and what goes on the wire is this repo's frame. The
-        mapping used to be inherited from the SDK, which is where it
-        belongs for a provider-side link — but a gateway is not one, so it
-        does the mapping itself and confines it here. Reading souk's
-        objects freehand throughout is how the first provider ever handed
-        a run died, on `input_json`.
+        The frame is `{"type": "run"}` plus the wire form upstream
+        declares — `DeliveredRun.from_claimed(...).model_dump(by_alias=
+        True)` — so this gateway no longer hand-writes the mapping and the
+        far side rebuilds with `model_validate` instead of picking fields.
+        `from_claimed` also owns the validation rule: input that does not
+        parse as `RunAgentInput` is a permanent `Refusal`, answered here
+        without ever touching the wire (souk built the input, so this
+        firing means a core bug or a version skew — either way permanent).
 
         Answering late is the same as declining, whichever deadline ran
         out: the ack arrives for a run nobody is waiting on any more, and
         `ack` drops it. souk keeps the run either way.
         """
+        try:
+            delivered = DeliveredRun.from_claimed(run)
+        except ValidationError as e:
+            return Refusal(f"input does not validate as RunAgentInput: {e}")
         loop = asyncio.get_running_loop()
         waiter: asyncio.Future[bool | Refusal] = loop.create_future()
         self._acks[run.run_id] = waiter
         self._outbound.put_nowait(
-            {
-                "type": "run",
-                "runId": run.run_id,
-                "threadId": run.thread_id,
-                "agentName": run.agent.name,
-                "input": run.run_input,
-            }
+            {"type": "run", **delivered.model_dump(by_alias=True, mode="json")}
         )
         try:
             return await asyncio.wait_for(waiter, timeout=ACK_TIMEOUT_SECONDS)
@@ -348,10 +347,16 @@ def _hello_error(hello: dict[str, Any]) -> str | None:
 
 
 async def prove_and_verify(
-    websocket: WebSocket, souk: "Souk", hello: dict[str, Any], hello_raw: str
+    websocket: WebSocket, souk: "Souk", hello: dict[str, Any], names: list[str]
 ) -> bool:
     """Frames two and three: souk answers the provider's nonce, then checks
     the provider's answer to its own. True if the provider proved itself.
+
+    The signed bytes are upstream's connect family (handshake v2): souk
+    signs `souk-connect-souk:{nonce_s}:{nonce_p}`, the provider signs
+    `souk-connect-provider:{nonce_s}:{nonce_p}:{sorted names}` — `names`
+    being whichever roster this socket attaches for, which is why the
+    caller passes them rather than this function re-reading the hello.
 
     Closes the socket itself on every failure — there is exactly one way
     past this function, which is what keeps a half-authenticated
@@ -377,7 +382,7 @@ async def prove_and_verify(
         "soukPublicKey": souk_public_key,
         "nonce": souk_nonce,
         "signature": (
-            souk.sign(souk_challenge_payload(provider_nonce, souk_nonce))
+            souk.sign(souk_connect_payload(souk_nonce, provider_nonce))
             if souk_public_key is not None
             else None
         ),
@@ -401,7 +406,7 @@ async def prove_and_verify(
     if not verify_signature(
         hello["publicKey"],
         signature,
-        provider_proof_payload(provider_nonce, souk_nonce, hello_raw),
+        provider_connect_payload(souk_nonce, provider_nonce, names),
     ):
         await websocket.close(code=POLICY_VIOLATION, reason="proof does not verify")
         return False
@@ -416,14 +421,14 @@ async def provider_socket(websocket: WebSocket) -> None:
     received = await receive_hello(websocket)
     if received is None:
         return
-    hello, hello_raw = received
+    hello, _hello_raw = received
 
     problem = _hello_error(hello)
     if problem:
         await websocket.close(code=POLICY_VIOLATION, reason=problem)
         return
 
-    if not await prove_and_verify(websocket, souk, hello, hello_raw):
+    if not await prove_and_verify(websocket, souk, hello, hello["agentNames"]):
         return
 
     public_key = hello["publicKey"]

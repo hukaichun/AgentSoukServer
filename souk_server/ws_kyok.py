@@ -47,7 +47,11 @@ from openai.types.chat import ChatCompletionChunk
 
 from souk.errors import LlmProviderNotFound
 from souk.ids import new_id
-from souk_llm_provider_sdk import CONNECTED_LLM_PROVIDER_ATTRS, CompletionRefused
+from souk_llm_provider_sdk import (
+    CONNECTED_LLM_PROVIDER_ATTRS,
+    CompletionRefused,
+    DeliveredCompletion,
+)
 from souk_server.handshake import HANDSHAKE_VERSION
 from souk_server.ws_common import (
     POLICY_VIOLATION,
@@ -115,9 +119,10 @@ class SocketLLMProvider:
 
         The frame goes out here, not in the generator, so the request is
         on the wire the moment core holds the iterator — before anything
-        awaits it. Field names are this frame's own mapping from core's
-        `CompletionRequest`, confined to this one place the same way
-        `SocketProvider.deliver` confines the run frame's.
+        awaits it. The frame is `{"type", "requestId"}` plus the wire form
+        upstream declares (`DeliveredCompletion.from_request(...).
+        model_dump(by_alias=True)`), so neither end hand-writes the field
+        mapping any more.
         """
         request_id = new_id("kyokreq")
         queue: asyncio.Queue[Any] = asyncio.Queue()
@@ -126,13 +131,9 @@ class SocketLLMProvider:
             {
                 "type": "completionRequest",
                 "requestId": request_id,
-                "runId": request.run_id,
-                "providerKey": request.agent.provider_key,
-                "agentName": request.agent.name,
-                "llmName": request.llm_name,
-                "context": request.context,
-                "actorChain": request.actor_chain,
-                "payload": request.body,
+                **DeliveredCompletion.from_request(request).model_dump(
+                    by_alias=True, mode="json"
+                ),
             }
         )
         return self._answer_stream(request_id, queue)
@@ -215,14 +216,14 @@ async def kyok_socket(websocket: WebSocket) -> None:
     received = await receive_hello(websocket)
     if received is None:
         return
-    hello, hello_raw = received
+    hello, _hello_raw = received
 
     problem = _hello_error(hello)
     if problem:
         await websocket.close(code=POLICY_VIOLATION, reason=problem)
         return
 
-    if not await prove_and_verify(websocket, souk, hello, hello_raw):
+    if not await prove_and_verify(websocket, souk, hello, hello["modelNames"]):
         return
 
     public_key = hello["publicKey"]
