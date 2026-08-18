@@ -1,27 +1,37 @@
-"""WS /ws/kyok: the completion relay, per docs/server-mode.md.
+"""WS /ws/kyok: the socket an LLM provider connects out on.
 
-Replaces the `GET /kyok/poll` + `POST /kyok/respond/{id}` pair. The
-provider-facing `POST /kyok/v1/chat/completions` endpoint is untouched —
-an OpenAI-compatible URL is the whole point of that side.
+The party on the far end changed, and this file changed with it. This
+socket used to carry an anonymous "bridge" that rendezvoused with souk
+over a caller-minted sessionId — the only actor in the system with no
+identity, which upstream's KYOK redesign names as the root of every
+failure that design had (AgentSouk/docs/keep-your-own-key.md, "History").
+The answering party is now an **LLM provider**: a first-class provider
+kind with the same Ed25519 identity machinery as an agent provider. It
+registers model offerings (`POST /llm-providers/register`, payload prefix
+`souk-register-llm`), then connects here and attaches as the live server
+for the offerings it names — `attach_llm_provider`, the mirror of
+`attach_provider` rule for rule, registration enforced the same way.
 
-What KYOK *means* — the two-part authorization on the provider side, the
-relay queues, reassembly — stays in core (souk/protocols/kyok.py). This
-file frames it: it pushes queued completion requests down the socket and
-feeds answer frames back through the same `KyokAdapter.respond` the HTTP
-endpoint used, as the NDJSON lines that call already speaks.
+So this socket now opens exactly like `/ws/provider`: the same four-frame
+mutual challenge-response (see handshake.py), with `modelNames` in the
+hello where the provider socket says `agentNames`. The signed digest of
+the hello binds the claimed names; fresh nonces on both sides make a
+recorded exchange worthless.
 
-The `sessionId` in `hello` is a routing key, the same one `/kyok/poll`
-took — souk neither mints nor verifies it (see souk/kyok.py), because
-souk has no caller identity to bind it to; *who* may present a session is
-the deployment's business, enforced at the edge (pure ASGI middleware,
-before accept). What this socket adds is the binding the HTTP pair never
-had: answer frames are accepted only for requests *delivered on this
-socket*, so a `request_id` stops being a bearer capability on an open
-endpoint and becomes a multiplexing key within the connection that
-received it. Sockets sharing a session coexist, completion requests going
-to whichever polls first — the same race the HTTP poll had; tightening
-that to one-bridge-per-session waits on a real bridge credential, which
-is a caller-identity question souk deliberately doesn't own.
+What flows afterwards is the completion relay, inverted from the old
+poll: core resolves a run's binding to an attached link per call
+(`KyokAdapter.complete`) and calls `complete()` on it; this file writes
+that request down the socket as a `completionRequest` frame and feeds
+`chunk`/`done`/`error` frames back as the `ChatCompletionChunk` stream
+core is iterating. One socket serves concurrent completions, multiplexed
+by `requestId`.
+
+What survived from the old socket, because it was the security fix worth
+keeping: **an answer is accepted only on the connection its request was
+delivered to.** Membership in this connection's in-flight table — not
+anything a frame carries — is what authorizes an answer, so a requestId
+is a multiplexing key within the connection that received it, never a
+bearer capability on an open endpoint.
 """
 
 from __future__ import annotations
@@ -29,108 +39,172 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, WebSocket
+from openai.types.chat import ChatCompletionChunk
 
-from souk.errors import KyokRejected
-from souk.protocols.kyok import KyokAdapter
+from souk.errors import LlmProviderNotFound
+from souk.ids import new_id
+from souk_llm_provider_sdk import CONNECTED_LLM_PROVIDER_ATTRS, CompletionRefused
+from souk_server.handshake import HANDSHAKE_VERSION
 from souk_server.ws_common import (
-    INTERNAL_ERROR,
     POLICY_VIOLATION,
-    close_frame,
     parse_frame,
     receive_hello,
     write_loop,
 )
+from souk_server.ws_provider import prove_and_verify
 
 if TYPE_CHECKING:
     from souk.core import Souk
+    from souk.kyok import CompletionRequest
 
 logger = logging.getLogger("souk.ws_kyok")
 
 router = APIRouter()
 
-# One cycle of the server-side poll loop — how long each poll waits for a
-# completion to be queued before coming back empty and going again.
-POLL_WAIT_SECONDS = 25.0
+# The longest a completion waits for the *next* frame of its answer. Not a
+# per-completion deadline — a long generation streams for as long as it
+# streams — but a gap this long means the provider is gone in a way the
+# socket has not noticed, and the agent's HTTP call must fail rather than
+# hang on it.
+CHUNK_GAP_TIMEOUT_SECONDS = 120.0
+
+# What this socket accepts after the handshake — read by the dispatch and
+# published in docs/wire-vectors.json, asserted equal in tests.
+INBOUND_FRAME_TYPES = frozenset({"chunk", "done", "error"})
+
+# Sentinel closing one completion's answer queue.
+_DONE = object()
 
 
-class _Relay:
-    """One in-flight completion's answer path: the same
-    `KyokAdapter.respond` call the HTTP endpoint made, fed frame by frame
-    instead of by a request body. `respond` takes chunks and already
-    understands `{"error": ...}` as "fail this completion", so nothing
-    about the relay's semantics — incremental consumption, the done
-    sentinel, error short-circuit — is reimplemented here.
+class SocketLLMProvider:
+    """`souk.kyok.ConnectedLLMProvider` with a WebSocket underneath.
 
-    Chunks, not NDJSON. This used to serialise each frame and hand
-    `respond` the bytes so it could parse them straight back, with no
-    network in between: framing invented in order to be undone one call
-    away. Core changed the port and the encoding drops out.
+    Duck-typed against core's protocol, like `SocketProvider` beside it,
+    and asserted against upstream's `CONNECTED_LLM_PROVIDER_ATTRS` in the
+    constructor for the same reason: an attribute core expects but this
+    forgets would attach fine and fail inside the relay, three layers
+    from the cause.
+
+    Holds one queue per in-flight completion, keyed by the requestId this
+    side minted. That table is connection-scoped on purpose — it *is* the
+    binding described in the module docstring.
     """
 
-    def __init__(self, souk: "Souk", request_id: str) -> None:
-        self.request_id = request_id
-        self._queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
-        self._task = asyncio.create_task(self._run(souk))
-
-    async def _run(self, souk: "Souk") -> None:
-        try:
-            await KyokAdapter(souk).respond(self.request_id, self._chunks())
-        except KyokRejected as e:
-            # The completion is already gone — timed out waiting (see
-            # CLAIM_TIMEOUT_SECONDS) or abandoned. Nothing to route the
-            # answer to; the bridge finds out when its next frame for this
-            # request_id gets an error frame (alive() below).
-            logger.info("kyok ws relay %s: %s", self.request_id, e)
-
-    async def _chunks(self):
-        while (chunk := await self._queue.get()) is not None:
-            yield chunk
-
-    def alive(self) -> bool:
-        return not self._task.done()
-
-    def feed(self, message: dict[str, Any]) -> None:
-        self._queue.put_nowait(message)
-
-    def finish(self) -> None:
-        self._queue.put_nowait(None)
-
-    async def abandon(self) -> None:
-        """The socket died mid-answer. A truncated answer must fail the
-        completion, not complete it — feed the error chunk `respond`
-        treats as exactly that, then let the task drain."""
-        if self.alive():
-            self.feed({"error": "kyok bridge disconnected mid-response"})
-            self.finish()
-        with contextlib.suppress(Exception):
-            await self._task
-
-
-async def _poll_loop(
-    souk: "Souk", session_id: str, relays: dict[str, _Relay], outbound: asyncio.Queue
-) -> None:
-    """The server polling on the bridge's behalf — what `poll` returned is
-    pushed instead. One socket serves concurrent completions: each gets
-    its own relay, keyed by requestId, and the loop goes straight back to
-    polling while answers stream in."""
-    adapter = KyokAdapter(souk)
-    while True:
-        try:
-            item = await adapter.poll(session_id, POLL_WAIT_SECONDS)
-        except Exception:
-            logger.exception("kyok poll loop for session %s failed", session_id)
-            outbound.put_nowait(close_frame(INTERNAL_ERROR, "poll loop failed"))
-            return
-        if item is None:
-            continue
-        request_id = item["requestId"]
-        relays[request_id] = _Relay(souk, request_id)
-        outbound.put_nowait(
-            {"type": "completionRequest", "requestId": request_id, "payload": item["body"]}
+    def __init__(self, public_key: str, outbound: asyncio.Queue) -> None:
+        missing = sorted(
+            a for a in CONNECTED_LLM_PROVIDER_ATTRS if not hasattr(type(self), a)
         )
+        if missing:
+            raise TypeError(
+                f"{type(self).__name__} is not a ConnectedLLMProvider: missing {missing}"
+            )
+        self._public_key = public_key
+        self._outbound = outbound
+        self._answers: dict[str, asyncio.Queue[Any]] = {}
+
+    @property
+    def public_key(self) -> str:
+        return self._public_key
+
+    def complete(self, request: "CompletionRequest") -> AsyncIterator[ChatCompletionChunk]:
+        """Write `request` to the wire and return the stream of its answer.
+
+        The frame goes out here, not in the generator, so the request is
+        on the wire the moment core holds the iterator — before anything
+        awaits it. Field names are this frame's own mapping from core's
+        `CompletionRequest`, confined to this one place the same way
+        `SocketProvider.deliver` confines the run frame's.
+        """
+        request_id = new_id("kyokreq")
+        queue: asyncio.Queue[Any] = asyncio.Queue()
+        self._answers[request_id] = queue
+        self._outbound.put_nowait(
+            {
+                "type": "completionRequest",
+                "requestId": request_id,
+                "runId": request.run_id,
+                "providerKey": request.agent.provider_key,
+                "agentName": request.agent.name,
+                "llmName": request.llm_name,
+                "context": request.context,
+                "actorChain": request.actor_chain,
+                "payload": request.body,
+            }
+        )
+        return self._answer_stream(request_id, queue)
+
+    async def _answer_stream(
+        self, request_id: str, queue: asyncio.Queue[Any]
+    ) -> AsyncIterator[ChatCompletionChunk]:
+        """One completion's answer, frame by frame. Raising is how this
+        side fails the completion — core's `CompletionRelay` turns it into
+        a 502 or an in-band error, so nothing here needs to know which
+        shape the caller asked for. A chunk that is not a valid
+        `ChatCompletionChunk` fails the same way: what an LLM provider
+        returns is untrusted input, and core relays what this yields
+        as-is.
+        """
+        try:
+            while True:
+                try:
+                    item = await asyncio.wait_for(queue.get(), CHUNK_GAP_TIMEOUT_SECONDS)
+                except asyncio.TimeoutError:
+                    raise RuntimeError(
+                        "LLM provider stopped answering mid-completion"
+                    ) from None
+                if item is _DONE:
+                    return
+                if isinstance(item, Exception):
+                    raise item
+                yield ChatCompletionChunk.model_validate(item)
+        finally:
+            self._answers.pop(request_id, None)
+
+    def feed(self, request_id: str, item: Any) -> bool:
+        """Route one inbound frame's payload to its completion. False if
+        this connection was never delivered `request_id` (or it is over) —
+        the refusal that used to be an open door."""
+        queue = self._answers.get(request_id)
+        if queue is None:
+            return False
+        queue.put_nowait(item)
+        return True
+
+    def fail_pending(self) -> None:
+        """The socket is gone: a truncated answer must fail its
+        completion, not complete it, and fail it now rather than at the
+        gap timeout."""
+        for queue in self._answers.values():
+            queue.put_nowait(RuntimeError("LLM provider disconnected mid-response"))
+        self._answers.clear()
+
+
+def _hello_error(hello: dict[str, Any]) -> str | None:
+    """What an LLM provider's hello must carry to be worth challenging.
+
+    Same checks and same ordering rationale as the provider socket's:
+    version first, by name; nothing signed until the frame is worth it.
+    """
+    version = hello.get("version")
+    if version != HANDSHAKE_VERSION:
+        if version is None:
+            return (
+                "hello has no version: this souk speaks handshake "
+                f"v{HANDSHAKE_VERSION}, a mutual challenge-response"
+            )
+        return f"unsupported handshake version {version!r}; this souk speaks v{HANDSHAKE_VERSION}"
+    if not isinstance(hello.get("publicKey"), str):
+        return "hello needs a publicKey"
+    if not isinstance(hello.get("nonce"), str) or not hello["nonce"]:
+        return "hello needs a nonce"
+    names = hello.get("modelNames")
+    if not (isinstance(names, list) and names and all(isinstance(n, str) for n in names)):
+        return "modelNames must be a non-empty list of strings"
+    return None
 
 
 @router.websocket("/ws/kyok")
@@ -139,24 +213,38 @@ async def kyok_socket(websocket: WebSocket) -> None:
 
     await websocket.accept()
     received = await receive_hello(websocket)
-    hello = received[0] if received else None
-    if hello is None:
+    if received is None:
         return
-    session_id = hello.get("sessionId")
-    if not (isinstance(session_id, str) and session_id):
-        await websocket.close(code=POLICY_VIOLATION, reason="hello must carry a sessionId")
+    hello, hello_raw = received
+
+    problem = _hello_error(hello)
+    if problem:
+        await websocket.close(code=POLICY_VIOLATION, reason=problem)
         return
+
+    if not await prove_and_verify(websocket, souk, hello, hello_raw):
+        return
+
+    public_key = hello["publicKey"]
+    model_names = hello["modelNames"]
 
     outbound: asyncio.Queue = asyncio.Queue()
-    # requestIds delivered on *this* socket, each with its live answer
-    # path. This set is the binding described in the module docstring —
-    # membership, not any credential a frame carries, is what authorizes
-    # an answer.
-    relays: dict[str, _Relay] = {}
+    link = SocketLLMProvider(public_key, outbound)
+    # Before attaching, for the same reason the provider socket queues its
+    # welcome first: attaching makes this link resolvable, and a
+    # completion could be delivered inside `attach_llm_provider`'s own
+    # awaits. Nothing is written until the writer task starts, so a failed
+    # attach still closes without ever sending this.
     outbound.put_nowait({"type": "welcome"})
+    try:
+        # Registration is the prerequisite and core enforces it — a model
+        # name this key never registered is refused here.
+        await souk.attach_llm_provider(link, model_names)
+    except (LlmProviderNotFound, ValueError) as e:
+        await websocket.close(code=POLICY_VIOLATION, reason=str(e))
+        return
 
     writer = asyncio.create_task(write_loop(websocket, outbound))
-    poller = asyncio.create_task(_poll_loop(souk, session_id, relays, outbound))
     try:
         while True:
             message = await websocket.receive()
@@ -168,16 +256,49 @@ async def kyok_socket(websocket: WebSocket) -> None:
                 continue
             ftype = frame.get("type")
             request_id = frame.get("requestId")
-            if ftype not in ("chunk", "done", "error"):
+            if ftype not in INBOUND_FRAME_TYPES:
                 outbound.put_nowait(
                     {"type": "error", "message": f"unknown frame type {ftype!r}"}
                 )
                 continue
-            relay = relays.get(request_id) if isinstance(request_id, str) else None
-            if relay is None or not relay.alive():
-                # Not delivered on this socket (or already over): the one
-                # rejection that used to be an open door — see module
-                # docstring.
+            if not isinstance(request_id, str):
+                outbound.put_nowait(
+                    {"type": "error", "message": "frame needs a requestId"}
+                )
+                continue
+            if ftype == "chunk":
+                data = frame.get("data")
+                if not isinstance(data, dict):
+                    outbound.put_nowait(
+                        {
+                            "type": "error",
+                            "requestId": request_id,
+                            "message": "chunk data must be an object",
+                        }
+                    )
+                    continue
+                accepted = link.feed(request_id, data)
+            elif ftype == "done":
+                accepted = link.feed(request_id, _DONE)
+            else:  # error: the provider failing fast beats the gap timeout
+                # A `refusal` dict rides the envelope core relays intact
+                # (`CompletionRelay` reads it duck-typed off the
+                # exception) — the provider's structured answer reaches
+                # the calling agent instead of flattening to prose. The
+                # vocabulary inside is the two roles' own; nothing here
+                # interprets it.
+                refusal = frame.get("refusal")
+                accepted = link.feed(
+                    request_id,
+                    CompletionRefused(refusal)
+                    if isinstance(refusal, dict)
+                    else RuntimeError(
+                        frame.get("message") or "LLM provider reported an error"
+                    ),
+                )
+            if not accepted:
+                # Not delivered on this socket, or already over — see the
+                # module docstring for why membership is the check.
                 outbound.put_nowait(
                     {
                         "type": "error",
@@ -185,28 +306,9 @@ async def kyok_socket(websocket: WebSocket) -> None:
                         "message": "no such in-flight completion on this connection",
                     }
                 )
-                continue
-            if ftype == "chunk":
-                data = frame.get("data")
-                if not isinstance(data, dict):
-                    outbound.put_nowait(
-                        {"type": "error", "requestId": request_id, "message": "chunk data must be an object"}
-                    )
-                    continue
-                relay.feed(data)
-            elif ftype == "done":
-                relay.finish()
-                del relays[request_id]
-            else:  # error: the bridge failing fast beats the timeout
-                relay.feed({"error": frame.get("message") or "kyok bridge reported an error"})
-                relay.finish()
-                del relays[request_id]
     finally:
-        poller.cancel()
+        souk.detach_llm_provider(public_key)
+        link.fail_pending()
         writer.cancel()
         with contextlib.suppress(asyncio.CancelledError):
-            await poller
-        with contextlib.suppress(asyncio.CancelledError):
             await writer
-        for relay in list(relays.values()):
-            await relay.abandon()

@@ -41,6 +41,8 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 import websockets
+from ag_ui.core import RunAgentInput
+from pydantic import ValidationError
 from souk_provider_sdk import (
     AgentHandle,
     DeliveredRun,
@@ -455,10 +457,34 @@ class SoukProvider(SoukLink):
                     await writer
 
     async def _offer(self, frame: dict[str, Any]) -> None:
+        # The SDK types `run_input` as `RunAgentInput`, and validating at
+        # the wire is what keeps that claim true: past this point the
+        # runtime and every agent behind it may lean on the model instead
+        # of re-checking a dict.
+        try:
+            run_input = RunAgentInput.model_validate(frame.get("input") or {})
+        except ValidationError as e:
+            reason = f"input does not validate as RunAgentInput: {e}"
+            logger.warning("refusing run %s: %s", frame.get("runId"), reason)
+            # `reason` makes this a *permanent* refusal, not a capacity
+            # decline: re-offering the same bytes can never succeed, so
+            # souk fails the run with this string recorded verbatim
+            # instead of re-offering it forever while the caller watches
+            # a queued run sit silent. Same rule `SoukLink.deliver`
+            # states in-process.
+            self._outbound.put_nowait(
+                {
+                    "type": "ack",
+                    "runId": frame.get("runId"),
+                    "accepted": False,
+                    "reason": reason,
+                }
+            )
+            return
         run = DeliveredRun(
             run_id=frame["runId"],
             agent_name=frame.get("agentName", ""),
-            run_input=frame.get("input") or {},
+            run_input=run_input,
             thread_id=frame.get("threadId"),
         )
         # A name this provider does not host is declined here rather than

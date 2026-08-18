@@ -87,9 +87,16 @@ def install_error_handlers(app: FastAPI) -> None:
 
     async def handle(_request: Request, exc: Exception) -> JSONResponse:
         status = _STATUS.get(type(exc), 500)
+        content: dict = {"detail": _detail(exc)}
         if isinstance(exc, KyokRejected):
             status = exc.status
-        return JSONResponse(status_code=status, content={"detail": _detail(exc)})
+            # The LLM provider's structured refusal, relayed intact for a
+            # non-streaming caller the same way `encode` relays it
+            # in-stream — core carries it on the exception so the HTTP
+            # layer doesn't flatten it to the detail string.
+            if exc.refusal is not None:
+                content["error"] = exc.refusal
+        return JSONResponse(status_code=status, content=content)
 
     for error_type in (*_STATUS, KyokRejected, SoukError):
         app.add_exception_handler(error_type, handle)
@@ -105,4 +112,4 @@ async def resolve_ref(souk: Souk, provider: str, name: str) -> AgentRef:
     found = await souk.resolve_agent(provider, name)
     if found is None:
         raise AgentNotFound(f"no agent '{name}' under provider '{provider}'")
-    return AgentRef(provider_key=found["provider_key"], name=found["name"])
+    return AgentRef(provider_key=found.provider_key, name=found.name)

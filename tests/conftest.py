@@ -76,7 +76,15 @@ DATABASE_URL = os.environ.get(
 
 # FK-safe teardown order (children before parents) for the SQLite path,
 # where there's no TRUNCATE ... CASCADE. Postgres uses TRUNCATE directly.
-_TABLES_CHILD_FIRST = ("run_events", "thread_messages", "runs", "threads", "agents", "providers")
+_TABLES_CHILD_FIRST = (
+    "run_events",
+    "thread_messages",
+    "runs",
+    "threads",
+    "agents",
+    "llm_providers",
+    "providers",
+)
 
 
 # A fixed key rather than a generated one: a test that asserts what a
@@ -138,8 +146,8 @@ async def _clean_db(souk: Souk) -> AsyncIterator[None]:
     async with souk.engine.begin() as conn:
         if is_postgres:
             await conn.exec_driver_sql(
-                "TRUNCATE providers, agents, threads, runs, thread_messages, run_events "
-                "RESTART IDENTITY CASCADE"
+                "TRUNCATE providers, agents, llm_providers, threads, runs, thread_messages, "
+                "run_events RESTART IDENTITY CASCADE"
             )
         else:
             for table in _TABLES_CHILD_FIRST:
@@ -193,6 +201,15 @@ class Identity(ProviderIdentity):
             "agents": agents,
             **extra,
         }
+
+    def sign_llm_registration(self, names: list[str]) -> tuple[str, int]:
+        """Signature+timestamp for registering LLM offerings — through the
+        SDK an actual LLM provider ships, for the shipped-signer reason:
+        this suite's hand-written payloads catch core drifting, and this
+        catches the SDK drifting from both."""
+        from souk_llm_provider_sdk import sign_llm_registration
+
+        return sign_llm_registration(self, names)
 
     def hello(self, names: list[str], **extra) -> dict:
         """Frame one. No signature in it — the proof comes later, over a
@@ -285,9 +302,9 @@ class EchoAgent:
     def __init__(self) -> None:
         self.seen_caller: dict | None = None
 
-    async def run_stream(self, agent_name: str, run_input: dict):
-        self.seen_caller = (run_input.get("forwardedProps") or {}).get("caller")
-        ids = {"threadId": run_input["threadId"], "runId": run_input["runId"]}
+    async def run_stream(self, agent_name: str, run_input):
+        self.seen_caller = (run_input.forwarded_props or {}).get("caller")
+        ids = {"threadId": run_input.thread_id, "runId": run_input.run_id}
         yield {"type": "RUN_STARTED", **ids}
         yield {"type": "TEXT_MESSAGE_START", "messageId": "m1", "role": "assistant"}
         yield {"type": "TEXT_MESSAGE_CONTENT", "messageId": "m1", "delta": "done"}

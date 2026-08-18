@@ -38,7 +38,7 @@ from fastapi import APIRouter, WebSocket
 from souk.errors import AgentNotFound
 from souk.identity import verify_signature
 from souk.models import AgentRef
-from souk_provider_sdk import CONNECTED_PROVIDER_ATTRS
+from souk_provider_sdk import CONNECTED_PROVIDER_ATTRS, Refusal
 from souk_provider_sdk.contract import LINK_QUERY_METHODS
 from souk_server.handshake import (
     HANDSHAKE_VERSION,
@@ -84,6 +84,11 @@ QUERY_METHODS = frozenset(LINK_QUERY_METHODS)
 # noticing it a minute late costs nothing — see `_watch_registration`.
 OWNERSHIP_RECHECK_SECONDS = 120.0
 
+# What this socket accepts after the handshake. The dispatch below reads
+# it, and docs/wire-vectors.json publishes it — one set, asserted equal in
+# tests, so a frame type added in code without a vectors row goes red.
+INBOUND_FRAME_TYPES = frozenset({"ack", "event", "finish", "query"})
+
 
 class SocketProvider:
     """`broker.ConnectedProvider` with a socket underneath.
@@ -120,7 +125,7 @@ class SocketProvider:
         self._public_key = public_key
         self._max_concurrent_runs = max_concurrent_runs
         self._outbound = outbound
-        self._acks: dict[str, asyncio.Future[bool]] = {}
+        self._acks: dict[str, asyncio.Future[bool | Refusal]] = {}
 
     @property
     def public_key(self) -> str:
@@ -130,7 +135,7 @@ class SocketProvider:
     def max_concurrent_runs(self) -> int | None:
         return self._max_concurrent_runs
 
-    async def deliver(self, run: Any) -> bool:
+    async def deliver(self, run: Any) -> bool | Refusal:
         """Write this run to the wire and wait for the answer.
 
         This is the one place souk's field names appear, and it is a
@@ -147,7 +152,7 @@ class SocketProvider:
         `ack` drops it. souk keeps the run either way.
         """
         loop = asyncio.get_running_loop()
-        waiter: asyncio.Future[bool] = loop.create_future()
+        waiter: asyncio.Future[bool | Refusal] = loop.create_future()
         self._acks[run.run_id] = waiter
         self._outbound.put_nowait(
             {
@@ -171,10 +176,20 @@ class SocketProvider:
         finally:
             self._acks.pop(run.run_id, None)
 
-    def ack(self, run_id: str, accepted: bool) -> None:
+    def ack(self, run_id: str, accepted: bool, reason: str | None = None) -> None:
+        """A declined ack carrying a `reason` is a *permanent* refusal — the
+        provider saying re-offering can never succeed (an input that does
+        not parse, most importantly). souk fails the run with the reason
+        recorded verbatim and stops re-offering; a bare decline stays what
+        it always was, \"full right now\". The wire says so with one
+        optional field because the port says so with one optional type
+        (`souk_provider_sdk.Refusal`, read duck-typed by the broker)."""
         waiter = self._acks.get(run_id)
         if waiter is not None and not waiter.done():
-            waiter.set_result(accepted)
+            if not accepted and isinstance(reason, str) and reason:
+                waiter.set_result(Refusal(reason))
+            else:
+                waiter.set_result(accepted)
 
     def cancel(self, run_id: str) -> None:
         """Ask, and do not wait. souk decides the outcome from what the
@@ -332,7 +347,7 @@ def _hello_error(hello: dict[str, Any]) -> str | None:
     return None
 
 
-async def _prove_and_verify(
+async def prove_and_verify(
     websocket: WebSocket, souk: "Souk", hello: dict[str, Any], hello_raw: str
 ) -> bool:
     """Frames two and three: souk answers the provider's nonce, then checks
@@ -408,7 +423,7 @@ async def provider_socket(websocket: WebSocket) -> None:
         await websocket.close(code=POLICY_VIOLATION, reason=problem)
         return
 
-    if not await _prove_and_verify(websocket, souk, hello, hello_raw):
+    if not await prove_and_verify(websocket, souk, hello, hello_raw):
         return
 
     public_key = hello["publicKey"]
@@ -452,8 +467,14 @@ async def provider_socket(websocket: WebSocket) -> None:
                 continue
             kind = parsed.get("type")
             run_id = parsed.get("runId")
-            if kind == "ack":
-                provider.ack(run_id, bool(parsed.get("accepted", True)))
+            if kind not in INBOUND_FRAME_TYPES:
+                outbound.put_nowait({"type": "error", "message": f"unexpected frame {kind!r}"})
+            elif kind == "ack":
+                provider.ack(
+                    run_id,
+                    bool(parsed.get("accepted", True)),
+                    parsed.get("reason"),
+                )
             elif kind == "event":
                 if not souk.report_event(run_id, parsed.get("event"), claimed_by=public_key):
                     outbound.put_nowait(
@@ -470,8 +491,6 @@ async def provider_socket(websocket: WebSocket) -> None:
                 # including the acks and events of every run in flight on
                 # it — for the length of that read.
                 asyncio.create_task(_answer_query(souk, public_key, parsed, outbound))
-            else:
-                outbound.put_nowait({"type": "error", "message": f"unexpected frame {kind!r}"})
     finally:
         provider.fail_pending()
         # Detaching is what takes these agents offline, immediately —

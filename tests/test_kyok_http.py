@@ -39,8 +39,8 @@ def _kyok_headers(bearer: str, private_key, body: bytes) -> dict:
     }
 
 
-def _token(run_id: str, agent: AgentRef, session_id: str = "sess_1") -> str:
-    return issue_kyok_token(run_id, session_id, agent, "test-signing-secret")
+def _token(run_id: str, agent: AgentRef) -> str:
+    return issue_kyok_token(run_id, agent, "test-signing-secret")
 
 
 async def _live_run(souk, agent: AgentRef, run_id: str):
@@ -241,18 +241,43 @@ async def test_a_signature_from_another_identity_401s(client, souk, register, ne
         souk.broker.forget(run_id)
 
 
-async def test_claim_timeout_returns_502(client, souk, register, monkeypatch):
-    import souk.protocols.kyok as kyok_protocol
-
-    monkeypatch.setattr(kyok_protocol, "CLAIM_TIMEOUT_SECONDS", 0.05)
+async def test_a_run_with_no_kyok_binding_503s(client, souk, register):
+    """Authorization passed — the token is real, the run live, the
+    signature the agent's own — but nothing ever bound this run to an LLM
+    offering. Fail fast, the same shape as an offline agent, instead of
+    the timeout the old bridge design waited out."""
     served = await register("greeter")
-    run_id = "run_claim_timeout"
+    run_id = "run_unbound"
     await _live_run(souk, served.ref(), run_id)
     try:
-        token = _token(run_id, served.ref(), session_id="sess_unclaimed")
+        token = _token(run_id, served.ref())
         body = json.dumps({"messages": []}).encode()
         headers = {**_kyok_headers(token, served.identity._key, body), "content-type": "application/json"}
         resp = await client.post("/kyok/v1/chat/completions", content=body, headers=headers)
-        assert resp.status_code == 502
+        assert resp.status_code == 503
+    finally:
+        souk.broker.forget(run_id)
+
+
+async def test_a_binding_to_an_unattached_offering_503s(client, souk, register):
+    """Bound at run start, but the LLM provider is not attached at call
+    time. Resolution is per call and this is its fast-fail — the property
+    that lets a provider drop and re-attach mid-run."""
+    from souk.kyok import KyokBinding
+    from souk.models import LlmRef
+
+    served = await register("greeter")
+    run_id = "run_unattached_llm"
+    await _live_run(souk, served.ref(), run_id)
+    souk.kyok_relay.bind_run(
+        run_id,
+        KyokBinding(llm_provider=LlmRef(provider_key="aa" * 32, name="gpt-nowhere")),
+    )
+    try:
+        token = _token(run_id, served.ref())
+        body = json.dumps({"messages": []}).encode()
+        headers = {**_kyok_headers(token, served.identity._key, body), "content-type": "application/json"}
+        resp = await client.post("/kyok/v1/chat/completions", content=body, headers=headers)
+        assert resp.status_code == 503
     finally:
         souk.broker.forget(run_id)

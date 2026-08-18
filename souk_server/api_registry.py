@@ -11,7 +11,16 @@ from fastapi import APIRouter, Depends
 from souk.core import Souk
 from souk.identity import provider_fingerprint
 from souk_server.deps import get_souk
-from souk_server.models import AgentRosterEntry, RegisterBatchRequest, RegisterBatchResponse, RosterResponse
+from souk_server.models import (
+    AgentRosterEntry,
+    LlmOfferingEntry,
+    LlmRegisterRequest,
+    LlmRegisterResponse,
+    LlmRosterResponse,
+    RegisterBatchRequest,
+    RegisterBatchResponse,
+    RosterResponse,
+)
 
 router = APIRouter()
 
@@ -29,6 +38,36 @@ async def register_agents(
     )
 
     return RegisterBatchResponse(agents=await _roster(souk))
+
+
+@router.post("/llm-providers/register", status_code=201)
+async def register_llm_providers(
+    body: LlmRegisterRequest, souk: Souk = Depends(get_souk)
+) -> LlmRegisterResponse:
+    registered = await souk.register_llm_providers(
+        body.public_key,
+        body.signature,
+        body.timestamp,
+        body.models,
+        metadata=body.metadata or None,
+    )
+    return LlmRegisterResponse(models=sorted(registered))
+
+
+@router.get("/llm-providers")
+async def list_llm_providers(souk: Souk = Depends(get_souk)) -> LlmRosterResponse:
+    """The offering roster, `GET /agents`' mirror — what a KYOK caller
+    reads to discover an offering and to glance at its liveness before
+    binding a run to it."""
+    return LlmRosterResponse(
+        offerings=[
+            LlmOfferingEntry(
+                **summary.model_dump(),
+                fingerprint=provider_fingerprint(summary.provider_key),
+            )
+            for summary in await souk.list_llm_providers()
+        ]
+    )
 
 
 @router.get("/agents")

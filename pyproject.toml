@@ -37,6 +37,10 @@ dependencies = [
     # port, and the provider's own loop, with no transport in it. This
     # gateway builds the socket around exactly that contract.
     "souk-provider-sdk",
+    # Same relationship for the KYOK side: upstream states what an LLM
+    # provider is (`ConnectedLLMProvider`, `DeliveredCompletion`, the
+    # llm-registration payload), and /ws/kyok is the socket around it.
+    "souk-llm-provider-sdk",
     "fastapi>=0.115",
     # [standard] brings websockets, which serves /ws/provider and /ws/kyok
     # — the ws relays need no dependency of their own.
@@ -58,6 +62,7 @@ souk-server = "souk_server.server:main"
 [tool.uv.sources]
 souk = { path = "AgentSouk/souk", editable = true }
 souk-provider-sdk = { path = "AgentSouk/souk-provider-sdk", editable = true }
+souk-llm-provider-sdk = { path = "AgentSouk/souk-llm-provider-sdk", editable = true }
 # Dev only, and only for one test. Every KYOK test in this repo writes the
 # signing payload out by hand — deliberately, so a change to core's is
 # caught by a disagreement rather than propagated by a shared helper — but

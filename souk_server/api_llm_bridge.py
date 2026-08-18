@@ -11,11 +11,12 @@ frames the result as SSE or JSON, and maps `KyokRejected` onto its status.
   caller's bridge, then blocks *this HTTP call* while relaying the answer
   back.
 
-The bridge's side of the relay — where `poll` and `respond/{request_id}`
-used to be — is `WS /ws/kyok` (souk_server/ws_kyok.py): the same queues,
-pushed down one socket instead of polled, with answers accepted only on the
-connection each request was delivered to. See docs/server-mode.md for why
-that replacement is a security fix and not only a transport swap.
+The answering side of the relay is `WS /ws/kyok` (souk_server/ws_kyok.py):
+the LLM provider the run's binding names, attached over a socket, with
+answers accepted only on the connection each request was delivered to. See
+docs/server-mode.md for the frames and docs/keep-your-own-key.md upstream
+for why the answering party is an identified provider now, not an
+anonymous bridge.
 
 See docs/keep-your-own-key.md for the full picture.
 """
@@ -53,7 +54,10 @@ async def chat_completions(
         signature=request.headers.get("x-souk-kyok-signature", ""),
     )
     if not relay.stream_requested:
-        return JSONResponse(await relay.collapsed())
+        # `collapsed` returns the openai package's `ChatCompletion` model —
+        # dumped in json mode so what goes on the wire is exactly its
+        # serialization, not the dict a model happens to be underneath.
+        return JSONResponse((await relay.collapsed()).model_dump(mode="json"))
 
     async def sse():
         # A rejection here surfaces mid-stream: the response has already

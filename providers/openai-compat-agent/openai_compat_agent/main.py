@@ -55,7 +55,10 @@ def _build_messages(agent: AgentConfig, run_input: dict[str, Any]) -> list[dict[
 
 
 def make_run_stream(agent: AgentConfig):
-    async def run_stream(run_input: dict[str, Any]) -> AsyncIterator[dict[str, Any]]:
+    async def run_stream(run_input) -> AsyncIterator[dict[str, Any]]:
+        # Typed `RunAgentInput` from the SDK, dumped back to the camelCase
+        # wire dict once at the edge — everything below reads that shape.
+        run_input = run_input.model_dump(by_alias=True)
         thread_id = run_input["threadId"]
         run_id = run_input["runId"]
         yield {"type": "RUN_STARTED", "threadId": thread_id, "runId": run_id}

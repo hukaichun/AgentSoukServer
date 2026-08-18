@@ -14,6 +14,9 @@ COPY AgentSouk/souk /app/AgentSouk/souk
 # The provider contract souk states and the gateway's socket implements —
 # `ws_provider.SocketProvider` subclasses its `SoukConnection`.
 COPY AgentSouk/souk-provider-sdk /app/AgentSouk/souk-provider-sdk
+# The LLM-provider contract behind /ws/kyok — `ws_kyok.SocketLLMProvider`
+# is checked against its `CONNECTED_LLM_PROVIDER_ATTRS`.
+COPY AgentSouk/souk-llm-provider-sdk /app/AgentSouk/souk-llm-provider-sdk
 COPY pyproject.toml uv.lock .python-version /app/
 # Dev-group only, and only for `tests/test_kyok_shipped_signer.py` — but
 # `uv sync --group dev` below resolves the whole group, so a path source
