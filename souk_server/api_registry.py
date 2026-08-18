@@ -13,6 +13,7 @@ from souk.identity import provider_fingerprint
 from souk_server.deps import get_souk
 from souk_server.models import (
     AgentRosterEntry,
+    DeletionRequest,
     LlmOfferingEntry,
     LlmRegisterRequest,
     LlmRegisterResponse,
@@ -52,6 +53,31 @@ async def register_llm_providers(
         metadata=body.metadata or None,
     )
     return LlmRegisterResponse(models=sorted(registered))
+
+
+@router.delete("/agents", status_code=204)
+async def delete_agent(body: DeletionRequest, souk: Souk = Depends(get_souk)) -> None:
+    """Remove one agent record, on a signed order from the key that owns
+    it. Core refuses (409 through the app-wide handler) while a provider
+    serves it, while it has active runs, or when it has conversation
+    history — history means the record is the past's, and the way to
+    retire the agent is to stop offering it."""
+    await souk.delete_agent(body.public_key, body.name, body.signature, body.timestamp)
+
+
+@router.delete("/llm-providers", status_code=204)
+async def delete_llm_offering(
+    body: DeletionRequest, souk: Souk = Depends(get_souk)
+) -> None:
+    """Remove one LLM offering record — the deletion half of roster
+    symmetry, and what lets a throwaway KYOK bridge clean up after
+    itself instead of leaving an ephemeral key's offering on the roster
+    forever. Core refuses (409) while the offering is attached or a live
+    run is bound to it; offerings carry no history, so unlike agents
+    there is nothing else to protect."""
+    await souk.delete_llm_offering(
+        body.public_key, body.name, body.signature, body.timestamp
+    )
 
 
 @router.get("/llm-providers")

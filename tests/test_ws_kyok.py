@@ -210,6 +210,60 @@ async def test_registration_over_http_then_attach(souk):
         assert (await roster_row())["online"] is False
 
 
+async def test_a_signed_deletion_removes_the_offering_and_serving_blocks_it(souk):
+    """Roster symmetry's deletion half through this gateway: the mirror
+    of upstream's delete_llm_offering, driven over the wire a throwaway
+    bridge uses to clean up after itself. While attached, the delete is a
+    409 — retiring a live offering means detaching first, same rule as
+    agents; afterwards a signed order removes the row and the roster
+    stops listing it."""
+    from souk_llm_provider_sdk import sign_llm_deletion
+
+    identity = await _register_llm(souk, ["gpt-test"])
+
+    def order() -> dict:
+        signature, timestamp = sign_llm_deletion(identity, "gpt-test")
+        return {
+            "name": "gpt-test",
+            "public_key": identity.public_key,
+            "signature": signature,
+            "timestamp": timestamp,
+        }
+
+    async with _client(souk) as client:
+        async with aconnect_ws("http://test/ws/kyok", client) as ws:
+            await _LlmSocket(ws, identity).connect(["gpt-test"])
+            refused = await client.request("DELETE", "/llm-providers", json=order())
+            assert refused.status_code == 409
+
+        ref = LlmRef(provider_key=identity.public_key, name="gpt-test")
+        async with asyncio.timeout(RECEIVE_TIMEOUT):
+            while souk.kyok_relay.serving(ref) is not None:
+                await asyncio.sleep(0.01)
+
+        # A registration signature is not a deletion order.
+        wrong_signature, timestamp = identity.sign_llm_registration(["gpt-test"])
+        forged = await client.request(
+            "DELETE",
+            "/llm-providers",
+            json={
+                "name": "gpt-test",
+                "public_key": identity.public_key,
+                "signature": wrong_signature,
+                "timestamp": timestamp,
+            },
+        )
+        assert forged.status_code == 401
+
+        deleted = await client.request("DELETE", "/llm-providers", json=order())
+        assert deleted.status_code == 204
+        assert (await client.get("/llm-providers")).json() == {"offerings": []}
+        # Gone means gone: a second order finds nothing.
+        assert (
+            await client.request("DELETE", "/llm-providers", json=order())
+        ).status_code == 404
+
+
 # --- round trips -------------------------------------------------------------
 
 

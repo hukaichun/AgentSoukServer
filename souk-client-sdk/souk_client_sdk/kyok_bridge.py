@@ -54,6 +54,7 @@ from souk_llm_provider_sdk import (
     CompletionRefused,
     DeliveredCompletion,
     ProviderIdentity,
+    sign_llm_deletion,
     sign_llm_registration,
 )
 
@@ -114,7 +115,13 @@ class KyokBridge:
         self.offering = offering
         # Ephemeral by default: a personal bridge's identity only needs to
         # outlive its runs. Pass a persisted one to keep a stable
-        # provider_key across restarts.
+        # provider_key across restarts. Remembered which, because it
+        # decides cleanup: an ephemeral key can never come back, so the
+        # offering registered under it is roster garbage the moment this
+        # process exits — `serving()` deletes it on the way out. A
+        # persisted identity keeps its registration, same as an agent
+        # provider between connections.
+        self._ephemeral = identity is None
         self.identity = identity or ProviderIdentity.generate()
         self.reconnect_delay = reconnect_delay
         # The interposition point the library guarantees (see the
@@ -156,6 +163,39 @@ class KyokBridge:
                 },
             )
             resp.raise_for_status()
+
+    async def deregister(self) -> None:
+        """Delete this bridge's offering from souk's roster, signed by its
+        own key — `register()`'s mirror (payload prefix `souk-delete-llm`).
+
+        Best-effort by design: souk refuses (409) while the offering is
+        attached or a run is still bound to it, and a bridge tearing down
+        has nothing useful to do about either — so refusals and transport
+        failures are logged, not raised. A stale row's only cost is roster
+        noise; crashing a clean shutdown over it would cost more.
+        """
+        signature, timestamp = sign_llm_deletion(self.identity, self.offering)
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.request(
+                    "DELETE",
+                    f"{self.souk_http_url}/llm-providers",
+                    json={
+                        "name": self.offering,
+                        "public_key": self.identity.public_key,
+                        "signature": signature,
+                        "timestamp": timestamp,
+                    },
+                )
+            if resp.status_code not in (204, 404):
+                logger.warning(
+                    "kyok bridge could not deregister %r: %s %s",
+                    self.offering,
+                    resp.status_code,
+                    resp.text,
+                )
+        except Exception:
+            logger.warning("kyok bridge could not deregister %r", self.offering, exc_info=True)
 
     def run_metadata(self, context: Any = None) -> dict[str, Any]:
         """The `metadata` a caller passes to opt a run into this bridge:
@@ -228,6 +268,11 @@ class KyokBridge:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+            # After the socket is down, so the attach no longer blocks the
+            # delete. Only for an identity this bridge minted itself — a
+            # persisted one keeps its registration between runs.
+            if self._ephemeral:
+                await self.deregister()
 
     async def _handshake(self, ws) -> None:
         nonce = secrets.token_hex(NONCE_BYTES)

@@ -122,6 +122,22 @@ class LlmRegisterResponse(BaseModel):
     models: list[str]
 
 
+class DeletionRequest(BaseModel):
+    """One signed deletion order, serving both rosters.
+
+    `name` is the agent or offering being removed; the signature is over
+    the deletion payload for that roster (`souk-delete-agent:` /
+    `souk-delete-llm:` — distinct domain tags, so neither a registration
+    signature nor the other roster's deletion signature can be replayed
+    as this one).
+    """
+
+    name: str
+    public_key: str
+    signature: str
+    timestamp: int
+
+
 class LlmOfferingEntry(BaseModel):
     """One LLM offering on the wire — `AgentRosterEntry`'s mirror.
 

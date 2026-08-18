@@ -23,7 +23,7 @@ a persistent WebSocket each, replacing gRPC entirely.
 | Callers | AG-UI (`/agui/*`, `/threads/*`), A2A (`/a2a/*`), registry (`/agents*`), health | HTTP + SSE | exists, unchanged |
 | Callers | MCP (the docent) | streamable HTTP at `/mcp`, same listener | built; see "MCP: the docent" below |
 | Providers | work relay | `WS /ws/provider` | built |
-| LLM providers (KYOK) | registration + roster (`/llm-providers*`), completion relay | HTTP + `WS /ws/kyok` | built |
+| LLM providers (KYOK) | registration + roster + deletion (`/llm-providers*`), completion relay | HTTP + `WS /ws/kyok` | built |
 | Provider's model client | `POST /kyok/v1/chat/completions` | HTTP (OpenAI-compatible by definition) | exists, unchanged |
 
 gRPC is **removed**, not demoted to an option: `grpc_server.py`,
