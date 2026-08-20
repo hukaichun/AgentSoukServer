@@ -800,3 +800,112 @@ def test_the_wire_carries_every_query_the_link_declares():
     from souk_provider_sdk.contract import LINK_QUERY_METHODS
 
     assert set(ws_provider.QUERY_METHODS) == set(LINK_QUERY_METHODS)
+
+
+# --- the interjection annotation --------------------------------------------
+
+
+def _complete_run_agent_input(thread_id: str, run_id: str) -> dict:
+    """A full `ag_ui.core.RunAgentInput` — what core hands the broker, and
+    what `DeliveredRun.from_claimed` validates before anything reaches the
+    wire. Written out here because this test enqueues the way the A2A door
+    does rather than through `start_run`, which completes it for you."""
+    return {
+        "threadId": thread_id,
+        "runId": run_id,
+        "state": None,
+        "messages": [],
+        "tools": [],
+        "context": [],
+        "forwardedProps": None,
+    }
+
+
+async def test_an_interjection_crosses_the_wire_and_a_decline_ends_the_negotiation(
+    souk, register, session
+):
+    """Upstream's mid-turn offer, as it looks on this socket.
+
+    A caller who addresses a message to a run already in flight declares an
+    interjection, and souk offers that run *once* mid-turn, annotated:
+    `metadata.addressedRunId` on the run frame names the run being
+    interrupted. The provider's ordinary ack is the whole negotiation —
+    nothing here advertises a capability, and a plain decline (no reason,
+    so not a permanent refusal) simply routes the run back behind the
+    thread gate.
+
+    The second offer is the part worth pinning down on the wire: it must
+    arrive with the annotation *gone*. A provider that declines anything
+    addressed — which is what every runtime shipping today does, upstream's
+    `ProviderRuntime` and the Go pod-probe included — would otherwise
+    refuse its own next turn forever, and the run would never be served by
+    anybody.
+    """
+    served = await register("greeter")
+    async with _provider_client(souk) as client:
+        async with _connect(client) as ws:
+            socket = await _handshake(ws, served.identity, ["greeter"])
+
+            holder = await souk.start_run(served.ref(), {"messages": []})
+            first = await socket.take(holder.run_id)
+            assert first["metadata"] == {}, "an ordinary turn is not addressed to anything"
+            await _claimed(souk, holder.run_id)
+
+            # What the A2A door builds when a message names the running
+            # task: a new run on the same thread, carrying the address.
+            interjection = await repo.create_run(
+                session, holder.thread_id, served.ref(), "a2a", {"messages": []}
+            )
+            await session.commit()
+            souk.enqueue_run(
+                interjection["run_id"],
+                served.ref(),
+                holder.thread_id,
+                _complete_run_agent_input(holder.thread_id, interjection["run_id"]),
+                "a2a",
+                addressed_run_id=holder.run_id,
+            )
+
+            offered = await socket.recv()
+            assert offered["type"] == "run"
+            assert offered["runId"] == interjection["run_id"]
+            assert offered["metadata"] == {"addressedRunId": holder.run_id}
+
+            # No, and without a reason — "not mid-turn", not "never".
+            await socket.send(
+                {"type": "ack", "runId": interjection["run_id"], "accepted": False}
+            )
+            # It waits its turn now: the holder is still running, and one
+            # shot is all a mid-turn offer gets.
+            await socket.expect_nothing()
+
+            await socket.send({"type": "finish", "runId": holder.run_id})
+            await _drain(souk, holder.run_id)
+
+            # And it is eventually served as an ordinary turn. Asserted as
+            # "keep declining anything addressed, and you are still served"
+            # rather than as a single clean re-offer, because souk can
+            # briefly re-offer with a *stale* annotation: the thread gate
+            # opens when the holder's status is written, a beat before the
+            # holder leaves the broker's table, and an offer composed in
+            # that window still reads the ended run as in flight
+            # (AgentSouk#136). It self-heals, and this is the property that
+            # has to hold either way — a provider that declines every
+            # addressed offer must not decline its own next turn forever.
+            for _ in range(5):
+                frame = await socket.recv()
+                assert frame["type"] == "run"
+                assert frame["runId"] == interjection["run_id"]
+                if not frame["metadata"].get("addressedRunId"):
+                    break
+                await socket.send(
+                    {"type": "ack", "runId": frame["runId"], "accepted": False}
+                )
+            else:
+                raise AssertionError("never offered as a plain next turn")
+
+            await socket.send(
+                {"type": "ack", "runId": interjection["run_id"], "accepted": True}
+            )
+            await socket.send({"type": "finish", "runId": interjection["run_id"]})
+            await _drain(souk, interjection["run_id"])

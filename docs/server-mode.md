@@ -261,6 +261,53 @@ stays reserved for server-side failure the client didn't cause.
 | ↓ | `{"type": "queryResult", "queryId", "result"?, "error"?}` | its answer, correlated by `queryId` |
 | ↓ | `{"type": "error", "message", "runId"?}` | server-side rejection of a frame (bad runId, not the holder) |
 
+### The one annotation a run frame carries: `addressedRunId`
+
+`metadata` on the run frame is souk's channel for saying something *about*
+an offer rather than about the work. It has exactly one key so far, and a
+transport author needs to know what it means because ignoring it is a
+decision, not a default.
+
+A caller who addresses a message to a run already in flight has declared an
+**interjection** — an interruption of a turn in progress, not the next
+turn. Over A2A that address is **`message.taskId`** (on the message, not
+on `params` — upstream's `_send_args` reads `message.taskId`, and a
+`taskId` put beside it at params level is silently ignored, which reads
+as "interjections do not work" rather than as a misplaced field). souk
+offers that run **once, mid-turn**, with
+`metadata: {"addressedRunId": "<the run being interrupted>"}`. Every
+other offer carries `metadata: {}`.
+
+**The ack is the whole negotiation.** Nothing in the handshake advertises
+whether a provider can absorb an interjection, and nothing should: a
+capability flag would have to be declared before anyone knows what the
+utterance says. A provider that can fold the message into the running
+turn accepts; one that cannot declines — *bare*, with no `reason`, so it
+stays the transient "not now" rather than the permanent refusal a reason
+makes it. souk then routes the run back behind the thread gate and offers
+it again as an ordinary next turn once the addressed run ends.
+
+That second offer is the part a transport must get right. It arrives with
+the annotation **gone**, and it has to: a provider that declines anything
+addressed — which is what every runtime shipping today does, upstream's
+`ProviderRuntime` and this repo's Go pod-probe agent included — would
+otherwise decline its own next turn forever and the run would never be
+served by anybody. souk can briefly re-offer with a *stale* annotation
+(the thread gate opens a beat before the finished run leaves the broker's
+table — AgentSouk#136); it self-heals on the following offer, and a
+provider that declines every addressed offer is still served, which is
+the property the test in `tests/test_ws_provider.py` pins down.
+
+**A full thread refuses at the door, 429.** A thread's pending-utterance
+buffer is bounded (`thread_queue_limit`, 8 by default upstream), and a
+message arriving at the limit is refused rather than accepted and expired
+later. That refusal reaches the HTTP surface as **429, not the 409** the
+other conflict refusals get: every one of those means "this request
+conflicts with the state and will keep conflicting", while a full queue
+means only "right now" — the identical request succeeds once the thread
+drains. Answering a paused run's question is never subject to the limit;
+a reply adds nothing to the buffer.
+
 ### Queries: the one thing here that expects an answer
 
 Every other frame is fire-and-forget. `query` is not, and it is worth
