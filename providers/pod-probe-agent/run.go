@@ -12,13 +12,17 @@ import (
 // runFrame is the offer that arrives after welcome. agentName rides along
 // because this provider routes by it and the RunAgentInput does not name
 // it. input is the AG-UI RunAgentInput, kept raw so a KYOK token in its
-// forwardedProps survives untouched.
+// forwardedProps survives untouched. metadata carries souk's annotations;
+// the only one so far is addressedRunId — see startRun.
 type runFrame struct {
 	Type      string          `json:"type"`
 	RunID     string          `json:"runId"`
 	ThreadID  string          `json:"threadId"`
 	AgentName string          `json:"agentName"`
 	Input     json.RawMessage `json:"input"`
+	Metadata  struct {
+		AddressedRunID string `json:"addressedRunId"`
+	} `json:"metadata"`
 }
 
 // serve reads frames until the socket dies. This is the whole loop, and it
@@ -80,11 +84,28 @@ func (c *SoukConn) serve(ctx context.Context, answer AnswerFunc) error {
 // cancel, must still be read while the probe works. Every path ends the run
 // with a finish: souk decides the outcome from the stream ending, and a run
 // whose stream never ends is a run that hangs.
+//
+// One offer is declined outright: an interjection. A run carrying
+// addressedRunId was declared by its caller as an interruption of a run
+// this provider already has in flight, and souk offers it once mid-turn to
+// ask whether that is welcome. A plain probe has nothing to absorb it into
+// — each report is one shot, not a conversation being steered — so the
+// answer is no. The decline is the whole negotiation: souk keeps the run
+// and re-offers it as an ordinary next turn once the addressed run ends,
+// so nothing is lost by refusing.
 func (c *SoukConn) startRun(ctx context.Context, run runFrame, answer AnswerFunc, write func(map[string]any) error, cancels *cancelSet) {
+	if run.Metadata.AddressedRunID != "" {
+		_ = write(map[string]any{"type": "ack", "runId": run.RunID, "accepted": false})
+		return
+	}
 	if err := write(map[string]any{"type": "ack", "runId": run.RunID, "accepted": true}); err != nil {
 		logf("run %s: ack failed: %v", run.RunID, err)
 		return
 	}
+	// One line per run, deliberately. This agent logged nothing per run,
+	// which is how it stayed unclear for two rounds whether an offer had
+	// even reached it — see funduq-server#36.
+	logf("run %s: accepted", run.RunID)
 	runCtx, cancel := context.WithCancel(ctx)
 	cancels.add(run.RunID, cancel)
 

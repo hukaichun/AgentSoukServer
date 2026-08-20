@@ -36,6 +36,7 @@ from souk.errors import (
     SoukError,
     ThreadNotFound,
     ThreadOwnershipMismatch,
+    ThreadQueueFull,
 )
 from souk.identity import InvalidActorChain
 
@@ -69,6 +70,11 @@ _STATUS = {
     # conflict with current state, not a bad request.
     AgentInUse: 409,
     LlmOfferingInUse: 409,
+    # Backpressure, not a conflict: the thread's pending-utterance buffer
+    # is full *right now* and the same request succeeds once it drains, so
+    # 429 (retry later) rather than the 409 the other refusals get, which
+    # would tell a caller its request was wrong when it was merely early.
+    ThreadQueueFull: 429,
     InvalidRegistration: 401,
     InvalidActorChain: 401,
     InvalidRunInput: 400,

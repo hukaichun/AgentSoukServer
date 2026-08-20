@@ -201,3 +201,33 @@ def test_build_forwarded_props_without_chain_or_kyok_passes_through_untouched():
     )
 
     assert result == {"appSpecific": True}
+
+
+async def test_a_thread_whose_pending_buffer_is_full_refuses_with_429(client, register, session, souk):
+    """Upstream bounds a thread's pending-utterance buffer and refuses at
+    the limit rather than accepting and expiring the message later. That
+    refusal reaches this door, and which status it deserves is this
+    layer's call: **429, not 409.**
+
+    The distinction is not cosmetic. Every other refusal mapped to 409
+    here means "your request conflicts with the state and will keep
+    conflicting" — a de-listed agent, a thread owned by somebody else. A
+    full queue means "right now" and nothing else: the identical request
+    succeeds once the thread drains, which is precisely what 429 tells a
+    caller and what 409 tells it not to bother doing.
+    """
+    served = await register("greeter")
+    thread_id = await repo.create_thread(session, served.ref())
+    limit = souk.settings.thread_queue_limit
+    assert limit is not None, "this test is about the limit being set"
+    # Filled through the repo rather than the door: these stand in for
+    # utterances already waiting, and driving them through /agui would
+    # start dispatching them.
+    for _ in range(limit):
+        await repo.create_run(session, thread_id, served.ref(), "ag-ui", {})
+    await session.commit()
+
+    resp = await client.post(f"/agui/{served.path()}", json=_run_input(thread_id))
+
+    assert resp.status_code == 429, resp.text
+    assert "not accepted" in resp.json()["detail"]
