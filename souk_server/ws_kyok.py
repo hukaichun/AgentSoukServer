@@ -317,7 +317,9 @@ async def kyok_socket(websocket: WebSocket) -> None:
                     }
                 )
     finally:
-        souk.detach_llm_provider(public_key)
+        # Named by connection, so a key that already re-attached on a
+        # fresh socket keeps its replacement serving through this cleanup.
+        souk.detach_llm_provider(public_key, link)
         link.fail_pending()
         writer.cancel()
         with contextlib.suppress(asyncio.CancelledError):

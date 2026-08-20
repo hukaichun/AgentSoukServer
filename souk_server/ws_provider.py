@@ -505,8 +505,11 @@ async def provider_socket(websocket: WebSocket) -> None:
         provider.fail_pending()
         # Detaching is what takes these agents offline, immediately —
         # `online` is `is_serving`, so there is no window where souk still
-        # advertises an agent whose socket has gone.
-        await souk.detach_provider(public_key)
+        # advertises an agent whose socket has gone. Named by connection
+        # (upstream's detach-scoped change): if this key already
+        # re-attached on a fresh socket, this cleanup withdraws nothing
+        # and the replacement stays serving.
+        souk.detach_provider(public_key, provider)
         for task in (watcher, writer):
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
