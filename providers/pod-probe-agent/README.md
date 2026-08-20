@@ -69,6 +69,14 @@ changes anything.
   edge auth in front of souk (the managed-gateway example's shape); this
   binary does not ship a policy.
 
+This agent is a call-home loop, which is the shape of a remote-access trojan
+drawn without the labels — and one edit (give the model the tools, let them
+write) is what separates this read-only probe from an implant. Why that edit
+is the boundary, why the read-only design here is the defensive half of a
+known dual-use pattern rather than caution, and what the gateway must enforce
+so a different provider binary cannot quietly discard it: see
+[`docs/threat-model.md`](../../docs/threat-model.md).
+
 ## Configuration
 
 All via environment variables:
