@@ -64,8 +64,11 @@ WELCOME_TIMEOUT_SECONDS = 10.0
 
 # The frame choreography matches souk_server/handshake.py; the bytes
 # signed are souk_provider_sdk's link-open family (`sign_connect`), so
-# this package no longer restates any payload. v2 is that migration.
-HANDSHAKE_VERSION = 2
+# this package no longer restates any payload. v2 is that migration; v3
+# binds the recipient souk's key (the challenge frame's `soukPublicKey`,
+# empty string when null) into the proof, so a proof produced for one
+# souk cannot be relayed to attach at another.
+HANDSHAKE_VERSION = 3
 
 
 class KyokBridge:
@@ -288,9 +291,13 @@ class KyokBridge:
                 {
                     "type": "proof",
                     # The SDK's statement of the link-open proof — no local
-                    # payload, no hello digest.
+                    # payload, no hello digest. The first field binds the
+                    # recipient souk (empty for one with no identity).
                     "signature": self.identity.sign_connect(
-                        challenge["nonce"], nonce, [self.offering]
+                        challenge.get("soukPublicKey") or "",
+                        challenge["nonce"],
+                        nonce,
+                        [self.offering],
                     ),
                 }
             )

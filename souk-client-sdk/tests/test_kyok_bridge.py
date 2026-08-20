@@ -173,11 +173,12 @@ async def test_the_handshake_carries_identity_and_offering_and_proves_the_key():
             assert gateway.hello["type"] == "hello"
             assert gateway.hello["publicKey"] == bridge.identity.public_key
             assert gateway.hello["modelNames"] == ["my-llm"]
-            # The proof signs the SDK's connect family (v2): both nonces
-            # and the sorted offering names, no hello digest.
+            # The proof signs the SDK's connect family (v3): the recipient
+            # souk key (empty — this stub presents none), both nonces and
+            # the sorted offering names, no hello digest.
             from souk_provider_sdk import provider_connect_payload
 
-            payload = provider_connect_payload("n_souk", gateway.hello["nonce"], ["my-llm"])
+            payload = provider_connect_payload("", "n_souk", gateway.hello["nonce"], ["my-llm"])
             from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
             Ed25519PublicKey.from_public_bytes(

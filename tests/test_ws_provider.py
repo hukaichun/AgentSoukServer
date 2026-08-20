@@ -89,7 +89,9 @@ async def _handshake(ws, identity, names: list[str], **hello_extra) -> _Socket:
 
     challenge = await socket.recv()
     assert challenge["type"] == "challenge", challenge
-    await socket.send(identity.proof(names, hello["nonce"], challenge["nonce"]))
+    await socket.send(
+        identity.proof(names, hello["nonce"], challenge["nonce"], challenge["soukPublicKey"])
+    )
 
     assert (await socket.recv()) == {"type": "welcome"}
     return socket
@@ -168,7 +170,9 @@ async def test_a_captured_handshake_does_not_open_a_second_socket(souk, register
             hello_raw = json.dumps(hello)
             await ws.send_text(hello_raw)
             challenge = await socket.recv()
-            proof = served.identity.proof(["greeter"], hello["nonce"], challenge["nonce"])
+            proof = served.identity.proof(
+                ["greeter"], hello["nonce"], challenge["nonce"], challenge["soukPublicKey"]
+            )
             await socket.send(proof)
             assert (await socket.recv()) == {"type": "welcome"}
 
@@ -202,7 +206,9 @@ async def test_the_proof_is_bound_to_the_names_the_hello_claimed(souk, register)
             challenge = await socket.recv()
             # Signed over the names that were *not* claimed on the wire.
             await socket.send(
-                served.identity.proof(["greeter"], honest["nonce"], challenge["nonce"])
+                served.identity.proof(
+                    ["greeter"], honest["nonce"], challenge["nonce"], challenge["soukPublicKey"]
+                )
             )
             with pytest.raises(WebSocketDisconnect) as excinfo:
                 await ws.receive_text(timeout=RECEIVE_TIMEOUT)
@@ -332,7 +338,10 @@ async def test_a_name_this_key_never_registered_is_refused_at_the_door(souk, reg
             challenge = await socket.recv()
             await socket.send(
                 served.identity.proof(
-                    ["greeter", "smuggled"], hello["nonce"], challenge["nonce"]
+                    ["greeter", "smuggled"],
+                    hello["nonce"],
+                    challenge["nonce"],
+                    challenge["soukPublicKey"],
                 )
             )
             with pytest.raises(WebSocketDisconnect) as excinfo:

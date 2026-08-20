@@ -9,7 +9,6 @@ package main
 import (
 	"context"
 	"crypto/ed25519"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -23,7 +22,9 @@ import (
 
 // The handshake this binary speaks. A mismatch is refused by name on the
 // souk side rather than failing as a bad signature (docs/server-mode.md).
-const handshakeVersion = 1
+// v3: the proof binds the recipient souk's public key, and souk requires
+// a proof unconditionally.
+const handshakeVersion = 3
 
 // registrationPayload is the exact bytes core verifies an /agents/register
 // signature against: souk.identity.registration_signing_payload, the
@@ -36,21 +37,23 @@ func registrationPayload(names []string, timestamp int64) []byte {
 	return []byte(fmt.Sprintf("souk-register:%s:%d", strings.Join(sortedCopy(names), ","), timestamp))
 }
 
-// soukChallengePayload is what souk signs so this side can tell one souk
+// soukConnectPayload is what souk signs so this side can tell one souk
 // from another answering the same URL — the half of the exchange souk
-// never had before (docs/server-mode.md, "souk signs first").
-func soukChallengePayload(providerNonce, soukNonce string) []byte {
-	return []byte("souk-auth:souk:" + providerNonce + ":" + soukNonce)
+// never had before (docs/server-mode.md, "souk signs first"). Upstream's
+// souk-connect family (souk.identity.souk_connect_signing_payload),
+// vectored in AgentSouk/docs/contract-vectors.json.
+func soukConnectPayload(soukNonce, providerNonce string) []byte {
+	return []byte("souk-connect-souk:" + soukNonce + ":" + providerNonce)
 }
 
-// providerProofPayload is what this side signs to prove it holds its key
-// *now*. The digest is over the exact hello bytes as they went on the wire
-// — never a re-serialization — so agentNames and maxConcurrentRuns cannot
-// be altered in flight, and so the digest can be taken before soukNonce
-// exists.
-func providerProofPayload(providerNonce, soukNonce string, helloRaw []byte) []byte {
-	digest := sha256.Sum256(helloRaw)
-	return []byte("souk-auth:provider:" + providerNonce + ":" + soukNonce + ":" + hex.EncodeToString(digest[:]))
+// providerConnectPayload is what this side signs to prove it holds its key
+// *now*, and to whom: soukPublicKey names the recipient — the key the souk
+// just proved (empty for a souk with no identity) — so a proof produced
+// for one souk cannot be relayed to attach at another. The sorted names
+// bind which agents this socket attaches for; both nonces make a recorded
+// exchange worthless. (souk.identity.provider_connect_signing_payload.)
+func providerConnectPayload(soukPublicKey, soukNonce, providerNonce string, names []string) []byte {
+	return []byte("souk-connect-provider:" + soukPublicKey + ":" + soukNonce + ":" + providerNonce + ":" + strings.Join(sortedCopy(names), ","))
 }
 
 // kyokCallPayload is what one Keep Your Own Key completion call signs: the
@@ -61,11 +64,10 @@ func kyokCallPayload(bearer string, timestamp int64, bodyHash string) []byte {
 	return []byte(fmt.Sprintf("souk-kyok-call:%s:%d:%s", bearer, timestamp, bodyHash))
 }
 
-// helloFrame is serialized once, sent as-is, and hashed as-is. Struct field
-// order fixes the JSON encoding, which is the only thing that must stay
-// stable — the digest binds these exact bytes. maxConcurrentRuns is a
-// pointer so it can be omitted the way the published vector's hello omits
-// it, though this agent always sends one.
+// helloFrame: frame one of the handshake. Nothing signs its bytes any
+// more (v2 dropped the hello digest for the sorted-names binding), so the
+// encoding only has to parse, not stay byte-stable. maxConcurrentRuns is
+// a pointer so it can be omitted, though this agent always sends one.
 type helloFrame struct {
 	Type              string   `json:"type"`
 	Version           int      `json:"version"`
@@ -129,7 +131,9 @@ func (c *SoukConn) handshake(ctx context.Context) error {
 		return err
 	}
 
-	proofSig := c.id.Sign(providerProofPayload(providerNonce, challenge.Nonce, helloRaw))
+	// The proof names its recipient: the key the souk just proved, empty
+	// for a souk with no identity — matching what core builds to verify.
+	proofSig := c.id.Sign(providerConnectPayload(challenge.SoukPublicKey, challenge.Nonce, providerNonce, c.agentNames))
 	proof, _ := json.Marshal(map[string]string{"type": "proof", "signature": proofSig})
 	if err := c.ws.Write(ctx, websocket.MessageText, proof); err != nil {
 		return fmt.Errorf("send proof: %w", err)
@@ -172,7 +176,7 @@ func (c *SoukConn) verifySouk(presentedHex, signatureHex, providerNonce, soukNon
 	if err != nil {
 		return errors.New("souk challenge signature is not hex")
 	}
-	if !ed25519.Verify(ed25519.PublicKey(presented), soukChallengePayload(providerNonce, soukNonce), sig) {
+	if !ed25519.Verify(ed25519.PublicKey(presented), soukConnectPayload(soukNonce, providerNonce), sig) {
 		return errors.New("souk challenge signature does not verify")
 	}
 	if c.soukPubKey == nil {

@@ -117,7 +117,11 @@ class _LlmSocket:
         )
         challenge = await self.recv()
         assert challenge["type"] == "challenge"
-        await self.send(self.identity.proof(model_names, nonce, challenge["nonce"]))
+        await self.send(
+            self.identity.proof(
+                model_names, nonce, challenge["nonce"], challenge["soukPublicKey"]
+            )
+        )
         assert (await self.recv()) == {"type": "welcome"}
 
     async def recv(self) -> dict:

@@ -164,7 +164,7 @@ async def test_hello_carries_the_claims_and_a_nonce_but_no_signature(tmp_path):
         )
         async with _connected(gateway, provider):
             assert gateway.hello["type"] == "hello"
-            assert gateway.hello["version"] == 2
+            assert gateway.hello["version"] == 3
             assert gateway.hello["publicKey"] == provider.public_key
             assert gateway.hello["agentNames"] == ["echo"]
             assert gateway.hello["maxConcurrentRuns"] == 2
@@ -176,8 +176,8 @@ async def test_the_proof_signs_both_nonces_and_the_names_that_were_claimed(tmp_p
     """Verified by rebuilding the payload from the frames the stub
     actually received — so a provider that signed the right shape over the
     wrong bytes fails here rather than passing. The payload is the SDK's
-    connect family (v2): both nonces plus the sorted names, no hello
-    digest."""
+    connect family (v3): the recipient souk's key, both nonces, and the
+    sorted names — no hello digest."""
     from souk_provider_sdk import provider_connect_payload, verify_signature
 
     async with StubGateway() as gateway:
@@ -191,7 +191,10 @@ async def test_the_proof_signs_both_nonces_and_the_names_that_were_claimed(tmp_p
                 provider.public_key,
                 gateway.proof["signature"],
                 provider_connect_payload(
-                    gateway.souk_nonce, gateway.hello["nonce"], gateway.hello["agentNames"]
+                    gateway.public_key,
+                    gateway.souk_nonce,
+                    gateway.hello["nonce"],
+                    gateway.hello["agentNames"],
                 ),
             )
 

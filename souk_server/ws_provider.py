@@ -363,6 +363,20 @@ async def collect_connect_proof(
     worth stealing. A souk with no identity configured cannot sign, and
     says so by sending `soukPublicKey: null` rather than by failing —
     honest, and the provider's pin is what turns it into a refusal.
+
+    The challenge frame's `soukPublicKey` does double duty since v3: it
+    is also the recipient the provider binds into its proof — core
+    verifies against a payload built with its *own* key, so a proof this
+    souk coaxed out cannot be relayed to attach at another. A provider
+    facing an identity-less souk binds the empty string, matching what
+    core builds when `identity_public_key` is None.
+
+    Attach returns souk's answering signature over the same
+    `souk-connect-souk:` bytes signed here — for transports where the
+    proof arrives before souk has spoken. This transport already said it
+    in the challenge frame (deterministic Ed25519: same key, same bytes,
+    same signature), so the sockets discard the return rather than
+    sending it twice.
     """
     souk_nonce = souk.issue_connect_challenge()
     provider_nonce = hello["nonce"]
