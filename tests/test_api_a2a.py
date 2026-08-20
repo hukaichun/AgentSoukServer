@@ -142,12 +142,13 @@ async def test_offline_target_fails_fast_instead_of_queueing(client, register, s
 async def test_a2a_can_never_bypass_a_paused_run_even_with_a_resume_flag(
     client, register, session
 ):
-    """A2A has no resume mechanism at all — see souk/pause.py's module
-    docstring for why that's deliberate (an agent must never be the one
-    resolving another provider's interrupt). A second tasks/send on the
-    same session, even one that tries the old metadata.resume=true
-    convention, must not bypass an active, paused run — it just gets
-    told the current state back, exactly like a plain duplicate call.
+    """Resuming over A2A is only the bound answer: a message whose
+    `taskId` names the thread's paused task. A second tasks/send that
+    tries the old metadata.resume=true convention instead must not touch
+    the paused run — since upstream's utterance-queue change it becomes a
+    *new* run, queued behind the thread's holder (one turn per thread),
+    while the interrupt stays exactly where it was, waiting for whoever
+    it was actually addressed to.
     """
     served = await register("approver")
 
@@ -176,9 +177,21 @@ async def test_a2a_can_never_bypass_a_paused_run_even_with_a_resume_flag(
     )
     assert second.status_code == 200, second.text
     result = second.json()["result"]
-    # Still the *original* run — a new one never started.
-    assert result["id"] == created["run_id"]
-    assert result["status"]["state"] == "TASK_STATE_INPUT_REQUIRED"
+    # A *new* run — never merged into the paused one. Nobody serves this
+    # agent here, so the new run is recorded failed (agent_offline)
+    # rather than queued; either way it is its own task, and the queueing
+    # of a served sibling behind the thread's holder is upstream's suite's
+    # to prove.
+    assert result["id"] != created["run_id"]
+    assert result["status"]["state"] == "TASK_STATE_FAILED"
 
-    still_one_run = (await session.execute(select(func.count()).select_from(runs))).scalar()
-    assert still_one_run == 1
+    paused = (
+        await session.execute(
+            select(runs.c.status, runs.c.metadata).where(runs.c.run_id == created["run_id"])
+        )
+    ).mappings().first()
+    assert paused["status"] == "input-required"
+    assert paused["metadata"]["interrupts"] == [{"id": "int_1"}]
+
+    run_count = (await session.execute(select(func.count()).select_from(runs))).scalar()
+    assert run_count == 2
