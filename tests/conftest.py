@@ -95,13 +95,9 @@ def settings() -> CoreSettings:
         database_url=DATABASE_URL,
         token_signing_secret=TEST_SIGNING_SECRET,
         identity_private_key=TEST_SOUK_IDENTITY,
-        # Strict from day one in this suite: every attach — both sockets,
-        # and the in-process links the fixtures use — must answer a live
-        # challenge. The permissive default is upstream's migration switch
-        # for transports that still authenticate at their own edge; this
-        # gateway no longer is one, so its tests must not pass under a
-        # leniency it doesn't need.
-        require_connect_proof=True,
+        # Nothing about the proof to configure any more: upstream removed
+        # the opt-out, so every attach — both sockets, and the in-process
+        # links the fixtures use — answers a live challenge or is refused.
     )
 
 
@@ -224,12 +220,16 @@ class Identity(ProviderIdentity):
             **extra,
         }
 
-    def proof(self, names: list[str], provider_nonce: str, souk_nonce: str) -> dict:
+    def proof(
+        self, names: list[str], provider_nonce: str, souk_nonce: str, souk_key: str | None = None
+    ) -> dict:
         """Frame three — the SDK's `sign_connect`, which is the whole point
-        of v2: no local payload, no hello digest, the names bound in."""
+        of v2: no local payload, no hello digest, the names bound in.
+        `souk_key` is the recipient v3 binds — the challenge frame's
+        `soukPublicKey`, empty/None for a souk with no identity."""
         return {
             "type": "proof",
-            "signature": self.sign_connect(souk_nonce, provider_nonce, names),
+            "signature": self.sign_connect(souk_key or "", souk_nonce, provider_nonce, names),
         }
 
 

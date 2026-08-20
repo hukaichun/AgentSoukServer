@@ -103,7 +103,7 @@ far side, decides.
 ### Opening a socket: a mutual challenge-response
 
 Four frames, two round trips, and **each side signs bytes the other
-chose**. Handshake **v2**: the signed payloads are upstream's link-open
+chose**. Handshake **v3**: the signed payloads are upstream's link-open
 family (`souk_provider_sdk.identity`, vectored in
 AgentSouk/docs/contract-vectors.json), and `souk_server/handshake.py`
 re-exports them beside the version number. Three packages used to restate
@@ -122,7 +122,8 @@ souk     → welcome    { }
 
 ```
 sig_s = souk.sign(     b"souk-connect-souk:"     + nonce_s + b":" + nonce_p )
-sig_p = identity.sign( b"souk-connect-provider:" + nonce_s + b":" + nonce_p
+sig_p = identity.sign( b"souk-connect-provider:" + souk_public_key + b":"
+                       + nonce_s + b":" + nonce_p
                        + b":" + ",".join(sorted(names)) )
 ```
 
@@ -143,6 +144,22 @@ test drives); tampering with a live connection's other fields was already
 outside the threat model here — an intercepting proxy is trusted by
 construction (AgentSoukServer#10). Traded knowingly.
 
+**What v3 added.** The provider's proof now opens with the *recipient*:
+the souk public key from the challenge frame (the key the provider just
+verified, or pinned; the empty string facing a souk with no identity).
+Core verifies against a payload built with its own key, so a proof one
+souk coaxed out of a provider cannot be relayed to attach at another —
+the cross-souk relay the threat-model doc names. In the same stroke
+upstream removed the proof's opt-out: `SOUK_REQUIRE_CONNECT_PROOF` no
+longer exists as a setting, and a connection that offers no proof is
+refused everywhere, in-process links included. One handshake, everywhere,
+is what lets a provider in any language implement it once against the
+published vectors. Attach also *returns* souk's `souk-connect-souk:`
+signature now — for transports where souk has not spoken before the
+proof arrives. This gateway's challenge frame already carries the same
+signature (deterministic Ed25519 over the same bytes), so the sockets
+discard the return rather than saying it twice.
+
 **Who verifies moved, deliberately.** The proof is checked by core's
 `attach` now, not by this gateway: souk mints the challenge
 (`Souk.issue_connect_challenge` — single-use, freshness-bounded), the
@@ -151,10 +168,10 @@ signature into `attach_provider`/`attach_llm_provider`, and core refuses
 an attach whose proof does not answer a live challenge. Attaching is
 where runs change hands, so it is where the proof belongs — and the
 in-process links are challenged the same way, closing the era when this
-transport was the only authenticated road in. The dev stack and the test
-suite run `SOUK_REQUIRE_CONNECT_PROOF=true`; the permissive default is
-upstream's migration switch for deployments whose transports still
-authenticate at their own edge, which this gateway no longer is.
+transport was the only authenticated road in. The proof is unconditional
+since v3: the migration switch (`SOUK_REQUIRE_CONNECT_PROOF`) is gone
+from core, and a proofless attach is refused with instructions rather
+than admitted.
 
 Why each piece is there:
 
@@ -165,6 +182,10 @@ Why each piece is there:
   for a registration or deletion.
 - **The sorted names.** Which roster entries this socket attaches for
   cannot be altered in flight; sorted, so order is nobody's problem.
+- **The recipient souk's key (v3).** A proof is an answer to one souk,
+  by name; a souk cannot launder a provider's answer into an attach at
+  some other souk, because the verifier builds the payload with its own
+  key and the signature stops matching.
 - **souk signs first.** A provider must be able to walk away from a souk
   it does not recognise *before* producing anything worth stealing.
   Signing second would mean handing a credential to whatever answered the

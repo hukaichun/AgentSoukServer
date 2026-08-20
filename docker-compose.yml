@@ -75,12 +75,6 @@ services:
       SOUK_IDENTITY_PRIVATE_KEY: ${SOUK_IDENTITY_PRIVATE_KEY:-ed2f1426228cc76fdceb83066aad7b5f27011d98240ebee9bd28afb31952f9e3}
       # Must match souk-migrate's above — see that service's comment.
       SOUK_DB_SCHEMA: ${SOUK_DB_SCHEMA:-public}
-      # Every attach must answer a live challenge core minted. The
-      # permissive default is upstream's migration switch for transports
-      # that still authenticate at their own edge; this gateway passes
-      # the ws proof through to core, so the strict mode costs nothing
-      # and catches an attach road that forgot to.
-      SOUK_REQUIRE_CONNECT_PROOF: "true"
     # /readyz, because it reports what a provider about to register
     # actually needs (database reachable, dispatch running) — /healthz
     # only proves the process answers. python urllib rather than curl:

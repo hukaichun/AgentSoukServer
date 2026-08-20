@@ -1,9 +1,10 @@
 """What each side signs to open a provider or LLM-provider socket.
 
 The payloads are upstream's now — `souk_provider_sdk.identity` publishes
-the link-open family (`souk-connect-provider:{souk_nonce}:{provider_nonce}:
-{sorted names}` and `souk-connect-souk:{souk_nonce}:{provider_nonce}`),
-vectored in AgentSouk/docs/contract-vectors.json — and this module only
+the link-open family (`souk-connect-provider:{souk_public_key}:
+{souk_nonce}:{provider_nonce}:{sorted names}` and
+`souk-connect-souk:{souk_nonce}:{provider_nonce}`), vectored in
+AgentSouk/docs/contract-vectors.json — and this module only
 re-exports them beside the version number and the frame choreography,
 which remain serving decisions. Three packages used to restate these
 bytes because none could import another (the gateway is AGPL, the SDKs
@@ -56,4 +57,11 @@ from souk_provider_sdk import (  # noqa: F401
 # v2: the signed payloads moved from this gateway's souk-auth family
 # (hello-digest binding) to upstream's souk-connect family (sorted-names
 # binding). v1 partners fail here by name, not by signature.
-HANDSHAKE_VERSION = 2
+#
+# v3: the provider's proof binds the recipient souk's public key — the
+# first field of `souk-connect-provider:` is the key from the challenge
+# frame (empty string for a souk with no identity) — so a proof coaxed
+# out by one souk cannot be relayed to attach at another. Upstream made
+# the proof unconditional in the same stroke: core's attach refuses a
+# proofless connection outright, with no setting to say otherwise.
+HANDSHAKE_VERSION = 3

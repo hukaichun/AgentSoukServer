@@ -65,8 +65,10 @@ WELCOME_TIMEOUT_SECONDS = 10.0
 # souk_provider_sdk's link-open family now (`provider_connect_payload` /
 # `souk_connect_payload`), so this package no longer restates any payload
 # — v2 is exactly that migration, and the digest-of-the-hello subtlety
-# went with it.
-HANDSHAKE_VERSION = 2
+# went with it. v3 binds the recipient souk's key into the proof (the
+# challenge frame's `soukPublicKey`, empty string when null), so a proof
+# produced for one souk cannot be relayed to attach at another.
+HANDSHAKE_VERSION = 3
 
 # How long an agent waits for souk to answer a question. Generous: it is a
 # database read on the far side of a socket, and the failure it guards is
@@ -323,16 +325,19 @@ class SoukProvider(SoukLink):
         souk_nonce = challenge.get("nonce")
         if not isinstance(souk_nonce, str) or not souk_nonce:
             raise RuntimeError("challenge carried no nonce")
-        self._check_souk_identity(challenge, provider_nonce, souk_nonce)
+        souk_key = self._check_souk_identity(challenge, provider_nonce, souk_nonce)
 
         await ws.send(
             json.dumps(
                 {
                     "type": "proof",
                     # The SDK's own statement of what a provider signs to
-                    # open a link — no local payload, no hello digest.
+                    # open a link — no local payload, no hello digest. The
+                    # first field binds the recipient: the key this souk
+                    # just proved (empty for one with no identity), so
+                    # this proof attaches here and nowhere else.
                     "signature": self.identity.sign_connect(
-                        souk_nonce, provider_nonce, names
+                        souk_key or "", souk_nonce, provider_nonce, names
                     ),
                 }
             )
@@ -342,8 +347,14 @@ class SoukProvider(SoukLink):
         if welcome.get("type") != "welcome":
             raise RuntimeError(f"expected welcome, got {welcome!r}")
 
-    def _check_souk_identity(self, challenge: dict, provider_nonce: str, souk_nonce: str) -> None:
+    def _check_souk_identity(
+        self, challenge: dict, provider_nonce: str, souk_nonce: str
+    ) -> str | None:
         """Is the thing answering this URL the souk we meant?
+
+        Returns the key the souk proved (None for an identity-less souk
+        we did not pin) — the recipient the proof binds, decided here so
+        signing cannot precede this check.
 
         Three states, and the difference between the last two is the whole
         reason `souk_public_key` exists:
@@ -383,7 +394,7 @@ class SoukProvider(SoukLink):
                 "other souk at that URL",
                 self.souk_http_url,
             )
-            return
+            return None
 
         if not isinstance(signature, str) or not verify_signature(
             souk_key, signature, souk_connect_payload(souk_nonce, provider_nonce)
@@ -404,6 +415,7 @@ class SoukProvider(SoukLink):
                 f"{self.souk_http_url} is souk {souk_key[:16]}…, not the "
                 f"{self.souk_public_key[:16]}… this provider was told to trust"
             )
+        return souk_key
 
     async def _run_connection(self) -> None:
         ssl_context: ssl.SSLContext | None = None

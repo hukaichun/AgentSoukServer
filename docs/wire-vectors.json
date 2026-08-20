@@ -1,6 +1,6 @@
 {
   "comment": "The gateway's wire contract, minus everything upstream now publishes. The signed payload families — registration, deletion, kyok-call, and since v2 the link-open pair this handshake signs (souk-connect-provider / souk-connect-souk) — are vectored in AgentSouk/docs/contract-vectors.json, whose 'wire' section also declares the delivery envelopes the run and completionRequest frames carry (DeliveredRun / DeliveredCompletion, model_dump(by_alias=True)). What remains this file's to state: the handshake version, and each socket's frame vocabulary. All three implementations' suites consume this file; the frame sets are the module constants the gateway's dispatch reads.",
-  "handshake_version": 2,
+  "handshake_version": 3,
   "payload_vectors": "AgentSouk/docs/contract-vectors.json",
   "frames": {
     "comment": "Frame types per socket. After the four-frame handshake (hello, challenge, proof, welcome), a run frame is {'type': 'run', **DeliveredRun}, a completion request is {'type': 'completionRequest', 'requestId', **DeliveredCompletion}; the ack may carry a 'reason' (permanent refusal), the kyok error frame may carry a 'refusal' payload relayed intact. Full field semantics in docs/server-mode.md.",
